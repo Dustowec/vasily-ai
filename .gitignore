@@ -61,3 +61,7 @@ my_tags_auto.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Temporary setup scripts
+setup_config.py
+*.backup.py
