@@ -1,7 +1,7 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
-*.class
+*$py.class
 *.so
 .Python
 build/
@@ -22,9 +22,9 @@ wheels/
 
 # Virtual environments
 venv/
+.venv/
 ENV/
 env/
-.venv
 .uv/
 
 # IDE
@@ -44,7 +44,7 @@ logs/
 *.sqlite
 *.sqlite3
 
-# My project specific
+# Project specific
 long_memory.txt
 visited_sites.json
 danbooru_knowledge_base.json
@@ -57,11 +57,11 @@ my_tags_auto.txt
 *.tmp
 *.temp
 .cache/
+.ruff_cache/
+setup_config.py
+fix_encoding.py
+*.backup.py
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Temporary setup scripts
-setup_config.py
-*.backup.py
