@@ -43,8 +43,8 @@ class AgentCore:
             llm_url=self.config.llm_url,
         )
 
-        # Discover plugins
-        self.plugin_registry.discover_plugins("plugins")
+        # Discover plugins (path from config)
+        self.plugin_registry.discover_plugins(self.config.plugins_dir)
         logger.info(
             "Plugins loaded",
             count=len(self.plugin_registry),
@@ -57,29 +57,19 @@ class AgentCore:
         logger.info("Agent initialized successfully")
 
     async def health_check(self) -> dict[str, Any]:
-        """Quick health check (< 1 sec)."""
-        results = {
-            "plugins_loaded": len(self.plugin_registry),
-            "memory_accessible": True,
-            "data_dir_exists": self.config.data_dir.exists(),
-        }
+        """Run full health check with colored report."""
+        from core.health_check import HealthChecker
 
-        # Check LLM availability (non-blocking, fast)
-        try:
-            import aiohttp
+        checker = HealthChecker(
+            config=self.config,
+            plugin_registry=self.plugin_registry,
+            memory_manager=self.memory,
+        )
+        report = await checker.run_all()
+        checker.print_report(report)
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.config.llm_url}/api/tags",
-                    timeout=aiohttp.ClientTimeout(total=0.5),
-                ) as response:
-                    results["llm_available"] = response.status == 200
-        except Exception:
-            results["llm_available"] = False
-            logger.warning("LLM server not available - degraded mode")
-
-        logger.info("Health check complete", **results)
-        return results
+        logger.info("Health check complete", overall=report.get("overall"))
+        return report
 
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
         """Handle user request with simple keyword routing."""

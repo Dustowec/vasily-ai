@@ -11,6 +11,7 @@ class Config:
     # Paths
     log_dir: Path = field(default_factory=lambda: Path("logs"))
     data_dir: Path = field(default_factory=lambda: Path("data"))
+    plugins_dir: str = "plugins"  # Package name for plugins
 
     # Logging
     log_level: str = "INFO"
@@ -20,6 +21,8 @@ class Config:
     llm_url: str = "http://localhost:11434"
     llm_model: str = "llama3.2"
     llm_timeout: float = 30.0
+    llm_auto_start: bool = False  # Try to auto-start LLM if unavailable
+    llm_max_retries: int = 2
 
     # Agent behavior
     max_concurrent_requests: int = 5
@@ -36,3 +39,5 @@ class Config:
             raise ValueError(f"Invalid log level: {self.log_level}")
         if self.request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
+        if self.llm_max_retries < 0:
+            raise ValueError("llm_max_retries must be >= 0")
