@@ -175,3 +175,11 @@ class MemoryManager:
         if self._compression_task:
             self._compression_task.cancel()
             logger.info("Background compression stopped")
+
+    def __len__(self) -> int:
+        """Total entries in hot + cold."""
+        return len(self.hot) + len(self._cold_data)
+
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists in hot or cold."""
+        return key in self.hot.get_all_entries() or key in self._cold_data
