@@ -1,16 +1,24 @@
 """
-Structured logging configuration with 4 log levels.
+Structured logging configuration with 4 log levels and alert levels.
 
-Log files:
-- logs/core.log       - Core system logs (AgentCore, PluginRegistry, Config)
+Log files (rotated every 72 hours):
+- logs/core.log       - Core system logs
 - logs/interaction.log - Core-to-plugin interaction logs
 - logs/plugins.log    - Plugin internal logs
 - logs/llm.log        - LLM request/response logs
-- logs/vasily.log     - All logs combined (for full debugging)
+- logs/vasily.log     - All logs combined
+
+Alert levels (auto-detected):
+- STATE             - System state (INFO by default)
+- REQUEST           - User request (INFO with request keywords)
+- WARNING           - Warning (WARNING)
+- CRITICAL_WARNING  - Critical warning (ERROR)
+- CRASH             - Fatal crash (CRITICAL)
 """
 
 import logging
 import sys
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import structlog
@@ -22,6 +30,50 @@ PLUGINS_LOG = "plugins.log"
 LLM_LOG = "llm.log"
 ALL_LOG = "vasily.log"
 
+# Rotation settings: keep logs for 72 hours (3 days)
+ROTATION_WHEN = "midnight"  # Rotate at midnight
+ROTATION_INTERVAL = 1  # Every day
+ROTATION_BACKUP_COUNT = 3  # Keep 3 days of logs
+
+
+def alert_level_processor(logger, method_name, event_dict):
+    """
+    Automatically adds alert_level based on Python log level.
+    Allows manual override if alert_level is already set.
+
+    Alert levels:
+    - STATE: System state (INFO by default)
+    - REQUEST: User request (INFO with request keywords)
+    - WARNING: Warning (WARNING)
+    - CRITICAL_WARNING: Critical warning (ERROR)
+    - CRASH: Fatal crash (CRITICAL)
+    """
+    # If alert_level is already set manually, keep it
+    if "alert_level" in event_dict:
+        return event_dict
+
+    # Auto-detect based on level
+    level = event_dict.get("level", "info")
+
+    if level == "critical":
+        event_dict["alert_level"] = "CRASH"
+    elif level == "error":
+        event_dict["alert_level"] = "CRITICAL_WARNING"
+    elif level == "warning":
+        event_dict["alert_level"] = "WARNING"
+    elif level == "info":
+        # Detect REQUEST by keywords in event text
+        event_text = event_dict.get("event", "").lower()
+        request_keywords = ["request", "user", "query", "command", "input"]
+        if any(word in event_text for word in request_keywords):
+            event_dict["alert_level"] = "REQUEST"
+        else:
+            event_dict["alert_level"] = "STATE"
+    elif level == "debug":
+        event_dict["alert_level"] = "DEBUG"
+
+    return event_dict
+
 
 def setup_logging(
     log_dir: Path,
@@ -29,7 +81,7 @@ def setup_logging(
     json_logs: bool = True,
 ) -> None:
     """
-    Configure structured logging with 4 log levels.
+    Configure structured logging with 4 log levels and rotation.
 
     Args:
         log_dir: Directory for log files
@@ -46,6 +98,7 @@ def setup_logging(
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
+        alert_level_processor,  # Auto-detect alert_level
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.TimeStamper(fmt="iso"),
@@ -68,52 +121,31 @@ def setup_logging(
         cache_logger_on_first_use=True,
     )
 
-    # === FILE HANDLERS ===
+    # === HELPER: Create rotating file handler ===
+    def create_rotating_handler(filename: str) -> TimedRotatingFileHandler:
+        """Create a handler that rotates logs every 72 hours."""
+        handler = TimedRotatingFileHandler(
+            log_dir / filename,
+            when=ROTATION_WHEN,
+            interval=ROTATION_INTERVAL,
+            backupCount=ROTATION_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        formatter = structlog.stdlib.ProcessorFormatter(
+            processor=file_renderer,
+            foreign_pre_chain=shared_processors,
+        )
+        handler.setFormatter(formatter)
+        handler.setLevel(log_level)
+        return handler
 
-    # 1. Core log handler
-    core_formatter = structlog.stdlib.ProcessorFormatter(
-        processor=file_renderer,
-        foreign_pre_chain=shared_processors,
-    )
-    core_handler = logging.FileHandler(log_dir / CORE_LOG, encoding="utf-8")
-    core_handler.setFormatter(core_formatter)
-    core_handler.setLevel(log_level)
+    # === FILE HANDLERS (with rotation) ===
 
-    # 2. Interaction log handler
-    interaction_formatter = structlog.stdlib.ProcessorFormatter(
-        processor=file_renderer,
-        foreign_pre_chain=shared_processors,
-    )
-    interaction_handler = logging.FileHandler(log_dir / INTERACTION_LOG, encoding="utf-8")
-    interaction_handler.setFormatter(interaction_formatter)
-    interaction_handler.setLevel(log_level)
-
-    # 3. Plugins log handler
-    plugins_formatter = structlog.stdlib.ProcessorFormatter(
-        processor=file_renderer,
-        foreign_pre_chain=shared_processors,
-    )
-    plugins_handler = logging.FileHandler(log_dir / PLUGINS_LOG, encoding="utf-8")
-    plugins_handler.setFormatter(plugins_formatter)
-    plugins_handler.setLevel(log_level)
-
-    # 4. LLM log handler
-    llm_formatter = structlog.stdlib.ProcessorFormatter(
-        processor=file_renderer,
-        foreign_pre_chain=shared_processors,
-    )
-    llm_handler = logging.FileHandler(log_dir / LLM_LOG, encoding="utf-8")
-    llm_handler.setFormatter(llm_formatter)
-    llm_handler.setLevel(log_level)
-
-    # 5. All logs handler (combined)
-    all_formatter = structlog.stdlib.ProcessorFormatter(
-        processor=file_renderer,
-        foreign_pre_chain=shared_processors,
-    )
-    all_handler = logging.FileHandler(log_dir / ALL_LOG, encoding="utf-8")
-    all_handler.setFormatter(all_formatter)
-    all_handler.setLevel(log_level)
+    core_handler = create_rotating_handler(CORE_LOG)
+    interaction_handler = create_rotating_handler(INTERACTION_LOG)
+    plugins_handler = create_rotating_handler(PLUGINS_LOG)
+    llm_handler = create_rotating_handler(LLM_LOG)
+    all_handler = create_rotating_handler(ALL_LOG)
 
     # === CONSOLE HANDLER ===
     console_formatter = structlog.stdlib.ProcessorFormatter(
@@ -126,7 +158,7 @@ def setup_logging(
 
     # === LOGGER CONFIGURATION ===
 
-    # Core logger (AgentCore, PluginRegistry, Config)
+    # Core logger
     core_logger = logging.getLogger("vasily.core")
     core_logger.handlers.clear()
     core_logger.addHandler(core_handler)
@@ -135,7 +167,7 @@ def setup_logging(
     core_logger.setLevel(log_level)
     core_logger.propagate = False
 
-    # Interaction logger (core-to-plugin calls)
+    # Interaction logger
     interaction_logger = logging.getLogger("vasily.interaction")
     interaction_logger.handlers.clear()
     interaction_logger.addHandler(interaction_handler)
@@ -144,7 +176,7 @@ def setup_logging(
     interaction_logger.setLevel(log_level)
     interaction_logger.propagate = False
 
-    # Plugins logger (plugin internals)
+    # Plugins logger
     plugins_logger = logging.getLogger("vasily.plugins")
     plugins_logger.handlers.clear()
     plugins_logger.addHandler(plugins_handler)
@@ -153,7 +185,7 @@ def setup_logging(
     plugins_logger.setLevel(log_level)
     plugins_logger.propagate = False
 
-    # LLM logger (requests/responses)
+    # LLM logger
     llm_logger = logging.getLogger("vasily.llm")
     llm_logger.handlers.clear()
     llm_logger.addHandler(llm_handler)
@@ -178,7 +210,6 @@ def get_logger(category: str, name: str | None = None) -> structlog.stdlib.Bound
         logger = get_logger("core", "AgentCore")
         logger.info("Agent started", plugins_count=4)
     """
-    # Map category to logger name
     logger_names = {
         "core": "vasily.core",
         "interaction": "vasily.interaction",

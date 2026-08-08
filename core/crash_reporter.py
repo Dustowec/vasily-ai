@@ -1,11 +1,12 @@
 """
 Crash Reporter - generates crash reports on fatal errors.
 
-Variant A (Phase 1):
+Features:
 - Reads last N lines from log files
+- Filters logs by request_id (tracks one request across all 4 sources)
+- Filters logs by alert_level (shows CRITICAL_WARNING and CRASH first)
 - Generates JSON + Markdown reports
 - Saves to logs/crash_reports/
-- NO cloud sending (local only)
 """
 
 import json
@@ -23,7 +24,17 @@ LOG_FILES = {
 }
 
 CRASH_REPORT_DIR = "crash_reports"
-MAX_LOG_LINES = 20  # Last N lines to include in report
+MAX_LOG_LINES = 50  # Last N lines to scan for filtering
+
+# Alert level priorities (higher = more critical)
+ALERT_PRIORITIES = {
+    "CRASH": 5,
+    "CRITICAL_WARNING": 4,
+    "WARNING": 3,
+    "REQUEST": 2,
+    "STATE": 1,
+    "DEBUG": 0,
+}
 
 
 class CrashReporter:
@@ -35,12 +46,13 @@ class CrashReporter:
         self.crash_report_dir = log_dir / CRASH_REPORT_DIR
         self.crash_report_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate_report(self, error: BaseException) -> tuple:
+    def generate_report(self, error: BaseException, request_id: str = None) -> tuple:
         """
         Generate crash report in JSON and Markdown formats.
 
         Args:
             error: The exception that caused the crash
+            request_id: Optional request_id to filter logs by
 
         Returns:
             Tuple of (json_path, markdown_path)
@@ -48,16 +60,23 @@ class CrashReporter:
         timestamp = datetime.now()
         timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S")
 
+        # Try to get current request_id if not provided
+        if request_id is None:
+            request_id = self._get_current_request_id()
+
         # Collect data
         error_info = self._collect_error_info(error)
         system_info = self._collect_system_info()
-        recent_logs = self._collect_recent_logs()
+        recent_logs = self._collect_recent_logs(request_id=request_id)
+        critical_alerts = self._extract_critical_alerts(recent_logs)
 
         # Build report
         report = {
             "timestamp": timestamp.isoformat(),
+            "request_id": request_id or "unknown",
             "error": error_info,
             "system": system_info,
+            "critical_alerts": critical_alerts,
             "recent_logs": recent_logs,
         }
 
@@ -73,6 +92,16 @@ class CrashReporter:
             f.write(md_content)
 
         return json_path, md_path
+
+    def _get_current_request_id(self) -> str:
+        """Try to get current request_id from structlog contextvars."""
+        try:
+            import structlog
+
+            ctx = structlog.contextvars.get_contextvars()
+            return ctx.get("request_id", "unknown")
+        except Exception:
+            return "unknown"
 
     def _collect_error_info(self, error: BaseException) -> dict:
         """Collect information about the error."""
@@ -93,8 +122,11 @@ class CrashReporter:
             "processor": platform.processor(),
         }
 
-    def _collect_recent_logs(self) -> dict:
-        """Collect last N lines from each log file."""
+    def _collect_recent_logs(self, request_id: str = None) -> dict:
+        """
+        Collect recent logs from each log file.
+        If request_id is provided, filter by it.
+        """
         recent_logs = {}
 
         for category, filename in LOG_FILES.items():
@@ -103,9 +135,19 @@ class CrashReporter:
                 try:
                     with open(log_path, encoding="utf-8") as f:
                         lines = f.readlines()
-                        recent_logs[category] = [
-                            line.strip() for line in lines[-self.max_log_lines :]
-                        ]
+
+                    # Take last N lines to scan
+                    scan_lines = lines[-self.max_log_lines :]
+
+                    if request_id and request_id != "unknown":
+                        # Filter by request_id
+                        filtered = [line.strip() for line in scan_lines if request_id in line]
+                        recent_logs[category] = (
+                            filtered if filtered else ["No logs found for this request_id"]
+                        )
+                    else:
+                        # No filter, take last 20 lines
+                        recent_logs[category] = [line.strip() for line in scan_lines[-20:]]
                 except Exception as e:
                     recent_logs[category] = [f"Error reading log: {e}"]
             else:
@@ -113,10 +155,57 @@ class CrashReporter:
 
         return recent_logs
 
+    def _extract_critical_alerts(self, recent_logs: dict) -> list:
+        """
+        Extract CRITICAL_WARNING and CRASH alerts from all logs.
+        Sort by priority (CRASH first, then CRITICAL_WARNING).
+        """
+        critical = []
+
+        for category, logs in recent_logs.items():
+            for log_line in logs:
+                try:
+                    log_entry = json.loads(log_line)
+                    alert = log_entry.get("alert_level", "")
+                    if alert in ("CRASH", "CRITICAL_WARNING"):
+                        critical.append(
+                            {
+                                "alert_level": alert,
+                                "category": category,
+                                "timestamp": log_entry.get("timestamp", ""),
+                                "module": log_entry.get("module", ""),
+                                "event": log_entry.get("event", ""),
+                                "priority": ALERT_PRIORITIES.get(alert, 0),
+                            }
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    continue  # Skip non-JSON lines
+
+        # Sort by priority (highest first)
+        critical.sort(key=lambda x: x["priority"], reverse=True)
+        return critical[:10]  # Max 10 critical alerts
+
     def _generate_markdown(self, report: dict) -> str:
         """Generate Markdown report."""
         lines = []
         lines.append(f"# Crash Report: {report['timestamp']}")
+        lines.append("")
+        lines.append(f"**Request ID:** `{report['request_id']}`")
+        lines.append("")
+
+        # Critical alerts section (most important!)
+        lines.append("## 🚨 Critical Alerts")
+        if report["critical_alerts"]:
+            lines.append("| Time | Level | Category | Module | Event |")
+            lines.append("|------|-------|----------|--------|-------|")
+            for alert in report["critical_alerts"]:
+                icon = "🔴" if alert["alert_level"] == "CRASH" else "🟠"
+                lines.append(
+                    f"| {alert['timestamp'][:19]} | {icon} {alert['alert_level']} "
+                    f"| {alert['category']} | {alert['module']} | {alert['event']} |"
+                )
+        else:
+            lines.append("No critical alerts found.")
         lines.append("")
 
         # Error summary
@@ -138,8 +227,8 @@ class CrashReporter:
         lines.append("```")
         lines.append("")
 
-        # Recent logs
-        lines.append("## Recent Logs")
+        # Recent logs by category
+        lines.append("## Recent Logs (filtered by request_id)")
         for category, logs in report["recent_logs"].items():
             lines.append(f"### {category.upper()}")
             lines.append("```")
@@ -161,7 +250,6 @@ def install_crash_handler(log_dir: Path) -> None:
     reporter = CrashReporter(log_dir)
 
     def exception_handler(exc_type, exc_value, exc_traceback):
-        # Generate crash report
         try:
             json_path, md_path = reporter.generate_report(exc_value)
             print(f"\n{'='*60}", file=sys.stderr)
@@ -172,7 +260,6 @@ def install_crash_handler(log_dir: Path) -> None:
         except Exception as e:
             print(f"Failed to generate crash report: {e}", file=sys.stderr)
 
-        # Call default handler
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
     sys.excepthook = exception_handler
