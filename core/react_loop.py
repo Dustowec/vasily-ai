@@ -2,7 +2,7 @@
 
 Mandatory requirements implemented:
 - R1: Plugin errors caught and returned to LLM history, cycle continues.
-- R2: Tool call limit (3 per tool per session), force stop on exceed.
+- R2: Tool call limit (config.max_tool_calls_per_tool), force stop on exceed.
 - R3: KeyboardInterrupt/CancelledError handled, returns partial progress.
 - R4: Step logging across core/llm/interaction journals with request_id.
 - Token management: pair-safe trimming, script-aware tokens (T3-018).
@@ -11,6 +11,7 @@ Mandatory requirements implemented:
 - P1-4: tool_calls kept in history, defensive arguments parsing,
   session timeout, graceful LLM-unavailable result.
 - T3-017.5: deduplication of identical calls with hard limit.
+- P2-1: limits and preview length taken from Config.
 """
 
 import asyncio
@@ -34,9 +35,6 @@ DEFAULT_SYSTEM_PROMPT = (
     "If a tool returns an error, consider another approach or explain the failure."
 )
 
-MAX_TOOL_CALLS_PER_TOOL = 3
-LOG_PREVIEW_LENGTH = 100
-
 
 class ReActLoop:
     """Executes Reasoning + Acting cycle with the LLM and plugins."""
@@ -46,6 +44,8 @@ class ReActLoop:
         self.llm = llm_client
         self.plugin_registry = plugin_registry
         self.max_iterations = config.max_react_iterations
+        self.max_tool_calls = config.max_tool_calls_per_tool
+        self.preview_length = config.log_preview_length
         self.tools = self._build_tools()
 
         self.token_manager = TokenManager(config.llm_num_ctx, config.llm_safety_margin)
@@ -98,7 +98,7 @@ class ReActLoop:
             "ReAct loop started",
             max_iterations=self.max_iterations,
             prompt_type=prompt_type,
-            request_preview=user_request[:LOG_PREVIEW_LENGTH],
+            request_preview=user_request[: self.preview_length],
         )
 
         for iteration in range(self.max_iterations):
@@ -215,7 +215,7 @@ class ReActLoop:
                     interaction_logger.warning("Identical call limit reached", tool=tool_name)
                 else:
                     # R2: per-tool limit counts only real executions
-                    if tool_call_counts.get(tool_name, 0) >= MAX_TOOL_CALLS_PER_TOOL:
+                    if tool_call_counts.get(tool_name, 0) >= self.max_tool_calls:
                         core_logger.warning("Tool call limit exceeded", tool=tool_name)
                         messages.append(
                             {
@@ -234,7 +234,7 @@ class ReActLoop:
                     interaction_logger.info(
                         "Calling plugin",
                         tool=tool_name,
-                        args_preview=str(args)[:LOG_PREVIEW_LENGTH],
+                        args_preview=str(args)[: self.preview_length],
                     )
 
                     # R1: catch plugin errors, feed back to LLM
@@ -267,7 +267,7 @@ class ReActLoop:
                             interaction_logger.info(
                                 "Plugin returned result",
                                 tool=tool_name,
-                                result_preview=tool_content[:LOG_PREVIEW_LENGTH],
+                                result_preview=tool_content[: self.preview_length],
                             )
                     except Exception as e:
                         interaction_logger.error("Plugin failed", tool=tool_name, error=str(e))
@@ -280,7 +280,7 @@ class ReActLoop:
                         "iteration": iteration + 1,
                         "tool": tool_name,
                         "args": args,
-                        "result_preview": tool_content[:LOG_PREVIEW_LENGTH],
+                        "result_preview": tool_content[: self.preview_length],
                     }
                 )
                 messages.append({"role": "tool", "content": tool_content})

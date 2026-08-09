@@ -67,6 +67,7 @@ class AgentCore:
             timeout=self.config.llm_timeout,
             max_retries=self.config.llm_max_retries,
             num_ctx=self.config.llm_num_ctx,
+            retry_delay_base=self.config.llm_retry_delay_base,
         )
 
         self.react_loop = ReActLoop(

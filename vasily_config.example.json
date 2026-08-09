@@ -1,0 +1,15 @@
+{
+  "log_level": "INFO",
+  "dev_mode": false,
+  "llm_model": "vasily-qwen",
+  "llm_num_ctx": 32768,
+  "llm_timeout": 30.0,
+  "llm_max_retries": 2,
+  "llm_retry_delay_base": 1.0,
+  "max_react_iterations": 6,
+  "max_tool_calls_per_tool": 3,
+  "log_preview_length": 100,
+  "request_timeout": 60.0,
+  "searxng_url": "http://localhost:8080/search",
+  "danbooru_url": "https://danbooru.donmai.us"
+}

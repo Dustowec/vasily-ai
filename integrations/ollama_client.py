@@ -7,6 +7,7 @@ Requirements (T3-015):
 - Logging: structlog with request_id (ADR-004)
 - Resilience: 2 retries, then crash report and LLMUnavailableError
 - Context window: num_ctx configurable, auto-injected into options
+- P2-1: retry delay base configurable via Config
 """
 
 import asyncio
@@ -25,8 +26,8 @@ DEFAULT_MODEL = "vasily-qwen"
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_NUM_CTX = 32768
+DEFAULT_RETRY_DELAY_BASE = 1.0
 MAX_RETRIES = 2
-RETRY_DELAY_BASE = 1.0
 
 
 class LLMUnavailableError(Exception):
@@ -46,6 +47,7 @@ class OllamaClient:
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = MAX_RETRIES,
         num_ctx: int = DEFAULT_NUM_CTX,
+        retry_delay_base: float = DEFAULT_RETRY_DELAY_BASE,
         log_dir: str = "logs",
     ):
         self.base_url = base_url.rstrip("/")
@@ -54,6 +56,7 @@ class OllamaClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
         self.num_ctx = num_ctx
+        self.retry_delay_base = retry_delay_base
         self._session: aiohttp.ClientSession | None = None
         self._crash_reporter = CrashReporter(Path(log_dir))
 
@@ -181,7 +184,7 @@ class OllamaClient:
                 last_error = str(e)
 
             if attempt < self.max_retries:
-                delay = RETRY_DELAY_BASE * (2**attempt)
+                delay = self.retry_delay_base * (2**attempt)
                 logger.info("Retrying after delay", delay_seconds=delay)
                 await asyncio.sleep(delay)
 
