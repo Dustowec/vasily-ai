@@ -195,11 +195,12 @@ class AgentCore:
         self.running = True
         logger.info("Agent started", plugins=len(self.plugin_registry))
 
-        def simple_compressor(value: Any) -> str:
-            text = str(value)
-            return text[:100] + "..." if len(text) > 100 else text
+        # Use LLM-powered compressor
+        from memory.llm_compressor import create_compressor
 
-        self.memory.start_background_compression(simple_compressor)
+        llm_compressor = create_compressor(self.llm_client)
+        self.memory.start_background_compression(llm_compressor)
+        logger.info("LLM-powered memory compression enabled")
 
         try:
             await self._cli_loop()
