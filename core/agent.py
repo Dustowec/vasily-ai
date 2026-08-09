@@ -8,7 +8,7 @@ from typing import Any
 import structlog
 
 from core.config import Config
-from core.crash_reporter import install_crash_handler
+from core.crash_reporter import install_async_exception_handler, install_crash_handler
 from core.logging_config import get_logger, setup_logging
 from core.plugin_registry import PluginRegistry
 from core.react_loop import ReActLoop
@@ -33,6 +33,7 @@ class AgentCore:
 
         self.llm_client: OllamaClient | None = None
         self.react_loop: ReActLoop | None = None
+        self._active_request_task: asyncio.Task | None = None
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -42,6 +43,10 @@ class AgentCore:
             json_logs=self.config.json_logs,
         )
         install_crash_handler(self.config.log_dir)
+
+        # Catch unhandled asyncio task exceptions into crash reports
+        loop = asyncio.get_running_loop()
+        install_async_exception_handler(loop, self.config.log_dir)
 
         logger.info(
             "Agent initializing",
@@ -56,7 +61,6 @@ class AgentCore:
             plugins=self.plugin_registry.list_tools(),
         )
 
-        # Initialize LLM client
         self.llm_client = OllamaClient(
             base_url=self.config.llm_url,
             model=self.config.llm_model,
@@ -65,7 +69,6 @@ class AgentCore:
             num_ctx=self.config.llm_num_ctx,
         )
 
-        # Initialize ReAct loop
         self.react_loop = ReActLoop(
             config=self.config,
             llm_client=self.llm_client,
@@ -90,6 +93,13 @@ class AgentCore:
         logger.info("Health check complete", overall=report.get("overall"))
         return report
 
+    def cancel_active_request(self) -> bool:
+        """Cancel the active request task if any. Returns True if cancelled."""
+        if self._active_request_task and not self._active_request_task.done():
+            self._active_request_task.cancel()
+            return True
+        return False
+
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
         """Handle user request using ReAct-powered routing."""
         self._requests_count += 1
@@ -99,7 +109,6 @@ class AgentCore:
         try:
             logger.info("Request received", text=user_text[:50])
 
-            # Special commands handled locally (no LLM needed)
             if user_text.strip().lower() == "status":
                 return {"status": "success", "metrics": self.get_metrics()}
 
@@ -107,10 +116,10 @@ class AgentCore:
                 return {
                     "status": "success",
                     "message": "Available commands: status, help, exit. "
-                    "Any other text is processed by AI with access to plugins.",
+                    "Any other text is processed by AI with access to plugins. "
+                    "Ctrl+C cancels the current request.",
                 }
 
-            # ReAct-powered routing for all other requests
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
@@ -172,7 +181,18 @@ class AgentCore:
                     self.running = False
                     break
 
-                response = await self.handle_request({"id": "cli", "text": raw.strip()})
+                # Run request as a task so Ctrl+C can cancel it
+                task = asyncio.create_task(self.handle_request({"id": "cli", "text": raw.strip()}))
+                self._active_request_task = task
+                try:
+                    response = await task
+                except asyncio.CancelledError:
+                    response = {
+                        "status": "interrupted",
+                        "message": "Request cancelled by user.",
+                    }
+                finally:
+                    self._active_request_task = None
 
                 if response.get("status") == "success":
                     print(f"\n{response.get('message', '')}")
@@ -196,10 +216,10 @@ class AgentCore:
         logger.info("Agent started", plugins=len(self.plugin_registry))
 
         # Use LLM-powered compressor
-        from memory.llm_compressor import create_compressor
+        from memory.llm_compressor import LLMCompressor
 
-        llm_compressor = create_compressor(self.llm_client)
-        self.memory.start_background_compression(llm_compressor)
+        llm_compressor = LLMCompressor(self.llm_client)
+        self.memory.start_background_compression(llm_compressor.compress)
         logger.info("LLM-powered memory compression enabled")
 
         try:
@@ -236,20 +256,18 @@ class AgentCore:
         }
 
 
-def setup_signal_handlers(agent: AgentCore, loop: asyncio.AbstractEventLoop) -> None:
-    """Setup graceful shutdown on Ctrl+C / SIGTERM."""
+def setup_signal_handlers(agent: AgentCore) -> None:
+    """First Ctrl+C cancels the active request; second shuts down."""
 
-    def handle_signal():
-        logger.info("Shutdown signal received")
-        agent.running = False
-        for task in asyncio.all_tasks(loop):
-            task.cancel()
+    def handle_sigint(signum, frame):
+        if agent.cancel_active_request():
+            logger.info("Ctrl+C: active request cancelled, partial progress returned")
+        else:
+            logger.info("Ctrl+C: shutting down")
+            agent.running = False
+            raise KeyboardInterrupt
 
-    try:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, handle_signal)
-    except NotImplementedError:
-        pass
+    signal.signal(signal.SIGINT, handle_sigint)
 
 
 async def main():
@@ -260,8 +278,7 @@ async def main():
     agent = AgentCore(config)
     await agent.initialize()
 
-    loop = asyncio.get_running_loop()
-    setup_signal_handlers(agent, loop)
+    setup_signal_handlers(agent)
 
     try:
         await agent.run()

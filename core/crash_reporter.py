@@ -263,3 +263,27 @@ def install_crash_handler(log_dir: Path, max_log_lines: int = MAX_LOG_LINES) -> 
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
     sys.excepthook = exception_handler
+
+
+def install_async_exception_handler(loop, log_dir: Path) -> None:
+    """
+    Install loop-level handler that generates crash reports
+    for unhandled asyncio task exceptions.
+
+    Args:
+        loop: Running event loop
+        log_dir: Directory for log files
+    """
+    reporter = CrashReporter(log_dir)
+
+    def handler(loop, context):
+        exception = context.get("exception")
+        message = context.get("message", "Unhandled async exception")
+        error = exception if isinstance(exception, Exception) else RuntimeError(message)
+        try:
+            json_path, md_path = reporter.generate_report(error)
+            print(f"\n[ASYNC CRASH] Report generated: {md_path}")
+        except Exception as e:
+            print(f"[ASYNC CRASH] Failed to generate report: {e}")
+
+    loop.set_exception_handler(handler)
