@@ -65,3 +65,13 @@ fix_encoding.py
 # OS
 .DS_Store
 Thumbs.db
+# Runtime data (regeneratable)
+data/*.json
+data/prompts/*.json
+
+# Personal files
+commits_detailed.txt
+Modelfile.txt
+SUMMARY.md
+SUMMARY1.txt
+ПОДСКАЗКИ!!!.txt
