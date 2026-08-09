@@ -240,14 +240,14 @@ class CrashReporter:
         return "\n".join(lines)
 
 
-def install_crash_handler(log_dir: Path) -> None:
+def install_crash_handler(log_dir: Path, max_log_lines: int = MAX_LOG_LINES) -> None:
     """
     Install global exception handler that generates crash reports.
 
     Args:
         log_dir: Directory for log files
     """
-    reporter = CrashReporter(log_dir)
+    reporter = CrashReporter(log_dir, max_log_lines=max_log_lines)
 
     def exception_handler(exc_type, exc_value, exc_traceback):
         try:

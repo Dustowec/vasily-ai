@@ -11,17 +11,24 @@ class Config:
     # Paths
     log_dir: Path = field(default_factory=lambda: Path("logs"))
     data_dir: Path = field(default_factory=lambda: Path("data"))
-    plugins_dir: str = "plugins"  # Package name for plugins
+    plugins_dir: str = "plugins"
 
     # Logging
     log_level: str = "INFO"
     json_logs: bool = True
 
+    # Crash reporter
+    crash_report_lines: int = 50
+
+    # Sanitization (T3-016.5, implementation before Phase 4)
+    sanitize_logs: bool = True
+    max_log_field_length: int = 100
+
     # LLM
     llm_url: str = "http://localhost:11434"
-    llm_model: str = "llama3.2"
+    llm_model: str = "vasily-qwen"
     llm_timeout: float = 30.0
-    llm_auto_start: bool = False  # Try to auto-start LLM if unavailable
+    llm_auto_start: bool = False
     llm_max_retries: int = 2
 
     # Agent behavior
@@ -41,3 +48,7 @@ class Config:
             raise ValueError("request_timeout must be positive")
         if self.llm_max_retries < 0:
             raise ValueError("llm_max_retries must be >= 0")
+        if self.crash_report_lines <= 0:
+            raise ValueError("crash_report_lines must be positive")
+        if self.max_log_field_length <= 0:
+            raise ValueError("max_log_field_length must be positive")

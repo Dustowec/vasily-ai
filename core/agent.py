@@ -35,7 +35,7 @@ class AgentCore:
             level=self.config.log_level,
             json_logs=self.config.json_logs,
         )
-        install_crash_handler(self.config.log_dir)
+        install_crash_handler(self.config.log_dir, self.config.crash_report_lines)
 
         logger.info(
             "Agent initializing",
