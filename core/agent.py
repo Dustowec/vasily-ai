@@ -1,21 +1,25 @@
-"""AgentCore - minimal orchestration layer with interactive CLI."""
+"""AgentCore - orchestration layer with ReAct-powered routing."""
 
 import asyncio
 import signal
 import time
 from typing import Any
 
+import structlog
+
 from core.config import Config
 from core.crash_reporter import install_crash_handler
 from core.logging_config import get_logger, setup_logging
 from core.plugin_registry import PluginRegistry
+from core.react_loop import ReActLoop
+from integrations.ollama_client import LLMUnavailableError, OllamaClient
 from memory.manager import MemoryManager
 
 logger = get_logger("core", "AgentCore")
 
 
 class AgentCore:
-    """Minimal agent core: config, plugins, memory, CLI loop."""
+    """Agent core with ReAct-powered request routing."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -23,10 +27,12 @@ class AgentCore:
         self.memory = MemoryManager()
         self.running = False
 
-        # Metrics
         self._start_time = time.time()
         self._requests_count = 0
         self._errors_count = 0
+
+        self.llm_client: OllamaClient | None = None
+        self.react_loop: ReActLoop | None = None
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -35,7 +41,7 @@ class AgentCore:
             level=self.config.log_level,
             json_logs=self.config.json_logs,
         )
-        install_crash_handler(self.config.log_dir, self.config.crash_report_lines)
+        install_crash_handler(self.config.log_dir)
 
         logger.info(
             "Agent initializing",
@@ -43,7 +49,6 @@ class AgentCore:
             llm_url=self.config.llm_url,
         )
 
-        # Discover plugins (path from config)
         self.plugin_registry.discover_plugins(self.config.plugins_dir)
         logger.info(
             "Plugins loaded",
@@ -51,9 +56,23 @@ class AgentCore:
             plugins=self.plugin_registry.list_tools(),
         )
 
-        # Health check
-        await self.health_check()
+        # Initialize LLM client
+        self.llm_client = OllamaClient(
+            base_url=self.config.llm_url,
+            model=self.config.llm_model,
+            timeout=self.config.llm_timeout,
+            max_retries=self.config.llm_max_retries,
+            num_ctx=self.config.llm_num_ctx,
+        )
 
+        # Initialize ReAct loop
+        self.react_loop = ReActLoop(
+            config=self.config,
+            llm_client=self.llm_client,
+            plugin_registry=self.plugin_registry,
+        )
+
+        await self.health_check()
         logger.info("Agent initialized successfully")
 
     async def health_check(self) -> dict[str, Any]:
@@ -72,71 +91,68 @@ class AgentCore:
         return report
 
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Handle user request with simple keyword routing."""
+        """Handle user request using ReAct-powered routing."""
         self._requests_count += 1
         start = time.time()
-        text = request.get("text", "")
+        user_text = request.get("text", "")
 
         try:
-            logger.info("Request received", text=text[:50])
+            logger.info("Request received", text=user_text[:50])
 
-            # Simple keyword routing (Phase 2 will replace with LLM router)
-            if text.startswith("art "):
-                plugin = self.plugin_registry.get("art_generator")
-                if plugin:
-                    result = await plugin.execute(subject=text[4:])
-                    response = {"status": "success", "message": result.get("prompt", "")}
-                else:
-                    response = {"status": "error", "message": "Art plugin not found"}
+            # Special commands handled locally (no LLM needed)
+            if user_text.strip().lower() == "status":
+                return {"status": "success", "metrics": self.get_metrics()}
 
-            elif text.startswith("search "):
-                plugin = self.plugin_registry.get("web_search")
-                if plugin:
-                    result = await plugin.execute(query=text[7:], limit=3)
-                    response = {"status": "success", "results": result.get("results", [])}
-                else:
-                    response = {"status": "error", "message": "Search plugin not found"}
-
-            elif text.startswith("scrape "):
-                plugin = self.plugin_registry.get("web_scraper")
-                if plugin:
-                    result = await plugin.execute(url=text[7:])
-                    response = {"status": "success", "content": result.get("content", "")[:500]}
-                else:
-                    response = {"status": "error", "message": "Scraper plugin not found"}
-
-            elif text.startswith("tags "):
-                plugin = self.plugin_registry.get("danbooru_search")
-                if plugin:
-                    result = await plugin.execute(query=text[5:], limit=3)
-                    response = {"status": "success", "posts": result.get("posts", [])}
-                else:
-                    response = {"status": "error", "message": "Danbooru plugin not found"}
-
-            elif text == "status":
-                response = {"status": "success", "metrics": self.get_metrics()}
-
-            elif text == "help":
-                response = {
+            if user_text.strip().lower() == "help":
+                return {
                     "status": "success",
-                    "commands": [
-                        "art <subject>",
-                        "search <query>",
-                        "scrape <url>",
-                        "tags <tags>",
-                        "status",
-                        "help",
-                        "exit",
-                    ],
+                    "message": "Available commands: status, help, exit. "
+                    "Any other text is processed by AI with access to plugins.",
                 }
 
-            else:
-                response = {"status": "success", "message": f"Unknown command: {text}"}
+            # ReAct-powered routing for all other requests
+            if not self.react_loop:
+                return {"status": "error", "message": "ReAct loop not initialized"}
+
+            structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
+
+            result = await self.react_loop.run(user_text)
 
             duration_ms = (time.time() - start) * 1000
-            logger.info("Request completed", duration_ms=round(duration_ms, 2))
-            return response
+            logger.info(
+                "Request completed",
+                status=result.get("status"),
+                iterations=result.get("iterations"),
+                duration_ms=round(duration_ms, 2),
+            )
 
+            if result.get("status") == "success":
+                return {
+                    "status": "success",
+                    "message": result.get("answer", ""),
+                    "iterations": result.get("iterations"),
+                    "steps": result.get("steps", []),
+                }
+            elif result.get("status") == "interrupted":
+                return {
+                    "status": "interrupted",
+                    "message": result.get("answer", ""),
+                    "iterations": result.get("iterations"),
+                }
+            else:
+                return {
+                    "status": "error",
+                    "message": f"ReAct loop ended with status: {result.get('status')}",
+                    "answer": result.get("answer", ""),
+                }
+
+        except LLMUnavailableError as e:
+            self._errors_count += 1
+            logger.error("LLM unavailable", error=str(e))
+            return {
+                "status": "error",
+                "message": "AI is temporarily unavailable. Try again later.",
+            }
         except Exception as e:
             self._errors_count += 1
             logger.error("Request failed", error=str(e))
@@ -158,28 +174,14 @@ class AgentCore:
 
                 response = await self.handle_request({"id": "cli", "text": raw.strip()})
 
-                # Pretty print response
                 if response.get("status") == "success":
-                    if "message" in response:
-                        print(f"✓ {response['message']}")
-                    elif "results" in response:
-                        print(f"✓ Found {len(response['results'])} results:")
-                        for r in response["results"]:
-                            print(f"  - {r.get('title', r)}")
-                    elif "posts" in response:
-                        print(f"✓ Found {len(response['posts'])} posts:")
-                        for p in response["posts"]:
-                            print(f"  - ID {p.get('id')}: {p.get('tags', '')[:60]}")
-                    elif "metrics" in response:
-                        print(f"✓ Metrics: {response['metrics']}")
-                    elif "commands" in response:
-                        print("✓ Available commands:")
-                        for cmd in response["commands"]:
-                            print(f"  - {cmd}")
-                    else:
-                        print(f"✓ {response}")
+                    print(f"\n{response.get('message', '')}")
+                    if "iterations" in response:
+                        print(f"[Iterations: {response['iterations']}]")
+                elif response.get("status") == "interrupted":
+                    print(f"\n[Interrupted] {response.get('message', '')}")
                 else:
-                    print(f"✗ Error: {response.get('message', 'Unknown error')}")
+                    print(f"\n[Error] {response.get('message', 'Unknown error')}")
 
             except EOFError:
                 break
@@ -193,7 +195,6 @@ class AgentCore:
         self.running = True
         logger.info("Agent started", plugins=len(self.plugin_registry))
 
-        # Start background memory compression
         def simple_compressor(value: Any) -> str:
             text = str(value)
             return text[:100] + "..." if len(text) > 100 else text
@@ -211,10 +212,11 @@ class AgentCore:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
 
-        # Stop background tasks
         self.memory.stop_background_compression()
 
-        # Log final metrics
+        if self.llm_client:
+            await self.llm_client.close()
+
         metrics = self.get_metrics()
         logger.info("Final metrics", **metrics)
 
@@ -246,7 +248,6 @@ def setup_signal_handlers(agent: AgentCore, loop: asyncio.AbstractEventLoop) -> 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, handle_signal)
     except NotImplementedError:
-        # Windows doesn't fully support add_signal_handler
         pass
 
 
