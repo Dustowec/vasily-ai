@@ -6,12 +6,14 @@ Mandatory requirements implemented:
 - R3: KeyboardInterrupt handled, returns partial progress.
 - R4: Step logging across core/llm/interaction journals with request_id.
 - Token management: context window control (T3-018).
+- Golden Prompts: curated system prompts per task type (T3-020).
 """
 
 import asyncio
 import json
 from typing import Any
 
+from core.golden_prompts import GoldenPromptsLibrary
 from core.logging_config import get_logger
 from core.token_manager import TokenManager
 
@@ -19,7 +21,7 @@ core_logger = get_logger("core", "ReActLoop")
 llm_logger = get_logger("llm", "ReActLoop")
 interaction_logger = get_logger("interaction", "ReActLoop")
 
-SYSTEM_PROMPT = (
+DEFAULT_SYSTEM_PROMPT = (
     "You are Vasily, a helpful AI agent. You can use tools to accomplish tasks. "
     "Think step by step. If a tool is needed, call it. "
     "When you have the final answer, respond directly without tool calls. "
@@ -42,6 +44,9 @@ class ReActLoop:
 
         # Token manager with num_ctx from config
         self.token_manager = TokenManager(config.llm_num_ctx)
+
+        # Golden prompts library
+        self.prompts_library = GoldenPromptsLibrary()
 
     def _build_tools(self) -> list[dict[str, Any]]:
         """Convert plugin schemas to Ollama tool format."""
@@ -73,10 +78,11 @@ class ReActLoop:
             )
         return tools
 
-    async def run(self, user_request: str) -> dict[str, Any]:
+    async def run(self, user_request: str, prompt_type: str = "default") -> dict[str, Any]:
         """Run the ReAct cycle for a user request."""
+        system_prompt = self.prompts_library.get_prompt(prompt_type) or DEFAULT_SYSTEM_PROMPT
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_request},
         ]
         tool_call_counts: dict[str, int] = {}
@@ -85,6 +91,7 @@ class ReActLoop:
         core_logger.info(
             "ReAct loop started",
             max_iterations=self.max_iterations,
+            prompt_type=prompt_type,
             request_preview=user_request[:LOG_PREVIEW_LENGTH],
         )
 
