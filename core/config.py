@@ -30,10 +30,12 @@ class Config:
     llm_timeout: float = 30.0
     llm_auto_start: bool = False
     llm_max_retries: int = 2
+    llm_num_ctx: int = 32768
 
     # Agent behavior
     max_concurrent_requests: int = 5
     request_timeout: float = 60.0
+    max_react_iterations: int = 10
 
     @classmethod
     def load(cls) -> "Config":
@@ -48,7 +50,11 @@ class Config:
             raise ValueError("request_timeout must be positive")
         if self.llm_max_retries < 0:
             raise ValueError("llm_max_retries must be >= 0")
+        if self.llm_num_ctx <= 0:
+            raise ValueError("llm_num_ctx must be positive")
         if self.crash_report_lines <= 0:
             raise ValueError("crash_report_lines must be positive")
         if self.max_log_field_length <= 0:
             raise ValueError("max_log_field_length must be positive")
+        if self.max_react_iterations <= 0:
+            raise ValueError("max_react_iterations must be positive")

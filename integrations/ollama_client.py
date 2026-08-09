@@ -6,6 +6,7 @@ Requirements (T3-015):
 - Async: aiohttp only (ADR-001)
 - Logging: structlog with request_id (ADR-004)
 - Resilience: 2 retries, then crash report and LLMUnavailableError
+- Context window: num_ctx configurable, auto-injected into options
 """
 
 import asyncio
@@ -23,6 +24,7 @@ DEFAULT_URL = "http://localhost:11434"
 DEFAULT_MODEL = "vasily-qwen"
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_TIMEOUT = 30.0
+DEFAULT_NUM_CTX = 32768
 MAX_RETRIES = 2
 RETRY_DELAY_BASE = 1.0
 
@@ -43,6 +45,7 @@ class OllamaClient:
         temperature: float = DEFAULT_TEMPERATURE,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = MAX_RETRIES,
+        num_ctx: int = DEFAULT_NUM_CTX,
         log_dir: str = "logs",
     ):
         self.base_url = base_url.rstrip("/")
@@ -50,8 +53,17 @@ class OllamaClient:
         self.temperature = temperature
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
+        self.num_ctx = num_ctx
         self._session: aiohttp.ClientSession | None = None
         self._crash_reporter = CrashReporter(Path(log_dir))
+
+    def _build_options(self, **kwargs) -> dict[str, Any]:
+        """Build options dict. kwargs override defaults (including num_ctx)."""
+        return {
+            "temperature": self.temperature,
+            "num_ctx": self.num_ctx,
+            **kwargs,
+        }
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
@@ -88,10 +100,7 @@ class OllamaClient:
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {
-                "temperature": self.temperature,
-                **kwargs,
-            },
+            "options": self._build_options(**kwargs),
         }
         if tools:
             payload["tools"] = tools
@@ -104,10 +113,7 @@ class OllamaClient:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": self.temperature,
-                **kwargs,
-            },
+            "options": self._build_options(**kwargs),
         }
         return await self._request_with_retries("/api/generate", payload)
 
