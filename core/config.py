@@ -20,6 +20,9 @@ class Config:
     # Crash reporter
     crash_report_lines: int = 50
 
+    # Development mode: allow mock data from plugins
+    dev_mode: bool = False
+
     # Sanitization (T3-016.5, implementation before Phase 4)
     sanitize_logs: bool = True
     max_log_field_length: int = 100

@@ -181,7 +181,26 @@ class ReActLoop:
                     if plugin is None:
                         raise ValueError(f"Plugin not found: {tool_name}")
                     result = await plugin.execute(**args)
-                    tool_content = json.dumps(result, ensure_ascii=False)
+
+                    # P1-3: block mock data outside dev_mode
+                    if (
+                        isinstance(result, dict)
+                        and result.get("source") == "mock"
+                        and not self.config.dev_mode
+                    ):
+                        tool_content = json.dumps(
+                            {
+                                "status": "error",
+                                "error": (
+                                    f"Tool '{tool_name}' backend is unavailable. "
+                                    "Mock data is disabled outside dev_mode."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                        interaction_logger.warning("Mock result blocked", tool=tool_name)
+                    else:
+                        tool_content = json.dumps(result, ensure_ascii=False)
                     interaction_logger.info(
                         "Plugin returned result",
                         tool=tool_name,
