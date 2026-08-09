@@ -5,11 +5,11 @@ from typing import Any
 import aiohttp
 
 from core.base_tool import BaseTool
+from core.config import Config
 from core.logging_config import get_logger
+from core.plugin_types import make_error
 
 logger = get_logger("plugins", "DanbooruTool")
-
-DANBOORU_API = "https://danbooru.donmai.us"
 
 
 class DanbooruTool(BaseTool):
@@ -17,26 +17,40 @@ class DanbooruTool(BaseTool):
 
     name = "danbooru_search"
     description = "Search Danbooru for anime art tags and posts"
-    version = "1.0.0"
+    version = "1.1.0"
 
     async def execute(self, query: str = "", limit: int = 10, **kwargs) -> dict[str, Any]:
-        """Search Danbooru posts by tags. Falls back to mock data if API unavailable."""
+        """Search Danbooru posts by tags.
+
+        dev_mode: mock data on backend failure.
+        production: typed PluginErrorResult on backend failure.
+        """
+        config = Config.load()
         logger.info("Danbooru search started", query=query, limit=limit)
 
         try:
             async with aiohttp.ClientSession() as session:
-                url = f"{DANBOORU_API}/posts.json"
+                url = f"{config.danbooru_url}/posts.json"
                 params = {"tags": query, "limit": limit}
                 timeout = aiohttp.ClientTimeout(total=10)
-
                 async with session.get(url, params=params, timeout=timeout) as response:
                     if response.status != 200:
-                        logger.error("Danbooru API error", status=response.status)
-                        return self._mock_response(query, limit)
-
+                        logger.error(
+                            "Danbooru API error",
+                            status=response.status,
+                            error_type="http_error",
+                        )
+                        if config.dev_mode:
+                            return self._mock_response(query, limit)
+                        return make_error(
+                            "http_error",
+                            f"Danbooru API returned HTTP {response.status}",
+                            "Danbooru backend is malfunctioning. Do not retry the "
+                            "same call. Inform the user or try another tool.",
+                            http_status=response.status,
+                        )
                     posts = await response.json()
                     logger.info("Danbooru search complete", results_count=len(posts))
-
                     return {
                         "status": "success",
                         "source": "api",
@@ -52,13 +66,19 @@ class DanbooruTool(BaseTool):
                             for p in posts[:limit]
                         ],
                     }
-
         except Exception as e:
-            logger.warning("Danbooru API unavailable, using mock data", error=str(e))
-            return self._mock_response(query, limit)
+            logger.error("Danbooru API unavailable", error=str(e), error_type="connection_failed")
+            if config.dev_mode:
+                return self._mock_response(query, limit)
+            return make_error(
+                "connection_failed",
+                f"Cannot connect to Danbooru API: {e}",
+                "Danbooru backend unavailable. Do not retry the same call. "
+                "Inform the user and suggest trying later.",
+            )
 
     def _mock_response(self, query: str, limit: int) -> dict[str, Any]:
-        """Return mock data when API is unavailable."""
+        """Return mock data when API is unavailable (dev_mode only)."""
         logger.info("Using mock data", query=query)
         return {
             "status": "success",

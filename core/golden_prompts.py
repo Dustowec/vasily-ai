@@ -9,6 +9,15 @@ logger = get_logger("core", "GoldenPrompts")
 
 DEFAULT_PROMPTS_FILE = "data/prompts/golden.json"
 
+ERROR_HANDLING_RULES = (
+    "ERROR HANDLING RULES: When a tool returns an error with error_type "
+    "'backend_unavailable', 'connection_failed' or 'http_error', do not retry "
+    "the same call with the same arguments. Either try a different approach "
+    "(another tool or different parameters) or provide a final answer "
+    "explaining that the service is temporarily unavailable and suggesting "
+    "to try later."
+)
+
 
 class GoldenPromptsLibrary:
     """Library of curated system prompts for different task types."""
@@ -52,7 +61,8 @@ class GoldenPromptsLibrary:
                     "You are Vasily, a helpful AI agent. You can use tools to "
                     "accomplish tasks. Think step by step. If a tool is needed, "
                     "call it. When you have the final answer, respond directly "
-                    "without tool calls."
+                    "without tool calls. If a tool returns an error, consider "
+                    "another approach or explain the failure. " + ERROR_HANDLING_RULES
                 ),
             },
             "search": {
@@ -61,7 +71,7 @@ class GoldenPromptsLibrary:
                 "prompt": (
                     "You are Vasily, a web research specialist. Use web_search "
                     "and web_scraper tools to find information. Always cite "
-                    "sources. Summarize findings clearly and concisely."
+                    "sources. Summarize findings clearly and concisely. " + ERROR_HANDLING_RULES
                 ),
             },
             "art": {

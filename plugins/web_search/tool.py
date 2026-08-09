@@ -5,11 +5,11 @@ from typing import Any
 import aiohttp
 
 from core.base_tool import BaseTool
+from core.config import Config
 from core.logging_config import get_logger
+from core.plugin_types import make_error
 
 logger = get_logger("plugins", "WebSearchTool")
-
-SEARXNG_URL = "http://localhost:8080/search"
 
 
 class WebSearchTool(BaseTool):
@@ -17,26 +17,42 @@ class WebSearchTool(BaseTool):
 
     name = "web_search"
     description = "Search the web for information"
-    version = "1.0.0"
+    version = "1.1.0"
 
     async def execute(self, query: str = "", limit: int = 5, **kwargs) -> dict[str, Any]:
-        """Search web via SearXNG. Falls back to mock data if unavailable."""
+        """Search web via SearXNG.
+
+        dev_mode: mock data on backend failure.
+        production: typed PluginErrorResult on backend failure.
+        """
+        config = Config.load()
         logger.info("Web search started", query=query, limit=limit)
 
         try:
             async with aiohttp.ClientSession() as session:
                 params = {"q": query, "format": "json"}
                 timeout = aiohttp.ClientTimeout(total=10)
-
-                async with session.get(SEARXNG_URL, params=params, timeout=timeout) as response:
+                async with session.get(
+                    config.searxng_url, params=params, timeout=timeout
+                ) as response:
                     if response.status != 200:
-                        logger.error("SearXNG error", status=response.status)
-                        return self._mock_response(query, limit)
-
+                        logger.error(
+                            "SearXNG error",
+                            status=response.status,
+                            error_type="http_error",
+                        )
+                        if config.dev_mode:
+                            return self._mock_response(query, limit)
+                        return make_error(
+                            "http_error",
+                            f"Search backend returned HTTP {response.status}",
+                            "Search backend is malfunctioning. Do not retry the "
+                            "same call. Inform the user or try another tool.",
+                            http_status=response.status,
+                        )
                     data = await response.json()
                     results = data.get("results", [])[:limit]
                     logger.info("Web search complete", results_count=len(results))
-
                     return {
                         "status": "success",
                         "source": "searxng",
@@ -51,13 +67,19 @@ class WebSearchTool(BaseTool):
                             for r in results
                         ],
                     }
-
         except Exception as e:
-            logger.warning("SearXNG unavailable, using mock data", error=str(e))
-            return self._mock_response(query, limit)
+            logger.error("SearXNG unavailable", error=str(e), error_type="connection_failed")
+            if config.dev_mode:
+                return self._mock_response(query, limit)
+            return make_error(
+                "connection_failed",
+                f"Cannot connect to search backend: {e}",
+                "Search backend unavailable. Do not retry the same call. "
+                "Inform the user and suggest trying later.",
+            )
 
     def _mock_response(self, query: str, limit: int) -> dict[str, Any]:
-        """Return mock data when SearXNG is unavailable."""
+        """Return mock data when SearXNG is unavailable (dev_mode only)."""
         logger.info("Using mock data", query=query)
         return {
             "status": "success",

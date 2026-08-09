@@ -13,6 +13,10 @@ class Config:
     data_dir: Path = field(default_factory=lambda: Path("data"))
     plugins_dir: str = "plugins"
 
+    # External backends (plugins)
+    searxng_url: str = "http://localhost:8080/search"
+    danbooru_url: str = "https://danbooru.donmai.us"
+
     # Logging
     log_level: str = "INFO"
     json_logs: bool = True
@@ -34,11 +38,12 @@ class Config:
     llm_auto_start: bool = False
     llm_max_retries: int = 2
     llm_num_ctx: int = 32768
+    llm_safety_margin: int = 1000
 
     # Agent behavior
     max_concurrent_requests: int = 5
     request_timeout: float = 60.0
-    max_react_iterations: int = 10
+    max_react_iterations: int = 6
 
     @classmethod
     def load(cls) -> "Config":
@@ -55,6 +60,8 @@ class Config:
             raise ValueError("llm_max_retries must be >= 0")
         if self.llm_num_ctx <= 0:
             raise ValueError("llm_num_ctx must be positive")
+        if self.llm_safety_margin < 0:
+            raise ValueError("llm_safety_margin must be >= 0")
         if self.crash_report_lines <= 0:
             raise ValueError("crash_report_lines must be positive")
         if self.max_log_field_length <= 0:
