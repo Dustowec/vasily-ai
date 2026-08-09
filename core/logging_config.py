@@ -16,6 +16,7 @@ Alert levels (auto-detected):
 - CRASH             - Fatal crash (CRITICAL)
 """
 
+import hashlib
 import logging
 import sys
 from logging.handlers import TimedRotatingFileHandler
@@ -75,6 +76,83 @@ def alert_level_processor(logger, method_name, event_dict):
     return event_dict
 
 
+def sanitize_processor(logger, method_name, event_dict):
+    """
+    Sanitize sensitive fields based on log level and config.
+
+    T3-016.5 / P3-1:
+    - Critical keys (password, token, authorization, cookie) -> [REDACTED]
+    - Sensitive keys (prompt, query, url, content, ...) ->
+        - INFO/WARNING/DEBUG: truncate to max_log_field_length
+        - ERROR/CRITICAL: replace with metadata {length, hash}
+    - Respects sanitize_logs=False (dev/debug mode)
+    """
+    from core.config import Config
+
+    config = Config.load()
+    if not config.sanitize_logs:
+        return event_dict
+
+    level = event_dict.get("level", "info").lower()
+    redact_keys = set(config.log_redact_keys)
+    sensitive_keys = set(config.log_sensitive_keys)
+
+    # Keys that are not subject to sanitization
+    system_keys = {
+        "timestamp",
+        "level",
+        "module",
+        "logger",
+        "request_id",
+        "event",
+        "exc_info",
+        "alert_level",
+    }
+
+    for key in list(event_dict.keys()):
+        if key in system_keys:
+            continue
+
+        value = event_dict[key]
+
+        # Critical keys -> [REDACTED] on any level
+        if key in redact_keys:
+            event_dict[key] = "[REDACTED]"
+            continue
+
+        # Sensitive keys -> truncate or mask
+        if key in sensitive_keys:
+            event_dict[key] = _sanitize_value(value, level, sensitive_keys, redact_keys, config)
+
+    return event_dict
+
+
+def _sanitize_value(value, level, sensitive_keys, redact_keys, config):
+    """Recursively sanitize a single value."""
+    if isinstance(value, str):
+        if level in ("error", "critical"):
+            return {
+                "length": len(value),
+                "hash": hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:8],
+            }
+        if len(value) > config.max_log_field_length:
+            return value[: config.max_log_field_length] + "..."
+        return value
+
+    if isinstance(value, dict):
+        result = {}
+        for k, v in value.items():
+            if k in redact_keys:
+                result[k] = "[REDACTED]"
+            elif k in sensitive_keys:
+                result[k] = _sanitize_value(v, level, sensitive_keys, redact_keys, config)
+            else:
+                result[k] = v
+        return result
+
+    return value
+
+
 def setup_logging(
     log_dir: Path,
     level: str = "INFO",
@@ -99,6 +177,7 @@ def setup_logging(
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         alert_level_processor,  # Auto-detect alert_level
+        sanitize_processor,  # T3-016.5: sensitive data redaction
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.TimeStamper(fmt="iso"),

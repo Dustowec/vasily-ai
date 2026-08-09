@@ -8,7 +8,7 @@ Loading priority (highest to lowest):
 
 import json
 import os
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -34,9 +34,29 @@ class Config:
     # Development mode: allow mock data from plugins
     dev_mode: bool = False
 
-    # Sanitization (T3-016.5, implementation before Phase 4)
+    # Sanitization (T3-016.5)
     sanitize_logs: bool = True
     max_log_field_length: int = 100
+    log_sensitive_keys: list[str] = field(
+        default_factory=lambda: [
+            "password",
+            "token",
+            "authorization",
+            "cookie",
+            "email",
+            "prompt",
+            "query",
+            "url",
+            "content",
+            "text",
+            "message",
+            "subject",
+            "tags",
+        ]
+    )
+    log_redact_keys: list[str] = field(
+        default_factory=lambda: ["password", "token", "authorization", "cookie"]
+    )
 
     # LLM
     llm_url: str = "http://localhost:11434"

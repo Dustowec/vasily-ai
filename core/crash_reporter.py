@@ -46,6 +46,58 @@ class CrashReporter:
         self.crash_report_dir = log_dir / CRASH_REPORT_DIR
         self.crash_report_dir.mkdir(parents=True, exist_ok=True)
 
+    def _sanitize_recent_logs(self, recent_logs: dict) -> dict:
+        """Apply sanitization to recent log lines before saving."""
+        from core.config import Config
+
+        config = Config.load()
+        if not config.sanitize_logs:
+            return recent_logs
+
+        redact_keys = set(config.log_redact_keys)
+        sensitive_keys = set(config.log_sensitive_keys)
+        max_len = config.max_log_field_length
+
+        sanitized = {}
+        for category, logs in recent_logs.items():
+            if not isinstance(logs, list):
+                sanitized[category] = logs
+                continue
+
+            new_logs = []
+            for line in logs:
+                # Parse JSON if possible
+                if isinstance(line, str):
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        new_logs.append(line)
+                        continue
+                elif isinstance(line, dict):
+                    data = line
+                else:
+                    new_logs.append(line)
+                    continue
+
+                # Sanitize data
+                for key in list(data.keys()):
+                    if key in redact_keys:
+                        data[key] = "[REDACTED]"
+                    elif key in sensitive_keys:
+                        value = data.get(key)
+                        if isinstance(value, str) and len(value) > max_len:
+                            data[key] = value[:max_len] + "..."
+
+                # Convert back to JSON string if it was originally a string
+                if isinstance(line, str):
+                    new_logs.append(json.dumps(data, ensure_ascii=False))
+                else:
+                    new_logs.append(data)
+
+            sanitized[category] = new_logs
+
+        return sanitized
+
     def generate_report(self, error: BaseException, request_id: str = None) -> tuple:
         """
         Generate crash report in JSON and Markdown formats.
@@ -80,10 +132,13 @@ class CrashReporter:
             "recent_logs": recent_logs,
         }
 
+        # Sanitize recent logs before saving
+        report["recent_logs"] = self._sanitize_recent_logs(report["recent_logs"])
+
         # Save JSON report
         json_path = self.crash_report_dir / f"crash_{timestamp_str}.json"
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+            json.dump(report, f, indent=2, ensure_ascii=False, default=str)
 
         # Save Markdown report
         md_path = self.crash_report_dir / f"crash_{timestamp_str}.md"
