@@ -87,6 +87,7 @@ class OllamaClient:
         payload = {
             "model": self.model,
             "messages": messages,
+            "stream": False,
             "options": {
                 "temperature": self.temperature,
                 **kwargs,
@@ -102,6 +103,7 @@ class OllamaClient:
         payload = {
             "model": self.model,
             "prompt": prompt,
+            "stream": False,
             "options": {
                 "temperature": self.temperature,
                 **kwargs,
