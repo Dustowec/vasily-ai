@@ -1,5 +1,6 @@
 """Web Scraper plugin - extracts content from web pages with SSRF protection."""
 
+import asyncio
 import ipaddress
 import socket
 from typing import Any
@@ -16,6 +17,9 @@ from core.plugin_types import make_error
 logger = get_logger("plugins", "WebScraperTool")
 
 ALLOWED_SCHEMES = ("http", "https")
+MAX_URL_LENGTH = 2048
+MAX_HTML_BYTES = 2 * 1024 * 1024  # 2 MB cap on downloaded HTML
+DNS_TIMEOUT_SECONDS = 3.0
 
 
 class WebScraperTool(BaseTool):
@@ -26,7 +30,7 @@ class WebScraperTool(BaseTool):
     version = "1.2.0"
 
     async def execute(self, url: str = "", **kwargs) -> dict[str, Any]:
-        """Scrape a web page with URL validation.
+        """Scrape a web page with URL validation and HTML size cap.
 
         dev_mode: mock data on backend failure.
         production: typed PluginErrorResult on backend failure.
@@ -39,6 +43,13 @@ class WebScraperTool(BaseTool):
                 "invalid_url",
                 "URL is required",
                 "Provide a valid URL to scrape.",
+            )
+
+        if len(url) > MAX_URL_LENGTH:
+            return make_error(
+                "invalid_url",
+                f"URL too long ({len(url)} characters)",
+                "Provide a shorter, valid URL to scrape.",
             )
 
         # SSRF protection: validate URL before making request
@@ -75,7 +86,18 @@ class WebScraperTool(BaseTool):
                             "or inform the user that the page is inaccessible.",
                             http_status=response.status,
                         )
-                    html = await response.text()
+
+                    # T3-017.6: bounded read - stop at MAX_HTML_BYTES + 1 byte
+                    raw = await response.content.read(MAX_HTML_BYTES + 1)
+                    if len(raw) > MAX_HTML_BYTES:
+                        logger.warning(
+                            "HTML response too large, truncated",
+                            limit_bytes=MAX_HTML_BYTES,
+                        )
+                        raw = raw[:MAX_HTML_BYTES]
+                    encoding = response.charset or "utf-8"
+                    html = raw.decode(encoding, errors="replace")
+
                     soup = BeautifulSoup(html, "html.parser")
                     for element in soup(["script", "style", "nav", "footer"]):
                         element.decompose()
@@ -108,12 +130,7 @@ class WebScraperTool(BaseTool):
         """Validate URL for SSRF protection.
 
         Returns:
-            None if URL is valid, or error type string if blocked.
-
-        Checks:
-            1. Scheme whitelist (http, https only)
-            2. Hostname not empty
-            3. Resolved IP addresses are not private/loopback/link-local
+            None if URL is valid, or a reason string if blocked.
         """
         if not url or not isinstance(url, str):
             return "empty_or_invalid"
@@ -131,7 +148,7 @@ class WebScraperTool(BaseTool):
         if not hostname:
             return "no_hostname"
 
-        # Check for literal localhost
+        # Literal localhost
         if hostname.lower() in ("localhost", "localhost.localdomain"):
             return "localhost"
 
@@ -140,52 +157,57 @@ class WebScraperTool(BaseTool):
             ip = ipaddress.ip_address(hostname)
             if self._is_private_ip(ip):
                 return f"private_ip:{ip}"
-            return None  # Valid external IP
+            return None
         except ValueError:
-            # Not an IP address, treat as hostname
             pass
 
-        # DNS resolution: check all resolved IPs
+        # DNS resolution (bounded by timeout)
         try:
-            # Use getaddrinfo to resolve hostname
-            loop = None
-            try:
-                import asyncio
-
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
-            if loop:
-                # Async DNS resolution
-                infos = await loop.getaddrinfo(
-                    hostname, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
-                )
-            else:
-                # Sync fallback (should not happen in async context)
-                infos = socket.getaddrinfo(hostname, None)
-
-            for _family, _type, _proto, _canonname, sockaddr in infos:
-                ip_str = sockaddr[0]
-                try:
-                    ip = ipaddress.ip_address(ip_str)
-                    if self._is_private_ip(ip):
-                        return f"private_ip:{ip_str}"
-                except ValueError:
-                    continue
-
-            return None  # All resolved IPs are external
-
+            infos = await self._resolve_hostname(hostname)
         except socket.gaierror:
-            # DNS resolution failed: not an SSRF issue, let aiohttp handle
-            # the connection attempt and return its own error.
-            return None
+            return None  # Let aiohttp report the connection failure
         except Exception as e:
             logger.warning("DNS resolution error", error=str(e))
             return None
 
+        if infos is None:
+            return None  # DNS timeout -> pass through
+
+        for _family, _type, _proto, _canonname, sockaddr in infos:
+            ip_str = sockaddr[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                if self._is_private_ip(ip):
+                    return f"private_ip:{ip_str}"
+            except ValueError:
+                continue
+
+        return None
+
+    async def _resolve_hostname(self, hostname: str):
+        """Resolve hostname with a bounded timeout (T3-017.6).
+
+        Returns a list of addrinfo tuples, or None on timeout.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.getaddrinfo(
+                    hostname,
+                    None,
+                    family=socket.AF_UNSPEC,
+                    type=socket.SOCK_STREAM,
+                ),
+                timeout=DNS_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("DNS resolution timed out", hostname=hostname)
+            return None
+
     @staticmethod
-    def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    def _is_private_ip(
+        ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> bool:
         """Check if IP address is private, loopback, or link-local."""
         return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
 

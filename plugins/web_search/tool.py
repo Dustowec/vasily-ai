@@ -25,6 +25,7 @@ class WebSearchTool(BaseTool):
         dev_mode: mock data on backend failure.
         production: typed PluginErrorResult on backend failure.
         """
+        query, limit = self._validate_inputs(query, limit)
         config = Config.load()
         logger.info("Web search started", query=query, limit=limit)
 
@@ -77,6 +78,16 @@ class WebSearchTool(BaseTool):
                 "Search backend unavailable. Do not retry the same call. "
                 "Inform the user and suggest trying later.",
             )
+
+    @staticmethod
+    def _validate_inputs(query: Any, limit: Any) -> tuple[str, int]:
+        """Clamp plugin inputs to safe ranges (T3-017.6)."""
+        query = str(query)[:500]
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 5
+        return query, min(max(limit, 1), 100)
 
     def _mock_response(self, query: str, limit: int) -> dict[str, Any]:
         """Return mock data when SearXNG is unavailable (dev_mode only)."""
