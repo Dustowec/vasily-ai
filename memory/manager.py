@@ -57,18 +57,22 @@ class MemoryManager:
     async def recall(self, key: str, default: Any = None) -> Any:
         """Retrieve from hot (if not expired) or cold with locking."""
         async with self._lock:
-            entry = self.hot.get_all_entries().get(key)
-            if entry:
-                created = datetime.fromisoformat(entry["created_at"])
-                age = datetime.now() - created
-                if age.total_seconds() < HOT_RETENTION_HOURS * 3600:
-                    return entry.get("value")
-                logger.debug("Hot entry expired", key=key)
+            return self._recall_unlocked(key, default)
 
-            cold_entry = self._cold_data.get(key)
-            if cold_entry:
-                return cold_entry.get("summary")
-            return default
+    def _recall_unlocked(self, key: str, default: Any = None) -> Any:
+        """Lock-free recall. Caller must already hold self._lock."""
+        entry = self.hot.get_all_entries().get(key)
+        if entry:
+            created = datetime.fromisoformat(entry["created_at"])
+            age = datetime.now() - created
+            if age.total_seconds() < HOT_RETENTION_HOURS * 3600:
+                return entry.get("value")
+            logger.debug("Hot entry expired", key=key)
+
+        cold_entry = self._cold_data.get(key)
+        if cold_entry:
+            return cold_entry.get("summary")
+        return default
 
     async def forget(self, key: str) -> bool:
         """Remove from both tiers with locking."""
@@ -140,7 +144,7 @@ class MemoryManager:
 
             hot_keys = list(self.hot.get_all_entries().keys())[-5:]
             for key in hot_keys:
-                value = await self.recall(key)
+                value = self._recall_unlocked(key)
                 if value is not None:
                     parts.append(f"[HOT] {key}: {str(value)[:200]}")
 
