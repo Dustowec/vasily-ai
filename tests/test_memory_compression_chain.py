@@ -100,28 +100,26 @@ async def test_failing_compressor_keeps_entry(memory_paths, monkeypatch):
     assert "k1" not in manager._cold_data
 
 
-async def test_background_compression_start_stop(memory_paths, monkeypatch):
+async def test_compress_cycle_runs_through_scheduler(memory_paths, monkeypatch):
+    """ADR-005: compression is driven by PeriodicScheduler, not by own worker."""
     monkeypatch.setattr(mm, "HOT_RETENTION_HOURS", 0)
     manager = mm.MemoryManager()
     await manager.remember("k", "data")
     compressor = FakeCompressor()
 
-    manager.start_background_compression(compressor)
-    assert manager._compression_task is not None
+    from core.scheduler import PeriodicScheduler
 
-    # Worker compresses the expired entry on its first cycle
+    scheduler = PeriodicScheduler()
+    scheduler.register("compress", 0.05, lambda: manager.compress_cycle(compressor))
+    await scheduler.start()
+
     for _ in range(50):
         if compressor.calls:
             break
         await asyncio.sleep(0.05)
-    assert compressor.calls == ["data"]
+    await scheduler.stop()
 
-    manager.stop_background_compression()
-    for _ in range(20):
-        if manager._compression_task.done():
-            break
-        await asyncio.sleep(0.05)
-    assert manager._compression_task.done()
+    assert compressor.calls == ["data"]
 
 
 async def test_build_context_includes_hot_and_cold(memory_paths):

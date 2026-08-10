@@ -16,7 +16,6 @@ HOT_FILE = "data/hot_memory.json"
 COLD_FILE = "data/cold_memory.json"
 HOT_RETENTION_HOURS = 72
 COLD_RETENTION_DAYS = 27
-COMPRESS_INTERVAL_HOURS = 6
 
 
 class MemoryManager:
@@ -27,8 +26,6 @@ class MemoryManager:
         self.cold_file = Path(COLD_FILE)
         self.cold_file.parent.mkdir(parents=True, exist_ok=True)
         self._cold_data = self._load_cold()
-        self._compression_task: asyncio.Task | None = None
-        self._stop_compression = False
 
         # Lock for concurrent access protection
         self._lock = asyncio.Lock()
@@ -137,6 +134,14 @@ class MemoryManager:
                 count += 1
         return count
 
+    async def compress_cycle(self, compressor) -> int:
+        """Run one compression cycle: compress all expired hot entries.
+
+        Designed to be registered as a periodic task in PeriodicScheduler
+        (ADR-005). Does not manage its own loop - the scheduler does.
+        """
+        return await self.compress_all_expired(compressor)
+
     async def build_context(self, query: str, max_tokens: int = 3000) -> str:
         """Build RAG context: latest 5 hot + relevant cold entries."""
         async with self._lock:
@@ -159,38 +164,6 @@ class MemoryManager:
 
             context = "\n".join(parts)
             return context[:max_tokens]
-
-    async def _compression_worker(self, compressor: Callable[[Any], Awaitable[str]]) -> None:
-        """Background compression task."""
-        logger.info("Background compression started")
-        while not self._stop_compression:
-            try:
-                count = await self.compress_all_expired(compressor)
-                if count:
-                    logger.info("Background compression complete", compressed=count)
-            except Exception as e:
-                logger.error("Compression worker error", error=str(e))
-
-            # Sleep COMPRESS_INTERVAL_HOURS (check every minute for stop flag)
-            for _ in range(COMPRESS_INTERVAL_HOURS * 60):
-                if self._stop_compression:
-                    break
-                await asyncio.sleep(60)
-
-    def start_background_compression(self, compressor: Callable[[Any], Awaitable[str]]) -> None:
-        """Start background compression task."""
-        if self._compression_task and not self._compression_task.done():
-            logger.warning("Compression already running")
-            return
-        self._stop_compression = False
-        self._compression_task = asyncio.create_task(self._compression_worker(compressor))
-
-    def stop_background_compression(self) -> None:
-        """Stop background compression."""
-        self._stop_compression = True
-        if self._compression_task:
-            self._compression_task.cancel()
-            logger.info("Background compression stopped")
 
     def __len__(self) -> int:
         return len(self.hot) + len(self._cold_data)
