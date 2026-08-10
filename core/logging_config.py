@@ -76,6 +76,29 @@ def alert_level_processor(logger, method_name, event_dict):
     return event_dict
 
 
+_SANITIZE_CONFIG_CACHE = None
+
+
+def get_sanitize_config():
+    """Return cached Config for sanitization, loading it only once.
+
+    Avoids reading vasily_config.json on every log event.
+    Call reset_sanitize_config_cache() after config changes.
+    """
+    global _SANITIZE_CONFIG_CACHE
+    if _SANITIZE_CONFIG_CACHE is None:
+        from core.config import Config
+
+        _SANITIZE_CONFIG_CACHE = Config.load()
+    return _SANITIZE_CONFIG_CACHE
+
+
+def reset_sanitize_config_cache() -> None:
+    """Clear the cached config (used by tests and explicit reloads)."""
+    global _SANITIZE_CONFIG_CACHE
+    _SANITIZE_CONFIG_CACHE = None
+
+
 def sanitize_processor(logger, method_name, event_dict):
     """
     Sanitize sensitive fields based on log level and config.
@@ -87,9 +110,7 @@ def sanitize_processor(logger, method_name, event_dict):
         - ERROR/CRITICAL: replace with metadata {length, hash}
     - Respects sanitize_logs=False (dev/debug mode)
     """
-    from core.config import Config
-
-    config = Config.load()
+    config = get_sanitize_config()
     if not config.sanitize_logs:
         return event_dict
 

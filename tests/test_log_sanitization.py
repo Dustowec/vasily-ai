@@ -9,7 +9,12 @@ from core.logging_config import sanitize_processor
 @pytest.fixture(autouse=True)
 def default_config(monkeypatch):
     """Force default config regardless of vasily_config.json or env."""
+    import core.logging_config as lc
+
     monkeypatch.setattr(Config, "load", classmethod(lambda cls: Config()))
+    lc.reset_sanitize_config_cache()
+    yield
+    lc.reset_sanitize_config_cache()
 
 
 def test_info_truncates_sensitive_fields():
@@ -60,3 +65,34 @@ def test_sanitization_disabled_keeps_full_data(monkeypatch):
     event = {"level": "info", "event": "Test", "text": long_text}
     result = sanitize_processor(None, "info", event)
     assert result["text"] == long_text
+
+
+def test_config_loaded_once_for_many_events(monkeypatch):
+    """sanitize_processor must not reload config per log event."""
+    import core.logging_config as lc
+
+    calls = []
+
+    def counting_load(cls):
+        calls.append(1)
+        return Config()
+
+    monkeypatch.setattr(Config, "load", classmethod(counting_load))
+    lc.reset_sanitize_config_cache()
+
+    for _ in range(10):
+        lc.sanitize_processor(None, "info", {"level": "info", "prompt": "x" * 200})
+
+    assert len(calls) == 1
+
+
+def test_reset_cache_picks_up_new_config(monkeypatch):
+    """After cache reset the processor sees the fresh config."""
+    import core.logging_config as lc
+
+    monkeypatch.setattr(Config, "load", classmethod(lambda cls: Config(sanitize_logs=False)))
+    lc.reset_sanitize_config_cache()
+
+    event = {"level": "info", "text": "y" * 200}
+    result = lc.sanitize_processor(None, "info", event)
+    assert result["text"] == "y" * 200
