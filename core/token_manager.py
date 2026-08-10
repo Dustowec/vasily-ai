@@ -90,7 +90,7 @@ class TokenManager:
                         longest = msg
             if longest is None or len(longest.get("content", "")) <= 200:
                 break
-            longest["content"] = longest["content"][:200] + "..."
+            longest["content"] = longest["content"][:197] + "..."
 
         trimmed = system + [m for g in groups for m in g]
         logger.info(
