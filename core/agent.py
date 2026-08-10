@@ -12,10 +12,14 @@ from core.crash_reporter import install_async_exception_handler, install_crash_h
 from core.logging_config import get_logger, setup_logging
 from core.plugin_registry import PluginRegistry
 from core.react_loop import ReActLoop
+from core.scheduler import PeriodicScheduler
 from integrations.ollama_client import LLMUnavailableError, OllamaClient
 from memory.manager import MemoryManager
 
 logger = get_logger("core", "AgentCore")
+
+# ADR-005: internal periodic task intervals (seconds)
+COMPRESSION_INTERVAL_SECONDS = 6 * 3600
 
 
 class AgentCore:
@@ -26,14 +30,13 @@ class AgentCore:
         self.plugin_registry = PluginRegistry()
         self.memory = MemoryManager()
         self.running = False
-
         self._start_time = time.time()
         self._requests_count = 0
         self._errors_count = 0
-
         self.llm_client: OllamaClient | None = None
         self.react_loop: ReActLoop | None = None
         self._active_request_task: asyncio.Task | None = None
+        self.scheduler: PeriodicScheduler | None = None
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -69,7 +72,6 @@ class AgentCore:
             num_ctx=self.config.llm_num_ctx,
             retry_delay_base=self.config.llm_retry_delay_base,
         )
-
         self.react_loop = ReActLoop(
             config=self.config,
             llm_client=self.llm_client,
@@ -90,7 +92,6 @@ class AgentCore:
         )
         report = await checker.run_all()
         checker.print_report(report)
-
         logger.info("Health check complete", overall=report.get("overall"))
         return report
 
@@ -125,9 +126,7 @@ class AgentCore:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
             structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
-
             result = await self.react_loop.run(user_text)
-
             duration_ms = (time.time() - start) * 1000
             logger.info(
                 "Request completed",
@@ -155,7 +154,6 @@ class AgentCore:
                     "message": f"ReAct loop ended with status: {result.get('status')}",
                     "answer": result.get("answer", ""),
                 }
-
         except LLMUnavailableError as e:
             self._errors_count += 1
             logger.error("LLM unavailable", error=str(e))
@@ -203,7 +201,6 @@ class AgentCore:
                     print(f"\n[Interrupted] {response.get('message', '')}")
                 else:
                     print(f"\n[Error] {response.get('message', 'Unknown error')}")
-
             except EOFError:
                 break
             except asyncio.CancelledError:
@@ -216,12 +213,18 @@ class AgentCore:
         self.running = True
         logger.info("Agent started", plugins=len(self.plugin_registry))
 
-        # Use LLM-powered compressor
+        # LLM-powered compression via internal scheduler (ADR-005)
         from memory.llm_compressor import LLMCompressor
 
         llm_compressor = LLMCompressor(self.llm_client)
-        self.memory.start_background_compression(llm_compressor.compress)
-        logger.info("LLM-powered memory compression enabled")
+        self.scheduler = PeriodicScheduler()
+        self.scheduler.register(
+            "memory_compression",
+            COMPRESSION_INTERVAL_SECONDS,
+            lambda: self.memory.compress_cycle(llm_compressor.compress),
+        )
+        await self.scheduler.start()
+        logger.info("LLM-powered memory compression enabled (internal scheduler)")
 
         try:
             await self._cli_loop()
@@ -233,15 +236,12 @@ class AgentCore:
     async def shutdown(self) -> None:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
-
-        self.memory.stop_background_compression()
-
+        if self.scheduler:
+            await self.scheduler.stop()
         if self.llm_client:
             await self.llm_client.close()
-
         metrics = self.get_metrics()
         logger.info("Final metrics", **metrics)
-
         self.running = False
         logger.info("Agent shut down cleanly")
 
@@ -275,12 +275,9 @@ async def main():
     """Entry point."""
     config = Config.load()
     config.validate()
-
     agent = AgentCore(config)
     await agent.initialize()
-
     setup_signal_handlers(agent)
-
     try:
         await agent.run()
     except (asyncio.CancelledError, KeyboardInterrupt):
