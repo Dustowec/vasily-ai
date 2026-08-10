@@ -12,6 +12,7 @@ Mandatory requirements implemented:
   session timeout, graceful LLM-unavailable result.
 - T3-017.5: deduplication of identical calls with hard limit.
 - P2-1: limits and preview length taken from Config.
+- P3-3: strict TypedDict for ReActResult, ReActStep, TokenUsage.
 """
 
 import asyncio
@@ -21,6 +22,7 @@ from typing import Any
 
 from core.golden_prompts import GoldenPromptsLibrary
 from core.logging_config import get_logger
+from core.react_types import ReActResult, ReActStep
 from core.token_manager import TokenManager
 from integrations.ollama_client import LLMUnavailableError
 
@@ -81,7 +83,7 @@ class ReActLoop:
             )
         return tools
 
-    async def run(self, user_request: str, prompt_type: str = "default") -> dict[str, Any]:
+    async def run(self, user_request: str, prompt_type: str = "default") -> ReActResult:
         """Run the ReAct cycle for a user request."""
         system_prompt = self.prompts_library.get_prompt(prompt_type) or DEFAULT_SYSTEM_PROMPT
         messages = [
@@ -91,7 +93,7 @@ class ReActLoop:
         tool_call_counts: dict[str, int] = {}
         call_signatures: dict[str, int] = {}
         previous_results: dict[str, str] = {}
-        steps: list[dict[str, Any]] = []
+        steps: list[ReActStep] = []
         start_time = time.monotonic()
 
         core_logger.info(
@@ -110,13 +112,13 @@ class ReActLoop:
                     elapsed=round(elapsed, 1),
                     timeout=self.config.request_timeout,
                 )
-                return {
-                    "status": "timeout",
-                    "answer": self._last_assistant_content(messages),
-                    "iterations": iteration + 1,
-                    "steps": steps,
-                    "token_usage": self.token_manager.get_usage_report(messages),
-                }
+                return ReActResult(
+                    status="timeout",
+                    answer=self._last_assistant_content(messages),
+                    iterations=iteration + 1,
+                    steps=steps,
+                    token_usage=self.token_manager.get_usage_report(messages),
+                )
 
             core_logger.info("ReAct iteration started", iteration=iteration + 1)
 
@@ -135,22 +137,22 @@ class ReActLoop:
                 response = await self.llm.chat(messages=messages, tools=self.tools)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 core_logger.warning("ReAct interrupted by user", iteration=iteration + 1)
-                return {
-                    "status": "interrupted",
-                    "answer": self._last_assistant_content(messages),
-                    "iterations": iteration + 1,
-                    "steps": steps,
-                    "token_usage": usage,
-                }
+                return ReActResult(
+                    status="interrupted",
+                    answer=self._last_assistant_content(messages),
+                    iterations=iteration + 1,
+                    steps=steps,
+                    token_usage=usage,
+                )
             except LLMUnavailableError as e:
                 core_logger.error("LLM unavailable during ReAct", error=str(e))
-                return {
-                    "status": "llm_unavailable",
-                    "answer": "AI is temporarily unavailable. Try again later.",
-                    "iterations": iteration + 1,
-                    "steps": steps,
-                    "token_usage": usage,
-                }
+                return ReActResult(
+                    status="llm_unavailable",
+                    answer="AI is temporarily unavailable. Try again later.",
+                    iterations=iteration + 1,
+                    steps=steps,
+                    token_usage=usage,
+                )
 
             llm_logger.info(
                 "LLM response received",
@@ -170,13 +172,13 @@ class ReActLoop:
 
             if not tool_calls:
                 core_logger.info("ReAct loop finished", iterations=iteration + 1)
-                return {
-                    "status": "success",
-                    "answer": content,
-                    "iterations": iteration + 1,
-                    "steps": steps,
-                    "token_usage": usage,
-                }
+                return ReActResult(
+                    status="success",
+                    answer=content,
+                    iterations=iteration + 1,
+                    steps=steps,
+                    token_usage=usage,
+                )
 
             for tool_call in tool_calls:
                 function = tool_call.get("function", {})
@@ -276,24 +278,24 @@ class ReActLoop:
                     previous_results[signature] = tool_content
 
                 steps.append(
-                    {
-                        "iteration": iteration + 1,
-                        "tool": tool_name,
-                        "args": args,
-                        "result_preview": tool_content[: self.preview_length],
-                    }
+                    ReActStep(
+                        iteration=iteration + 1,
+                        tool=tool_name,
+                        args=args,
+                        result_preview=tool_content[: self.preview_length],
+                    )
                 )
                 messages.append({"role": "tool", "content": tool_content})
 
         final_usage = self.token_manager.get_usage_report(messages)
         core_logger.warning("ReAct max iterations reached", max_iterations=self.max_iterations)
-        return {
-            "status": "max_iterations",
-            "answer": self._last_assistant_content(messages),
-            "iterations": self.max_iterations,
-            "steps": steps,
-            "token_usage": final_usage,
-        }
+        return ReActResult(
+            status="max_iterations",
+            answer=self._last_assistant_content(messages),
+            iterations=self.max_iterations,
+            steps=steps,
+            token_usage=final_usage,
+        )
 
     @staticmethod
     def _last_assistant_content(messages: list[dict[str, Any]]) -> str:
