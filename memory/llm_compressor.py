@@ -1,7 +1,5 @@
 """LLM-powered memory compressor - creates summaries instead of truncation."""
 
-import asyncio
-from collections.abc import Callable
 from typing import Any
 
 from core.logging_config import get_logger
@@ -69,27 +67,3 @@ class LLMCompressor:
     def _fallback_compress(self, text: str) -> str:
         """Fallback: simple truncation if LLM fails."""
         return text[:200] + "..." if len(text) > 200 else text
-
-
-def create_compressor(llm_client) -> Callable[[Any], str]:
-    """
-    Create a synchronous wrapper for LLM compressor.
-    Used by MemoryManager.start_background_compression().
-    """
-    compressor = LLMCompressor(llm_client)
-
-    def sync_compressor(value: Any) -> str:
-        """Synchronous wrapper that runs async compression."""
-        try:
-            # Run async compression in new event loop
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(compressor.compress(value))
-            finally:
-                loop.close()
-        except Exception as e:
-            logger.error("Sync compression wrapper failed", error=str(e))
-            text = str(value)
-            return text[:200] + "..." if len(text) > 200 else text
-
-    return sync_compressor
