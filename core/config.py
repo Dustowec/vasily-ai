@@ -63,6 +63,7 @@ class Config:
     llm_model: str = "vasily-qwen"
     llm_timeout: float = 30.0
     llm_auto_start: bool = False
+    llm_auto_start_timeout: float = 30.0
     llm_max_retries: int = 2
     llm_num_ctx: int = 32768
     llm_safety_margin: int = 1000

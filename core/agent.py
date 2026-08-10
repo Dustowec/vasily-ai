@@ -14,6 +14,7 @@ from core.metrics import MetricsCollector
 from core.plugin_registry import PluginRegistry
 from core.react_loop import ReActLoop
 from core.scheduler import PeriodicScheduler
+from core.service_launcher import ensure_ollama_running
 from integrations.ollama_client import LLMUnavailableError, OllamaClient
 from memory.manager import MemoryManager
 
@@ -81,6 +82,7 @@ class AgentCore:
             plugin_registry=self.plugin_registry,
         )
 
+        await ensure_ollama_running(self.config)
         await self.health_check()
         logger.info("Agent initialized successfully")
 
