@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -34,6 +36,16 @@ env/
 *.swo
 *~
 
+# Testing and coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # Logs
 *.log
 debug_log.txt
@@ -43,6 +55,9 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+
+# Environment and secrets
+.env
 
 # Project specific
 long_memory.txt
@@ -56,8 +71,6 @@ my_tags_auto.txt
 # Temporary
 *.tmp
 *.temp
-.cache/
-.ruff_cache/
 setup_config.py
 fix_encoding.py
 *.backup.py
@@ -65,6 +78,7 @@ fix_encoding.py
 # OS
 .DS_Store
 Thumbs.db
+
 # Runtime data (regeneratable)
 data/*.json
 data/prompts/*.json
@@ -76,6 +90,3 @@ SUMMARY.md
 SUMMARY1.txt
 ПОДСКАЗКИ!!!.txt
 git_history.txt
-# Coverage artifacts
-.coverage
-htmlcov/
