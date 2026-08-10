@@ -20,6 +20,7 @@ logger = get_logger("core", "AgentCore")
 
 # ADR-005: internal periodic task intervals (seconds)
 COMPRESSION_INTERVAL_SECONDS = 6 * 3600
+DIALOGUE_RESET_INTERVAL_SECONDS = 30 * 60
 
 
 class AgentCore:
@@ -268,6 +269,11 @@ class AgentCore:
             "memory_compression",
             COMPRESSION_INTERVAL_SECONDS,
             lambda: self.memory.compress_cycle(llm_compressor.compress),
+        )
+        self.scheduler.register(
+            "dialogue_reset",
+            DIALOGUE_RESET_INTERVAL_SECONDS,
+            lambda: self.memory.forget("dialogue:last"),
         )
         await self.scheduler.start()
         logger.info("LLM-powered memory compression enabled (internal scheduler)")
