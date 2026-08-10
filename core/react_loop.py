@@ -49,7 +49,6 @@ class ReActLoop:
         self.max_tool_calls = config.max_tool_calls_per_tool
         self.preview_length = config.log_preview_length
         self.tools = self._build_tools()
-
         self.token_manager = TokenManager(config.llm_num_ctx, config.llm_safety_margin)
         self.prompts_library = GoldenPromptsLibrary()
 
@@ -83,13 +82,28 @@ class ReActLoop:
             )
         return tools
 
-    async def run(self, user_request: str, prompt_type: str = "default") -> ReActResult:
+    async def run(
+        self,
+        user_request: str,
+        prompt_type: str = "default",
+        memory_context: str = "",
+    ) -> ReActResult:
         """Run the ReAct cycle for a user request."""
         system_prompt = self.prompts_library.get_prompt(prompt_type) or DEFAULT_SYSTEM_PROMPT
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_request},
         ]
+
+        if memory_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Relevant dialogue memory:\n" + memory_context,
+                }
+            )
+
+        messages.append({"role": "user", "content": user_request})
+
         tool_call_counts: dict[str, int] = {}
         call_signatures: dict[str, int] = {}
         previous_results: dict[str, str] = {}
@@ -123,7 +137,6 @@ class ReActLoop:
             core_logger.info("ReAct iteration started", iteration=iteration + 1)
 
             messages = self.token_manager.trim_messages(messages)
-
             usage = self.token_manager.get_usage_report(messages)
             core_logger.info(
                 "Token usage",
@@ -232,7 +245,6 @@ class ReActLoop:
                         continue
 
                     tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
-
                     interaction_logger.info(
                         "Calling plugin",
                         tool=tool_name,
@@ -244,6 +256,7 @@ class ReActLoop:
                         plugin = self.plugin_registry.get(tool_name)
                         if plugin is None:
                             raise ValueError(f"Plugin not found: {tool_name}")
+
                         result = await plugin.execute(**args)
 
                         # P1-3: block mock data outside dev_mode
@@ -275,8 +288,7 @@ class ReActLoop:
                         interaction_logger.error("Plugin failed", tool=tool_name, error=str(e))
                         tool_content = json.dumps({"error": str(e)}, ensure_ascii=False)
 
-                    previous_results[signature] = tool_content
-
+                previous_results[signature] = tool_content
                 steps.append(
                     ReActStep(
                         iteration=iteration + 1,

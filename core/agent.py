@@ -72,6 +72,7 @@ class AgentCore:
             num_ctx=self.config.llm_num_ctx,
             retry_delay_base=self.config.llm_retry_delay_base,
         )
+
         self.react_loop = ReActLoop(
             config=self.config,
             llm_client=self.llm_client,
@@ -126,7 +127,10 @@ class AgentCore:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
             structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
-            result = await self.react_loop.run(user_text)
+
+            memory_context = await self._build_dialogue_context()
+            result = await self.react_loop.run(user_text, memory_context=memory_context)
+
             duration_ms = (time.time() - start) * 1000
             logger.info(
                 "Request completed",
@@ -134,6 +138,8 @@ class AgentCore:
                 iterations=result.get("iterations"),
                 duration_ms=round(duration_ms, 2),
             )
+
+            await self._store_dialogue(user_text, result)
 
             if result.get("status") == "success":
                 return {
@@ -154,6 +160,7 @@ class AgentCore:
                     "message": f"ReAct loop ended with status: {result.get('status')}",
                     "answer": result.get("answer", ""),
                 }
+
         except LLMUnavailableError as e:
             self._errors_count += 1
             logger.error("LLM unavailable", error=str(e))
@@ -166,6 +173,42 @@ class AgentCore:
             logger.error("Request failed", error=str(e))
             return {"status": "error", "message": str(e)}
 
+    async def _build_dialogue_context(self) -> str:
+        """Build memory context from the last dialogue turn."""
+        last = await self.memory.recall("dialogue:last")
+
+        if not last:
+            return ""
+
+        user_text = str(last.get("user", ""))
+        assistant_text = str(last.get("assistant", ""))
+
+        if not user_text and not assistant_text:
+            return ""
+
+        return (
+            f"Previous user request: {user_text}\n" f"Previous assistant answer: {assistant_text}"
+        )
+
+    async def _store_dialogue(self, user_text: str, result: dict[str, Any]) -> None:
+        """Store the last dialogue turn into hot memory."""
+        status = result.get("status")
+        answer = str(result.get("answer", "") or "").strip()
+
+        if status not in ("success", "interrupted"):
+            return
+
+        if not answer:
+            return
+
+        await self.memory.remember(
+            "dialogue:last",
+            {
+                "user": str(user_text),
+                "assistant": answer,
+            },
+        )
+
     async def _cli_loop(self) -> None:
         """Async CLI loop - reads stdin without blocking asyncio."""
         loop = asyncio.get_running_loop()
@@ -176,6 +219,7 @@ class AgentCore:
                 raw = await loop.run_in_executor(None, input, "\n> ")
                 if not raw.strip():
                     continue
+
                 if raw.strip().lower() == "exit":
                     self.running = False
                     break
@@ -183,6 +227,7 @@ class AgentCore:
                 # Run request as a task so Ctrl+C can cancel it
                 task = asyncio.create_task(self.handle_request({"id": "cli", "text": raw.strip()}))
                 self._active_request_task = task
+
                 try:
                     response = await task
                 except asyncio.CancelledError:
@@ -201,6 +246,7 @@ class AgentCore:
                     print(f"\n[Interrupted] {response.get('message', '')}")
                 else:
                     print(f"\n[Error] {response.get('message', 'Unknown error')}")
+
             except EOFError:
                 break
             except asyncio.CancelledError:
@@ -236,10 +282,13 @@ class AgentCore:
     async def shutdown(self) -> None:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
+
         if self.scheduler:
             await self.scheduler.stop()
+
         if self.llm_client:
             await self.llm_client.close()
+
         metrics = self.get_metrics()
         logger.info("Final metrics", **metrics)
         self.running = False
@@ -278,6 +327,7 @@ async def main():
     agent = AgentCore(config)
     await agent.initialize()
     setup_signal_handlers(agent)
+
     try:
         await agent.run()
     except (asyncio.CancelledError, KeyboardInterrupt):
