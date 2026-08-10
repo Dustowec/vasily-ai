@@ -51,8 +51,6 @@ class MetricsCollector:
         token_usage = result.get("token_usage", {}) or {}
         self._tokens_used_total += int(token_usage.get("used_tokens", 0))
 
-        self._iterations_total += int(result.get("iterations", 0))
-
     def snapshot(self) -> dict[str, Any]:
         """Return current metrics as a plain dictionary."""
         if self._requests_total > 0:

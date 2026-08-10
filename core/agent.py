@@ -10,6 +10,7 @@ import structlog
 from core.config import Config
 from core.crash_reporter import install_async_exception_handler, install_crash_handler
 from core.logging_config import get_logger, setup_logging
+from core.metrics import MetricsCollector
 from core.plugin_registry import PluginRegistry
 from core.react_loop import ReActLoop
 from core.scheduler import PeriodicScheduler
@@ -30,6 +31,7 @@ class AgentCore:
         self.config = config
         self.plugin_registry = PluginRegistry()
         self.memory = MemoryManager()
+        self.metrics = MetricsCollector()
         self.running = False
         self._start_time = time.time()
         self._requests_count = 0
@@ -48,7 +50,6 @@ class AgentCore:
         )
         install_crash_handler(self.config.log_dir)
 
-        # Catch unhandled asyncio task exceptions into crash reports
         loop = asyncio.get_running_loop()
         install_async_exception_handler(loop, self.config.log_dir)
 
@@ -142,6 +143,16 @@ class AgentCore:
 
             await self._store_dialogue(user_text, result)
 
+            status = result.get("status")
+            self.metrics.record_request(
+                duration_ms=duration_ms,
+                status=status,
+                iterations=result.get("iterations", 0),
+            )
+
+            if status in ("success", "interrupted"):
+                self.metrics.record_react_result(result)
+
             if result.get("status") == "success":
                 return {
                     "status": "success",
@@ -225,7 +236,6 @@ class AgentCore:
                     self.running = False
                     break
 
-                # Run request as a task so Ctrl+C can cancel it
                 task = asyncio.create_task(self.handle_request({"id": "cli", "text": raw.strip()}))
                 self._active_request_task = task
 
@@ -260,7 +270,6 @@ class AgentCore:
         self.running = True
         logger.info("Agent started", plugins=len(self.plugin_registry))
 
-        # LLM-powered compression via internal scheduler (ADR-005)
         from memory.llm_compressor import LLMCompressor
 
         llm_compressor = LLMCompressor(self.llm_client)
@@ -303,13 +312,15 @@ class AgentCore:
     def get_metrics(self) -> dict[str, Any]:
         """Get current agent metrics."""
         uptime = time.time() - self._start_time
-        return {
+        base_metrics = {
             "uptime_seconds": round(uptime, 2),
             "requests_count": self._requests_count,
             "errors_count": self._errors_count,
             "plugins_loaded": len(self.plugin_registry),
             "memory_entries": len(self.memory),
         }
+        base_metrics.update(self.metrics.snapshot())
+        return base_metrics
 
 
 def setup_signal_handlers(agent: AgentCore) -> None:
