@@ -8,7 +8,10 @@ from plugins.danbooru.tool import DanbooruTool
 from plugins.web_scraper.tool import WebScraperTool
 from plugins.web_search.tool import WebSearchTool
 
-DEAD_URL = "http://localhost:59999"
+# External unreachable URL: .invalid TLD (RFC 2606) is guaranteed never to resolve.
+# This bypasses SSRF protection (no hostname -> IP to check) and lets aiohttp
+# fail with a real network error.
+DEAD_URL = "http://this-host-does-not-exist-vasily-test.invalid"
 
 
 @pytest.fixture
@@ -57,7 +60,8 @@ async def test_danbooru_returns_structured_error(prod_config):
 async def test_web_scraper_returns_structured_error(prod_config):
     result = await WebScraperTool().execute(url=f"{DEAD_URL}/page")
     assert is_plugin_error(result)
-    assert result["error_type"] == "connection_failed"
+    # Accept any network error (connection_failed or dns_failed)
+    assert result["error_type"] in ("connection_failed", "dns_failed")
 
 
 async def test_web_scraper_invalid_url(prod_config):

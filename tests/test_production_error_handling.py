@@ -122,8 +122,14 @@ async def test_web_search_returns_503_error(stub_server, monkeypatch):
     assert result["retry_advice"]
 
 
-async def test_web_scraper_returns_503_error(stub_server):
+async def test_web_scraper_returns_503_error(stub_server, monkeypatch):
     """Scraper must return a typed http_error with status 503."""
+    # Temporarily allow 127.0.0.1 for this test (stub server is local)
+    monkeypatch.setattr(
+        WebScraperTool,
+        "_is_private_ip",
+        staticmethod(lambda ip: False),
+    )
     result = await WebScraperTool().execute(url=f"{stub_server}/page")
     assert is_plugin_error(result)
     assert result["error_type"] == "http_error"
