@@ -11,10 +11,7 @@ from bs4 import BeautifulSoup
 
 from core.base_tool import BaseTool
 from core.config import Config
-from core.logging_config import get_logger
 from core.plugin_types import make_error
-
-logger = get_logger("plugins", "WebScraperTool")
 
 ALLOWED_SCHEMES = ("http", "https")
 MAX_URL_LENGTH = 2048
@@ -29,14 +26,9 @@ class WebScraperTool(BaseTool):
     description = "Extract text content from a web page"
     version = "1.2.0"
 
-    async def execute(self, url: str = "", **kwargs) -> dict[str, Any]:
-        """Scrape a web page with URL validation and HTML size cap.
-
-        dev_mode: mock data on backend failure.
-        production: typed PluginErrorResult on backend failure.
-        """
+    async def _execute(self, url: str = "", **kwargs) -> dict[str, Any]:
+        """Scrape a web page with URL validation and HTML size cap."""
         config = Config.load()
-        logger.info("Web scraping started", url=url)
 
         if not url:
             return make_error(
@@ -55,11 +47,6 @@ class WebScraperTool(BaseTool):
         # SSRF protection: validate URL before making request
         validation_error = await self._validate_url(url)
         if validation_error:
-            logger.error(
-                "URL validation failed",
-                url=url,
-                error_type=validation_error,
-            )
             return make_error(
                 "invalid_url",
                 f"URL is blocked: {validation_error}",
@@ -72,11 +59,6 @@ class WebScraperTool(BaseTool):
                 headers = {"User-Agent": "Mozilla/5.0 (Vasily AI Agent)"}
                 async with session.get(url, timeout=timeout, headers=headers) as response:
                     if response.status != 200:
-                        logger.error(
-                            "Scraping failed",
-                            status=response.status,
-                            error_type="http_error",
-                        )
                         if config.dev_mode:
                             return self._mock_response(url)
                         return make_error(
@@ -87,13 +69,9 @@ class WebScraperTool(BaseTool):
                             http_status=response.status,
                         )
 
-                    # T3-017.6: bounded read - stop at MAX_HTML_BYTES + 1 byte
+                    # Bounded read
                     raw = await response.content.read(MAX_HTML_BYTES + 1)
                     if len(raw) > MAX_HTML_BYTES:
-                        logger.warning(
-                            "HTML response too large, truncated",
-                            limit_bytes=MAX_HTML_BYTES,
-                        )
                         raw = raw[:MAX_HTML_BYTES]
                     encoding = response.charset or "utf-8"
                     html = raw.decode(encoding, errors="replace")
@@ -106,7 +84,6 @@ class WebScraperTool(BaseTool):
                     max_chars = 5000
                     if len(text) > max_chars:
                         text = text[:max_chars] + "..."
-                    logger.info("Scraping complete", title=title, text_length=len(text))
                     return {
                         "status": "success",
                         "source": "web",
@@ -116,7 +93,6 @@ class WebScraperTool(BaseTool):
                         "content": text,
                     }
         except Exception as e:
-            logger.error("Scraping failed", error=str(e), error_type="connection_failed")
             if config.dev_mode:
                 return self._mock_response(url)
             return make_error(
@@ -127,11 +103,7 @@ class WebScraperTool(BaseTool):
             )
 
     async def _validate_url(self, url: str) -> str | None:
-        """Validate URL for SSRF protection.
-
-        Returns:
-            None if URL is valid, or a reason string if blocked.
-        """
+        """Validate URL for SSRF protection."""
         if not url or not isinstance(url, str):
             return "empty_or_invalid"
 
@@ -140,7 +112,6 @@ class WebScraperTool(BaseTool):
         except Exception:
             return "parse_error"
 
-        # Check scheme
         if parsed.scheme.lower() not in ALLOWED_SCHEMES:
             return f"blocked_scheme:{parsed.scheme}"
 
@@ -148,11 +119,9 @@ class WebScraperTool(BaseTool):
         if not hostname:
             return "no_hostname"
 
-        # Literal localhost
         if hostname.lower() in ("localhost", "localhost.localdomain"):
             return "localhost"
 
-        # Try to parse as IP address directly
         try:
             ip = ipaddress.ip_address(hostname)
             if self._is_private_ip(ip):
@@ -161,17 +130,15 @@ class WebScraperTool(BaseTool):
         except ValueError:
             pass
 
-        # DNS resolution (bounded by timeout)
         try:
             infos = await self._resolve_hostname(hostname)
         except socket.gaierror:
-            return None  # Let aiohttp report the connection failure
-        except Exception as e:
-            logger.warning("DNS resolution error", error=str(e))
+            return None
+        except Exception:
             return None
 
         if infos is None:
-            return None  # DNS timeout -> pass through
+            return None
 
         for _family, _type, _proto, _canonname, sockaddr in infos:
             ip_str = sockaddr[0]
@@ -185,10 +152,7 @@ class WebScraperTool(BaseTool):
         return None
 
     async def _resolve_hostname(self, hostname: str):
-        """Resolve hostname with a bounded timeout (T3-017.6).
-
-        Returns a list of addrinfo tuples, or None on timeout.
-        """
+        """Resolve hostname with a bounded timeout."""
         loop = asyncio.get_running_loop()
         try:
             return await asyncio.wait_for(
@@ -201,7 +165,6 @@ class WebScraperTool(BaseTool):
                 timeout=DNS_TIMEOUT_SECONDS,
             )
         except TimeoutError:
-            logger.warning("DNS resolution timed out", hostname=hostname)
             return None
 
     @staticmethod
@@ -213,7 +176,6 @@ class WebScraperTool(BaseTool):
 
     def _mock_response(self, url: str) -> dict[str, Any]:
         """Return mock data when scraping fails (dev_mode only)."""
-        logger.info("Using mock data", url=url)
         return {
             "status": "success",
             "source": "mock",

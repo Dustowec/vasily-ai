@@ -6,10 +6,7 @@ import aiohttp
 
 from core.base_tool import BaseTool
 from core.config import Config
-from core.logging_config import get_logger
 from core.plugin_types import make_error
-
-logger = get_logger("plugins", "WebSearchTool")
 
 
 class WebSearchTool(BaseTool):
@@ -19,15 +16,10 @@ class WebSearchTool(BaseTool):
     description = "Search the web for information"
     version = "1.1.0"
 
-    async def execute(self, query: str = "", limit: int = 5, **kwargs) -> dict[str, Any]:
-        """Search web via SearXNG.
-
-        dev_mode: mock data on backend failure.
-        production: typed PluginErrorResult on backend failure.
-        """
+    async def _execute(self, query: str = "", limit: int = 5, **kwargs) -> dict[str, Any]:
+        """Search web via SearXNG."""
         query, limit = self._validate_inputs(query, limit)
         config = Config.load()
-        logger.info("Web search started", query=query, limit=limit)
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -37,11 +29,6 @@ class WebSearchTool(BaseTool):
                     config.searxng_url, params=params, timeout=timeout
                 ) as response:
                     if response.status != 200:
-                        logger.error(
-                            "SearXNG error",
-                            status=response.status,
-                            error_type="http_error",
-                        )
                         if config.dev_mode:
                             return self._mock_response(query, limit)
                         return make_error(
@@ -53,7 +40,6 @@ class WebSearchTool(BaseTool):
                         )
                     data = await response.json()
                     results = data.get("results", [])[:limit]
-                    logger.info("Web search complete", results_count=len(results))
                     return {
                         "status": "success",
                         "source": "searxng",
@@ -69,7 +55,6 @@ class WebSearchTool(BaseTool):
                         ],
                     }
         except Exception as e:
-            logger.error("SearXNG unavailable", error=str(e), error_type="connection_failed")
             if config.dev_mode:
                 return self._mock_response(query, limit)
             return make_error(
@@ -81,7 +66,7 @@ class WebSearchTool(BaseTool):
 
     @staticmethod
     def _validate_inputs(query: Any, limit: Any) -> tuple[str, int]:
-        """Clamp plugin inputs to safe ranges (T3-017.6)."""
+        """Clamp plugin inputs to safe ranges."""
         query = str(query)[:500]
         try:
             limit = int(limit)
@@ -91,7 +76,6 @@ class WebSearchTool(BaseTool):
 
     def _mock_response(self, query: str, limit: int) -> dict[str, Any]:
         """Return mock data when SearXNG is unavailable (dev_mode only)."""
-        logger.info("Using mock data", query=query)
         return {
             "status": "success",
             "source": "mock",

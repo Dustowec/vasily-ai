@@ -4,9 +4,6 @@ import random
 from typing import Any
 
 from core.base_tool import BaseTool
-from core.logging_config import get_logger
-
-logger = get_logger("plugins", "ArtGeneratorTool")
 
 # Quality tags for prompt enhancement
 QUALITY_TAGS = ["masterpiece", "best quality", "highly detailed", "sharp focus"]
@@ -21,7 +18,7 @@ class ArtGeneratorTool(BaseTool):
     description = "Generate detailed prompts for AI art generation"
     version = "1.0.0"
 
-    async def execute(
+    async def _execute(
         self,
         subject: str = "",
         style: str = "",
@@ -29,8 +26,6 @@ class ArtGeneratorTool(BaseTool):
         **kwargs,
     ) -> dict[str, Any]:
         """Generate an art prompt from subject and optional parameters."""
-        logger.info("Art generation started", subject=subject, style=style)
-
         if not subject:
             return {"status": "error", "message": "Subject is required"}
 
@@ -51,8 +46,6 @@ class ArtGeneratorTool(BaseTool):
 
         # Build negative prompt
         negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, cropped, worst quality, low quality, blurry"
-
-        logger.info("Prompt generated", prompt_length=len(prompt))
 
         return {
             "status": "success",

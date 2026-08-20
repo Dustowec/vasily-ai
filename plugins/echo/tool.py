@@ -5,9 +5,6 @@ Used for testing the plugin system.
 from typing import Any
 
 from core.base_tool import BaseTool
-from core.logging_config import get_logger
-
-logger = get_logger("plugins", "EchoTool")
 
 
 class EchoTool(BaseTool):
@@ -17,9 +14,8 @@ class EchoTool(BaseTool):
     description = "Returns the input message as-is"
     version = "1.0.0"
 
-    async def execute(self, message: str = "", **kwargs) -> dict[str, Any]:
+    async def _execute(self, message: str = "", **kwargs) -> dict[str, Any]:
         """Echo the message back."""
-        logger.info("Echo called", message=message)
         return {
             "status": "success",
             "message": message,
