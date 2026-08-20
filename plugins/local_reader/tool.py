@@ -1,6 +1,6 @@
 """Local Reader plugin - reads files from allowed directories.
 
-Supports: csv, json, txt, md, xlsx (via openpyxl if installed).
+Supports: csv, json, txt, md, xlsx (via openpyxl), pdf (via PyPDF2).
 Protected against path traversal attacks.
 """
 
@@ -23,6 +23,7 @@ PARSERS = {
     ".txt": "text",
     ".md": "text",
     ".xlsx": "xlsx",
+    ".pdf": "pdf",
 }
 
 MAX_FILE_SIZE_BYTES = 1024 * 1024  # 1 MB
@@ -33,7 +34,7 @@ class LocalReaderTool(BaseTool):
 
     name = "local_reader"
     description = "Read contents of files from data/ and reports/ directories"
-    version = "1.0.0"
+    version = "1.1.0"
 
     async def _execute(self, path: str = "", **kwargs) -> dict[str, Any]:
         """Read a file from an allowed directory."""
@@ -153,6 +154,24 @@ class LocalReaderTool(BaseTool):
                 result[sheet_name] = rows
             wb.close()
             return result
+
+        if parser_type == "pdf":
+            try:
+                import PyPDF2
+            except ImportError:
+                return {"error": "PyPDF2 is not installed. Run: pip install PyPDF2"}
+
+            try:
+                with open(file_path, "rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    text = ""
+                    for page in reader.pages:
+                        extracted = page.extract_text()
+                        if extracted:
+                            text += extracted + "\n"
+                    return text.strip() or "[No text extracted from PDF]"
+            except Exception as e:
+                return {"error": f"Failed to read PDF: {e}"}
 
         return {"error": f"Unknown parser: {parser_type}"}
 
