@@ -20,5 +20,5 @@ async def test_async_exception_handler_creates_crash_report(tmp_path):
 
     handler(loop, {"message": "Task exception was never retrieved", "exception": exc})
 
-    reports = list((tmp_path / "crash_reports").glob("*.json"))
+    reports = list((tmp_path / "crash_reports").glob("**/*.json"))
     assert len(reports) >= 1

@@ -124,8 +124,7 @@ async def test_all_retries_exhausted_raises_and_creates_crash_report(
     with pytest.raises(LLMUnavailableError):
         await client.chat(messages=[{"role": "user", "content": "hi"}])
 
-    # initial attempt + 1 retry
     assert stub_ollama["requests"] == 2
 
-    reports = list((tmp_path / "crash_reports").glob("crash_*"))
+    reports = list((tmp_path / "crash_reports").glob("**/crash_*"))
     assert len(reports) >= 1
