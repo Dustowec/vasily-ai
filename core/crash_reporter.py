@@ -6,13 +6,15 @@ Features:
 - Filters logs by request_id (tracks one request across all 4 sources)
 - Filters logs by alert_level (shows CRITICAL_WARNING and CRASH first)
 - Generates JSON + Markdown reports
-- Saves to logs/crash_reports/
+- Saves to logs/crash_reports/YYYY-MM-DD/ with sequential numbering
+- QA mode: prevents deletion during QA phase
+- TTL deletion: removes folders older than 48 hours (after QA)
 """
 
 import json
 import sys
 import traceback as tb
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Log file names (must match logging_config.py)
@@ -24,7 +26,10 @@ LOG_FILES = {
 }
 
 CRASH_REPORT_DIR = "crash_reports"
-MAX_LOG_LINES = 50  # Last N lines to scan for filtering
+MAX_LOG_LINES = 50
+MAX_REPORTS_PER_FOLDER = 100
+TTL_HOURS = 48
+QA_MODE = True  # Во время фазы QA: не удалять
 
 # Alert level priorities (higher = more critical)
 ALERT_PRIORITIES = {
@@ -46,6 +51,37 @@ class CrashReporter:
         self.crash_report_dir = log_dir / CRASH_REPORT_DIR
         self.crash_report_dir.mkdir(parents=True, exist_ok=True)
 
+    def _get_report_folder(self) -> Path:
+        """Get folder for today's reports: logs/crash_reports/YYYY-MM-DD/"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        folder = self.crash_report_dir / today
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _get_next_number(self, folder: Path) -> int:
+        """Find the next available number for crash_XXX files."""
+        if not folder.exists():
+            return 1
+
+        existing = list(folder.glob("crash_*.json"))
+        if not existing:
+            return 1
+
+        numbers = []
+        for p in existing:
+            try:
+                # extract number from crash_123.json
+                name = p.stem  # crash_123
+                num = int(name.split("_")[1])
+                numbers.append(num)
+            except (IndexError, ValueError):
+                continue
+
+        if not numbers:
+            return 1
+
+        return max(numbers) + 1
+
     def _sanitize_recent_logs(self, recent_logs: dict) -> dict:
         """Apply sanitization to recent log lines before saving."""
         from core.config import Config
@@ -66,7 +102,6 @@ class CrashReporter:
 
             new_logs = []
             for line in logs:
-                # Parse JSON if possible
                 if isinstance(line, str):
                     try:
                         data = json.loads(line)
@@ -79,7 +114,6 @@ class CrashReporter:
                     new_logs.append(line)
                     continue
 
-                # Sanitize data
                 for key in list(data.keys()):
                     if key in redact_keys:
                         data[key] = "[REDACTED]"
@@ -88,7 +122,6 @@ class CrashReporter:
                         if isinstance(value, str) and len(value) > max_len:
                             data[key] = value[:max_len] + "..."
 
-                # Convert back to JSON string if it was originally a string
                 if isinstance(line, str):
                     new_logs.append(json.dumps(data, ensure_ascii=False))
                 else:
@@ -101,20 +134,23 @@ class CrashReporter:
     def generate_report(self, error: BaseException, request_id: str = None) -> tuple:
         """
         Generate crash report in JSON and Markdown formats.
-
-        Args:
-            error: The exception that caused the crash
-            request_id: Optional request_id to filter logs by
-
-        Returns:
-            Tuple of (json_path, markdown_path)
+        Saves to logs/crash_reports/YYYY-MM-DD/crash_XXX.json|md
         """
         timestamp = datetime.now()
-        timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S")
 
-        # Try to get current request_id if not provided
         if request_id is None:
             request_id = self._get_current_request_id()
+
+        # Get today's folder and next number
+        folder = self._get_report_folder()
+        num = self._get_next_number(folder)
+
+        # Enforce limit
+        if num > MAX_REPORTS_PER_FOLDER:
+            # Start a new folder with suffix
+            folder = self.crash_report_dir / f"{datetime.now().strftime('%Y-%m-%d')}_2"
+            folder.mkdir(parents=True, exist_ok=True)
+            num = 1
 
         # Collect data
         error_info = self._collect_error_info(error)
@@ -136,12 +172,12 @@ class CrashReporter:
         report["recent_logs"] = self._sanitize_recent_logs(report["recent_logs"])
 
         # Save JSON report
-        json_path = self.crash_report_dir / f"crash_{timestamp_str}.json"
+        json_path = folder / f"crash_{num:03d}.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False, default=str)
 
         # Save Markdown report
-        md_path = self.crash_report_dir / f"crash_{timestamp_str}.md"
+        md_path = folder / f"crash_{num:03d}.md"
         md_content = self._generate_markdown(report)
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
@@ -160,7 +196,6 @@ class CrashReporter:
 
     def _collect_error_info(self, error: BaseException) -> dict:
         """Collect information about the error with full traceback."""
-        # Используем format_exception с переданным исключением
         tb_lines = tb.format_exception(type(error), error, error.__traceback__)
         tb_text = "".join(tb_lines)
 
@@ -182,10 +217,7 @@ class CrashReporter:
         }
 
     def _collect_recent_logs(self, request_id: str = None) -> dict:
-        """
-        Collect recent logs from each log file.
-        If request_id is provided, filter by it.
-        """
+        """Collect recent logs from each log file."""
         recent_logs = {}
 
         for category, filename in LOG_FILES.items():
@@ -195,17 +227,14 @@ class CrashReporter:
                     with open(log_path, encoding="utf-8") as f:
                         lines = f.readlines()
 
-                    # Take last N lines to scan
                     scan_lines = lines[-self.max_log_lines :]
 
                     if request_id and request_id != "unknown":
-                        # Filter by request_id
                         filtered = [line.strip() for line in scan_lines if request_id in line]
                         recent_logs[category] = (
                             filtered if filtered else ["No logs found for this request_id"]
                         )
                     else:
-                        # No filter, take last 20 lines
                         recent_logs[category] = [line.strip() for line in scan_lines[-20:]]
                 except Exception as e:
                     recent_logs[category] = [f"Error reading log: {e}"]
@@ -215,10 +244,7 @@ class CrashReporter:
         return recent_logs
 
     def _extract_critical_alerts(self, recent_logs: dict) -> list:
-        """
-        Extract CRITICAL_WARNING and CRASH alerts from all logs.
-        Sort by priority (CRASH first, then CRITICAL_WARNING).
-        """
+        """Extract CRITICAL_WARNING and CRASH alerts from all logs."""
         critical = []
 
         for category, logs in recent_logs.items():
@@ -238,11 +264,10 @@ class CrashReporter:
                             }
                         )
                 except (json.JSONDecodeError, TypeError):
-                    continue  # Skip non-JSON lines
+                    continue
 
-        # Sort by priority (highest first)
         critical.sort(key=lambda x: x["priority"], reverse=True)
-        return critical[:10]  # Max 10 critical alerts
+        return critical[:10]
 
     def _generate_markdown(self, report: dict) -> str:
         """Generate Markdown report."""
@@ -252,7 +277,6 @@ class CrashReporter:
         lines.append(f"**Request ID:** `{report['request_id']}`")
         lines.append("")
 
-        # Critical alerts section (most important!)
         lines.append("## 🚨 Critical Alerts")
         if report["critical_alerts"]:
             lines.append("| Time | Level | Category | Module | Event |")
@@ -267,26 +291,22 @@ class CrashReporter:
             lines.append("No critical alerts found.")
         lines.append("")
 
-        # Error summary
         lines.append("## Error Summary")
         lines.append(f"- **Type:** `{report['error']['type']}`")
         lines.append(f"- **Message:** {report['error']['message']}")
         lines.append("")
 
-        # System info
         lines.append("## System Info")
         lines.append(f"- **Python:** {report['system']['python_version']}")
         lines.append(f"- **Platform:** {report['system']['platform']}")
         lines.append("")
 
-        # Traceback
         lines.append("## Traceback")
         lines.append("```")
         lines.append(report["error"]["traceback"])
         lines.append("```")
         lines.append("")
 
-        # Recent logs by category
         lines.append("## Recent Logs (filtered by request_id)")
         for category, logs in report["recent_logs"].items():
             lines.append(f"### {category.upper()}")
@@ -298,14 +318,36 @@ class CrashReporter:
 
         return "\n".join(lines)
 
+    def clean_old_reports(self) -> int:
+        """Delete crash report folders older than TTL_HOURS.
+        Only runs when QA_MODE is False.
+        """
+        if QA_MODE:
+            return 0
+
+        cutoff = datetime.now() - timedelta(hours=TTL_HOURS)
+        deleted = 0
+
+        for folder in self.crash_report_dir.iterdir():
+            if not folder.is_dir():
+                continue
+            try:
+                # Parse date from folder name (YYYY-MM-DD or YYYY-MM-DD_N)
+                folder_date_str = folder.name.split("_")[0]
+                folder_date = datetime.strptime(folder_date_str, "%Y-%m-%d")
+                if folder_date < cutoff:
+                    import shutil
+
+                    shutil.rmtree(folder)
+                    deleted += 1
+            except (ValueError, OSError):
+                continue
+
+        return deleted
+
 
 def install_crash_handler(log_dir: Path, max_log_lines: int = MAX_LOG_LINES) -> None:
-    """
-    Install global exception handler that generates crash reports.
-
-    Args:
-        log_dir: Directory for log files
-    """
+    """Install global exception handler that generates crash reports."""
     reporter = CrashReporter(log_dir, max_log_lines=max_log_lines)
 
     def exception_handler(exc_type, exc_value, exc_traceback):
@@ -325,14 +367,7 @@ def install_crash_handler(log_dir: Path, max_log_lines: int = MAX_LOG_LINES) -> 
 
 
 def install_async_exception_handler(loop, log_dir: Path) -> None:
-    """
-    Install loop-level handler that generates crash reports
-    for unhandled asyncio task exceptions.
-
-    Args:
-        loop: Running event loop
-        log_dir: Directory for log files
-    """
+    """Install loop-level handler for unhandled asyncio task exceptions."""
     reporter = CrashReporter(log_dir)
 
     def handler(loop, context):
