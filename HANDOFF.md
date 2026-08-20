@@ -1,65 +1,188 @@
-Vasily AI — HANDOFF (передача контекста в новую сессию)
-Обновлено: 2026-08-11, конец сессии. Новой сессии: читать ПЕРВЫМ.
+# VASILY AI — HANDOFF (передача контекста в новую сессию)
+**Обновлено:** 2026-08-20
+**Версия:** После завершения QA-0..QA-3
+**Новая сессия: читать ПЕРВЫМ файлом.**
 
-1. Суть проекта
-Vasily AI — локальный ИИ-агент (Windows, CLI), Python 3.14.
-LLM: Ollama, модель vasily-qwen (integrations/ollama_client.py)
-Архитектура: плагины (plugins/*), ReAct-цикл (core/react_loop.py),
-память hot/cold (memory/manager.py), внутренний планировщик (core/scheduler.py)
-Логи: structlog, 4 журнала, санация (core/logging_config.py)
-Тесты: pytest (tests/, asyncio_mode=auto); функциональный гейт: test_intelligence.py
-Гигиена: pre-commit (black, ruff); ветка develop; remote: github.com/Dustowec/vasily-ai
+---
 
-2. Роли и процесс
-Пользователь — начинающий: только копируемые команды в PowerShell.
-Предпочитает создание файлов через notepad, а не heredoc.
-Ассистент — техлид: нумерованные шаги; если правки сложны — полные файлы кодом.
-Дисциплина: TDD (red-green), коммит на логический блок, пользователь шлёт выводы.
-Маркер «готов» или вывод команды закрывает шаг.
+## 1. СУТЬ ПРОЕКТА
 
-3. Текущее состояние (2026-08-11)
-Фазы 0–2.5 закрыты (стабилизация завершена).
-ТЗ-017.6 (hardening входов) закрыт; ревью DeepSeek отработано полностью.
-ФАЗА 3 ЗАКРЫТА ПОЛНОСТЬЮ:
-- G-1 + Warm-память: диалог сохраняется в dialogue:last,
-  сброс выполняется задачей dialogue_reset через PeriodicScheduler (30 мин).
-- ТЗ-022: PeriodicScheduler по ADR-005, компрессия памяти через планировщик.
-- ТЗ-023: MetricsCollector в core/metrics.py, интегрирован в AgentCore.
-- ТЗ-024: автоподъём Ollama через core/service_launcher.py
-  (llm_auto_start + llm_auto_start_timeout в конфиге).
-- ТЗ-025: байтовый BackupManager в core/backup.py, агностичный к шифрованию.
-- ТЗ-026: CrashAnalyzer в core/crash_analyzer.py, читает crash_*.json
-  из logs/crash_reports и запрашивает анализ через локальный LLM.
+**Vasily AI** — локальный ИИ-агент (Windows, CLI), Python 3.14.
+**LLM:** Ollama, модель `vasily-qwen` (Qwen2.5-3B, q4_k_s, 32k context).
+**Архитектура:** плагины (`plugins/*`), ReAct-цикл (`core/react_loop.py`), память hot/cold (`memory/manager.py`), внутренний планировщик (`core/scheduler.py`).
+**Логи:** structlog, 4 журнала, санация PII (`core/logging_config.py`).
+**Тесты:** pytest (`tests/`, asyncio_mode=auto); функциональный гейт: `test_intelligence.py`.
+**Гигиена:** pre-commit (black, ruff); ветка `develop`; remote: `github.com/Dustowec/vasily-ai`.
 
-Тесты: 111 passed. ТЗ-021: 5/5 PASS, ACCEPTANCE: PASSED. Покрытие ~73%.
-Репозиторий: develop запушен, working tree clean.
+---
 
-4. Утверждённые решения (см. docs/)
-docs/adr/ADR-005-internal-timers.md: периодические таймеры — внутренние
-asyncio-задачи, не зависят от внешних вызовов.
-docs/specs/phase3-g1-warm-memory.md: G-1 и Warm-память через планировщик.
-docs/specs/tz-023-monitoring.md: метрики.
-docs/specs/tz-024-auto-start.md: автоподъём Ollama.
-docs/specs/tz-025-backups.md: байтовые бэкапы.
-docs/specs/tz-026-crash-analysis.md: анализ crash-отчётов.
-docs/specs/phase4-data-security.md: CryptoProvider, Fernet, PBKDF2, KEK/DEK,
-ротация пароля; реализация в Фазе 4.
+## 2. ТЕКУЩЕЕ СОСТОЯНИЕ РЕПОЗИТОРИЯ
 
-5. Очередь Фазы 4
-Фаза 4 — Data Security:
-- CryptoProvider (Fernet + PBKDF2).
-- KEK/DEK схема.
-- Ротация пароля.
-- Перевод бэкапов на шифрованные копии.
-- Аутентификация (CLI).
+**Ветка:** `develop` (чистая, запушена на GitHub).
+**Тестов:** 111 passed.
+**Покрытие:** ~73%.
+**Модулей в core/:** 16 (добавлены `crypto.py`, `backup.py` обновлён).
+**Плагинов:** 6 (`art_generator`, `danbooru_search`, `echo`, `web_scraper`, `web_search`, `local_reader`).
+**Тестовых файлов в tests/:** 28.
 
-6. Реестр пробелов (не терять)
-Остаточное покрытие: logging_config 42%, crash_reporter 70%, llm_compressor 60% — опционально.
-Счётчик подряд идущих ошибок в ReAct — опционально.
-DI в тестах вместо monkeypatch — отложено.
-Warm-память: сброс только через планировщик, не через run().
+**Фаза QA:**
+- ✅ **QA-0** — Логирование и crash-репорты (ЗАКРЫТ)
+- ✅ **QA-1** — Структура хранения crash-репортов (ЗАКРЫТ)
+- ✅ **QA-2** — CryptoProvider (заглушка NoOp) (ЗАКРЫТ)
+- ✅ **QA-3** — Local Reader (ЗАКРЫТ)
+- ⏳ **QA-4** — Streamlit дашборд (НЕ НАЧАТ)
 
-7. Ключевые команды
-python -m pytest -v
+---
+
+## 3. ЧТО РЕАЛИЗОВАНО (НОВОЕ В ЭТОЙ СЕССИИ)
+
+### QA-0: Логирование и crash-репорты
+- **`core/logging_config.py`** — добавлен `LazyLogger` с универсальным `__getattr__`. Логгеры работают даже до вызова `setup_logging()`.
+- **`core/crash_reporter.py`** — исправлен сбор traceback через `traceback.format_exception()` (вместо `format_exc()`).
+- **`plugins/echo/tool.py`** — добавлено логирование (пример).
+- **Тесты:** `debug_logging.py`, `debug_agent_logging.py`, `debug_react_logging.py`, `test_crash.py`.
+- **request_id** теперь привязывается ко всем логам.
+
+### QA-1: Структура хранения crash-репортов
+- Папки по дате: `logs/crash_reports/YYYY-MM-DD/`
+- Нумерация: `crash_001.json`, `crash_002.md`
+- Лимит: 100 репортов на папку
+- `QA_MODE=True` — удаление отключено во время фазы QA
+- `clean_old_reports()` для TTL-удаления (48 часов) после QA
+
+### Рефакторинг плагинов (гибридный вариант)
+- **`core/base_tool.py`** — автоматическое логирование всех вызовов плагинов:
+  - `Tool called` (с аргументами)
+  - `Tool succeeded` (с duration_ms)
+  - `Tool failed` (с ошибкой)
+- Все плагины переименованы: `execute()` → `_execute()`
+- Убраны дублирующиеся `logger` из плагинов
+- `plugins.log` теперь получает записи от **всех** плагинов автоматически
+
+### QA-2: CryptoProvider (заглушка)
+- **`core/crypto.py`** — `NoOpCrypto` (ничего не шифрует)
+- **`core/backup.py`** — опциональный параметр `crypto`, по умолчанию `NoOpCrypto`
+- Обратная совместимость сохранена
+
+### QA-3: Local Reader
+- **`plugins/local_reader/tool.py`** — чтение файлов из `data/` и `reports/`
+- Поддерживает: `csv`, `json`, `txt`, `md`, `xlsx` (openpyxl), `pdf` (PyPDF2)
+- Защита от path traversal (`os.path.abspath` + `startswith`)
+- Лимит размера файла: 1 MB
+- Версия плагина: 1.1.0
+
+### README.md (обновлён)
+- Полностью переписан (русский + английский)
+- Актуальная структура проекта
+- Описание всех 6 плагинов
+- Инструкции по установке, настройке, запуску
+- Разделы по тестированию, логированию, мониторингу
+
+---
+
+## 4. КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ (ДЛЯ ПОНИМАНИЯ)
+
+| Файл | Что изменилось |
+|------|----------------|
+| `core/logging_config.py` | Добавлен `LazyLogger` |
+| `core/crash_reporter.py` | Новая структура хранения (папки по дате) |
+| `core/base_tool.py` | Автоматическое логирование плагинов |
+| `core/backup.py` | Добавлен опциональный `crypto` |
+| `core/crypto.py` | **НОВЫЙ ФАЙЛ** — NoOp-заглушка |
+| `plugins/local_reader/` | **НОВЫЙ ПЛАГИН** |
+| `README.md` | Полностью переписан |
+
+**Все 5 плагинов** переименованы: `execute()` → `_execute()`.
+
+---
+
+## 5. ПРОВЕРЕННЫЕ СЦЕНАРИИ
+
+- ✅ `pytest tests/ -q` — 111 passed
+- ✅ `test_intelligence.py` — ACCEPTANCE: PASSED
+- ✅ `debug_react_logging.py` — все 5 лог-файлов пишутся
+- ✅ `test_crash.py` — crash-репорт создаётся с полным traceback
+- ✅ `LocalReaderTool` — чтение `data/test.txt` работает
+
+---
+
+## 6. ТЕКУЩИЕ ПРОБЛЕМЫ (ИЗВЕСТНЫЕ)
+
+| Проблема | Статус |
+|----------|--------|
+| Отсканированные PDF (без текстового слоя) | Не поддерживаются (OCR не включён) |
+| Streamlit дашборд | **НЕ НАЧАТ** — требует отдельного ТЗ |
+
+---
+
+## 7. СЛЕДУЮЩИЕ ШАГИ (ДЛЯ НОВОЙ СЕССИИ)
+
+### Немедленные действия:
+1. **Получить ТЗ на Streamlit дашборд** от пользователя (он обратится к другой нейросети за описанием).
+2. **Обсудить и утвердить ТЗ**.
+3. **Реализовать QA-4** (Streamlit дашборд).
+
+### Пользователь:
+- Не программист.
+- Работает через PowerShell и notepad.
+- Предпочитает готовые файлы для вставки.
+- Даёт команды на коммит явно.
+
+### Ассистент (ты):
+- Сеньор-разработчик / Tech Lead.
+- Даёшь нумерованные шаги, не более 3 за раз.
+- Используешь TDD (красный → зелёный → рефакторинг).
+- Дисциплина: коммит на логический блок.
+
+---
+
+## 8. КЛЮЧЕВЫЕ КОМАНДЫ
+
+```powershell
+# Тесты
+python -m pytest tests/ -q
 python test_intelligence.py
-git add <файлы>; git commit -m "..."; git push
+
+# Синтаксис
+python -m py_compile <файл>.py
+
+# Git
+git status --short
+git add <файлы>
+git commit -m "сообщение"
+git push
+
+# Создание файла (предпочитаемый способ)
+New-Item -ItemType File -Force -Path <путь> | Out-Null
+notepad <путь>
+# (вставить содержимое, Ctrl+S, закрыть)
+
+
+## 9. УТВЕРЖДЁННЫЕ РЕШЕНИЯ
+Остановка после QA-3: Дальше — получение ТЗ на дашборд от пользователя.
+
+CryptoProvider: Заглушка (NoOp) до Фазы 4.
+
+PDF-парсер: PyPDF2 (без OCR).
+
+README: Двуязычный (RU/EN), актуальный.
+
+
+## 10. ВАЖНО: ЧТО НЕЛЬЗЯ ТЕРЯТЬ
+Пользователь — не программист. Все инструкции должны быть максимально простыми.
+
+Логирование работает. При любых подозрениях — проверять logs/.
+
+Crash-репорты сохраняются. Папки по дате, нумерация.
+
+Все плагины логируются автоматически через BaseTool.
+
+README обновлён. Следующая сессия начинается с него.
+
+
+## 11. ССЫЛКИ НА ДОКУМЕНТАЦИЮ
+Roadmap: РОАДМАП.txt (обновлён, QA-0..QA-3 отмечены как ЗАКРЫТЫ)
+
+HANDOFF: Этот файл (читается первым в новой сессии)
+
+README.md: Актуальная документация проекта
