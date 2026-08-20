@@ -11,7 +11,7 @@ Features:
 
 import json
 import sys
-import traceback
+import traceback as tb
 from datetime import datetime
 from pathlib import Path
 
@@ -159,11 +159,15 @@ class CrashReporter:
             return "unknown"
 
     def _collect_error_info(self, error: BaseException) -> dict:
-        """Collect information about the error."""
+        """Collect information about the error with full traceback."""
+        # Используем format_exception с переданным исключением
+        tb_lines = tb.format_exception(type(error), error, error.__traceback__)
+        tb_text = "".join(tb_lines)
+
         return {
             "type": type(error).__name__,
             "message": str(error),
-            "traceback": traceback.format_exc(),
+            "traceback": tb_text,
         }
 
     def _collect_system_info(self) -> dict:

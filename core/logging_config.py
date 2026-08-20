@@ -21,6 +21,7 @@ import logging
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -32,9 +33,58 @@ LLM_LOG = "llm.log"
 ALL_LOG = "vasily.log"
 
 # Rotation settings: keep logs for 72 hours (3 days)
-ROTATION_WHEN = "midnight"  # Rotate at midnight
-ROTATION_INTERVAL = 1  # Every day
-ROTATION_BACKUP_COUNT = 3  # Keep 3 days of logs
+ROTATION_WHEN = "midnight"
+ROTATION_INTERVAL = 1
+ROTATION_BACKUP_COUNT = 3
+
+# --- Глобальное состояние для ленивой инициализации ---
+_logging_initialized = False
+_logger_proxies: dict[str, "LazyLogger"] = {}
+
+
+class LazyLogger:
+    """
+    Прокси-логгер: перехватывает ЛЮБОЙ вызов и перенаправляет
+    реальному structlog.BoundLogger после инициализации.
+    """
+
+    def __init__(self, category: str, name: str | None = None):
+        self.category = category
+        self.name = name
+        self._logger: structlog.stdlib.BoundLogger | None = None
+
+    def _get_real(self) -> structlog.stdlib.BoundLogger:
+        """Получить реальный логгер, создав его при первом вызове."""
+        if self._logger is None:
+            logger_names = {
+                "core": "vasily.core",
+                "interaction": "vasily.interaction",
+                "plugins": "vasily.plugins",
+                "llm": "vasily.llm",
+            }
+            logger_name = logger_names.get(self.category, "vasily.core")
+            self._logger = structlog.get_logger(logger_name)
+            if self.name:
+                self._logger = self._logger.bind(module=self.name)
+        return self._logger
+
+    def __getattr__(self, name: str) -> Any:
+        """
+        Перехватывает ЛЮБОЙ вызов метода (bind, exception, log, ...)
+        и перенаправляет реальному логгеру.
+        """
+        real = self._get_real()
+        attr = getattr(real, name)
+        if callable(attr):
+
+            def wrapper(*args, **kwargs):
+                return attr(*args, **kwargs)
+
+            return wrapper
+        return attr
+
+    def __repr__(self) -> str:
+        return f"<LazyLogger category={self.category} name={self.name}>"
 
 
 def alert_level_processor(logger, method_name, event_dict):
@@ -49,11 +99,9 @@ def alert_level_processor(logger, method_name, event_dict):
     - CRITICAL_WARNING: Critical warning (ERROR)
     - CRASH: Fatal crash (CRITICAL)
     """
-    # If alert_level is already set manually, keep it
     if "alert_level" in event_dict:
         return event_dict
 
-    # Auto-detect based on level
     level = event_dict.get("level", "info")
 
     if level == "critical":
@@ -63,7 +111,6 @@ def alert_level_processor(logger, method_name, event_dict):
     elif level == "warning":
         event_dict["alert_level"] = "WARNING"
     elif level == "info":
-        # Detect REQUEST by keywords in event text
         event_text = event_dict.get("event", "").lower()
         request_keywords = ["request", "user", "query", "command", "input"]
         if any(word in event_text for word in request_keywords):
@@ -80,11 +127,6 @@ _SANITIZE_CONFIG_CACHE = None
 
 
 def get_sanitize_config():
-    """Return cached Config for sanitization, loading it only once.
-
-    Avoids reading vasily_config.json on every log event.
-    Call reset_sanitize_config_cache() after config changes.
-    """
     global _SANITIZE_CONFIG_CACHE
     if _SANITIZE_CONFIG_CACHE is None:
         from core.config import Config
@@ -94,7 +136,6 @@ def get_sanitize_config():
 
 
 def reset_sanitize_config_cache() -> None:
-    """Clear the cached config (used by tests and explicit reloads)."""
     global _SANITIZE_CONFIG_CACHE
     _SANITIZE_CONFIG_CACHE = None
 
@@ -118,7 +159,6 @@ def sanitize_processor(logger, method_name, event_dict):
     redact_keys = set(config.log_redact_keys)
     sensitive_keys = set(config.log_sensitive_keys)
 
-    # Keys that are not subject to sanitization
     system_keys = {
         "timestamp",
         "level",
@@ -136,12 +176,10 @@ def sanitize_processor(logger, method_name, event_dict):
 
         value = event_dict[key]
 
-        # Critical keys -> [REDACTED] on any level
         if key in redact_keys:
             event_dict[key] = "[REDACTED]"
             continue
 
-        # Sensitive keys -> truncate or mask
         if key in sensitive_keys:
             event_dict[key] = _sanitize_value(value, level, sensitive_keys, redact_keys, config)
 
@@ -149,7 +187,6 @@ def sanitize_processor(logger, method_name, event_dict):
 
 
 def _sanitize_value(value, level, sensitive_keys, redact_keys, config):
-    """Recursively sanitize a single value."""
     if isinstance(value, str):
         if level in ("error", "critical"):
             return {
@@ -187,30 +224,24 @@ def setup_logging(
         level: Logging level (DEBUG, INFO, WARNING, ERROR)
         json_logs: Use JSON format for file output
     """
-    # Create log directory
-    log_dir.mkdir(parents=True, exist_ok=True)
+    global _logging_initialized
 
-    # Determine logging level
+    log_dir.mkdir(parents=True, exist_ok=True)
     log_level = getattr(logging, level.upper(), logging.INFO)
 
-    # Shared processors for all loggers
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
-        alert_level_processor,  # Auto-detect alert_level
-        sanitize_processor,  # T3-016.5: sensitive data redaction
+        alert_level_processor,
+        sanitize_processor,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.TimeStamper(fmt="iso"),
     ]
 
-    # Console renderer (colorized for humans)
     console_renderer = structlog.dev.ConsoleRenderer(colors=True)
-
-    # File renderer (JSON for machines)
     file_renderer = structlog.processors.JSONRenderer() if json_logs else console_renderer
 
-    # Configure structlog
     structlog.configure(
         processors=shared_processors
         + [
@@ -221,9 +252,7 @@ def setup_logging(
         cache_logger_on_first_use=True,
     )
 
-    # === HELPER: Create rotating file handler ===
     def create_rotating_handler(filename: str) -> TimedRotatingFileHandler:
-        """Create a handler that rotates logs every 72 hours."""
         handler = TimedRotatingFileHandler(
             log_dir / filename,
             when=ROTATION_WHEN,
@@ -239,15 +268,12 @@ def setup_logging(
         handler.setLevel(log_level)
         return handler
 
-    # === FILE HANDLERS (with rotation) ===
-
     core_handler = create_rotating_handler(CORE_LOG)
     interaction_handler = create_rotating_handler(INTERACTION_LOG)
     plugins_handler = create_rotating_handler(PLUGINS_LOG)
     llm_handler = create_rotating_handler(LLM_LOG)
     all_handler = create_rotating_handler(ALL_LOG)
 
-    # === CONSOLE HANDLER ===
     console_formatter = structlog.stdlib.ProcessorFormatter(
         processor=console_renderer,
         foreign_pre_chain=shared_processors,
@@ -256,71 +282,34 @@ def setup_logging(
     console_handler.setFormatter(console_formatter)
     console_handler.setLevel(log_level)
 
-    # === LOGGER CONFIGURATION ===
+    _configure_logger("vasily.core", core_handler, all_handler, console_handler, level=log_level)
+    _configure_logger(
+        "vasily.interaction", interaction_handler, all_handler, console_handler, level=log_level
+    )
+    _configure_logger(
+        "vasily.plugins", plugins_handler, all_handler, console_handler, level=log_level
+    )
+    _configure_logger("vasily.llm", llm_handler, all_handler, console_handler, level=log_level)
 
-    # Core logger
-    core_logger = logging.getLogger("vasily.core")
-    core_logger.handlers.clear()
-    core_logger.addHandler(core_handler)
-    core_logger.addHandler(all_handler)
-    core_logger.addHandler(console_handler)
-    core_logger.setLevel(log_level)
-    core_logger.propagate = False
+    _logging_initialized = True
 
-    # Interaction logger
-    interaction_logger = logging.getLogger("vasily.interaction")
-    interaction_logger.handlers.clear()
-    interaction_logger.addHandler(interaction_handler)
-    interaction_logger.addHandler(all_handler)
-    interaction_logger.addHandler(console_handler)
-    interaction_logger.setLevel(log_level)
-    interaction_logger.propagate = False
 
-    # Plugins logger
-    plugins_logger = logging.getLogger("vasily.plugins")
-    plugins_logger.handlers.clear()
-    plugins_logger.addHandler(plugins_handler)
-    plugins_logger.addHandler(all_handler)
-    plugins_logger.addHandler(console_handler)
-    plugins_logger.setLevel(log_level)
-    plugins_logger.propagate = False
-
-    # LLM logger
-    llm_logger = logging.getLogger("vasily.llm")
-    llm_logger.handlers.clear()
-    llm_logger.addHandler(llm_handler)
-    llm_logger.addHandler(all_handler)
-    llm_logger.addHandler(console_handler)
-    llm_logger.setLevel(log_level)
-    llm_logger.propagate = False
+def _configure_logger(name: str, *handlers, level: int) -> None:
+    """Настроить или обновить существующий логгер."""
+    logger = logging.getLogger(name)
+    logger.handlers.clear()
+    for handler in handlers:
+        logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
 
 
 def get_logger(category: str, name: str | None = None) -> structlog.stdlib.BoundLogger:
     """
-    Get a logger for a specific category.
-
-    Args:
-        category: One of "core", "interaction", "plugins", "llm"
-        name: Module name (automatically added to logs)
-
-    Returns:
-        Bound structlog logger
-
-    Example:
-        logger = get_logger("core", "AgentCore")
-        logger.info("Agent started", plugins_count=4)
+    Получить логгер для категории. Возвращает LazyLogger (прокси),
+    который создаёт реальный логгер только при первом вызове.
     """
-    logger_names = {
-        "core": "vasily.core",
-        "interaction": "vasily.interaction",
-        "plugins": "vasily.plugins",
-        "llm": "vasily.llm",
-    }
-
-    logger_name = logger_names.get(category, "vasily.core")
-    logger = structlog.get_logger(logger_name)
-
-    if name:
-        logger = logger.bind(module=name)
-
-    return logger
+    key = f"{category}:{name}" if name else category
+    if key not in _logger_proxies:
+        _logger_proxies[key] = LazyLogger(category, name)
+    return _logger_proxies[key]  # type: ignore
