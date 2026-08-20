@@ -1,46 +1,38 @@
-# Vasily AI
+Vasily AI
+English version below
 
-AI agent with modular ReAct architecture — art generation, web search, and more.
+🇷🇺 Русская версия
+Vasily AI — локальный ИИ-агент с архитектурой ReAct (Reasoning + Acting). Работает через Ollama, поддерживает плагины, имеет двухуровневую память, структурированное логирование и систему crash-репортов.
 
-**Status:** 🚧 Active development · Core complete · Memory integration in progress
+Статус: ✅ Стабильная версия · Готов к интеграции с дашбордом
 
----
+Возможности
+Область	Описание
+Ядро	ReAct-цикл с вызовом инструментов · Асинхронное ядро (asyncio) · Автодискавери плагинов
+Плагины	Генерация арт-промптов · Веб-поиск (SearXNG) · Веб-скрапинг с SSRF-защитой · Поиск по Danbooru · Чтение локальных файлов (csv, json, txt, md, xlsx, pdf) · Echo (для тестов)
+Память	Двухуровневая (Hot/Cold) · LLM-компрессия · Автоматический сброс диалога через 30 минут
+Логирование	4 категории (core/interaction/plugins/llm) · 5 уровней алертов · Ротация 72 часа · Санация PII
+Безопасность	Crash-репорты (JSON + MD) · SSRF-защита · Защита от path traversal · Санация логов
+Инструменты	TokenManager · MetricsCollector · BackupManager · Health Check · Автозапуск Ollama
+Быстрый старт
+Требования:
 
-## Overview
+Python 3.14+
 
-Vasily AI is an asynchronous AI agent that combines **reasoning + acting** (ReAct pattern) with a plugin-based tool system. It connects to a local LLM (Ollama) and can orchestrate multi-step tasks — searching the web, scraping pages, generating art prompts, querying Danbooru, and more.
+Ollama с моделью (рекомендуется vasily-qwen или llama3.2)
 
-Designed for **production stability** with structured logging, crash reporting, input sanitization, and robust error handling.
+SearXNG (опционально, для веб-поиска)
 
----
+Установка:
 
-## Features
-
-| Area | Capability |
-|------|------------|
-| **Core** | ReAct loop with tool calling · Async asyncio core · Plugin auto-discovery |
-| **Plugins** | Art prompt generation · Web search (SearXNG) · Web scraping (SSRF-protected) · Danbooru search · Echo (testing) |
-| **Memory** | Hot/Cold two-tier storage — *currently being integrated* · LLM-powered compression (planned) |
-| **Logging** | 4 categories (core/interaction/plugins/llm) · 5 alert levels · 24h rotation · 3-day retention |
-| **Safety** | Crash reports on fatal errors · Log sanitization (PII masking) · SSRF protection · Mock data only in dev mode |
-| **LLM** | Ollama client with retries · Configurable context window (num_ctx) · Health checks |
-
----
-
-## Quick Start
-
-### Requirements
-- Python 3.10+
-- [Ollama](https://ollama.ai/) with a compatible model (recommended: `vasily-qwen` or `llama3.2`)
-- [SearXNG](https://docs.searxng.org/) (optional, for web search)
-
-### Installation
-
-```bash
+git clone https://github.com/Dustowec/vasily-ai.git
+cd vasily-ai
 uv sync --all-extras
+Настройка:
 
-##Configuration
-Create vasily_config.json in the project root:
+Создай vasily_config.json в корне проекта:
+
+json
 {
   "llm_url": "http://localhost:11434",
   "llm_model": "vasily-qwen",
@@ -48,69 +40,172 @@ Create vasily_config.json in the project root:
   "dev_mode": false,
   "max_react_iterations": 6
 }
+Или используй переменные окружения:
 
-Alternatively, use environment variables:
 export VASILY_LLM_MODEL=llama3.2
 export VASILY_DEV_MODE=true
+Запуск:
 
-#Run
 python -m vasily_ai
+Команды CLI:
 
-Interactive CLI:
+text
 > Нарисуй самурая под дождём
 > Поищи информацию про Stable Diffusion
+> Прочитай файл data/report.json
 > status
 > help
 > exit
+Плагины
+Плагин	Описание
+art_generator	Генерирует детальные промпты для Stable Diffusion / Midjourney
+web_search	Поиск через SearXNG (поддерживает моки в dev_mode)
+web_scraper	Извлекает текст с веб-страниц с SSRF-защитой
+danbooru_search	Поиск постов и тегов на Danbooru
+local_reader	Чтение файлов из data/ и reports/ (csv, json, txt, md, xlsx, pdf)
+echo	Тестовый плагин — возвращает введённое сообщение
+Плагины загружаются автоматически. Достаточно добавить новый плагин в папку plugins/ — он станет доступен агенту.
 
-##Plugins
-Plugin	Description
-art_generator	Creates detailed prompts for Stable Diffusion / Midjourney
-web_search	Searches the web via SearXNG
-web_scraper	Extracts page content with SSRF protection (blocks local/private IPs)
-danbooru_search	Searches Danbooru posts and tags
-echo	Test plugin — returns input as-is
-Plugins are auto-discovered. Just drop a new plugin into plugins/ and it will be available to the agent.
-
-
-##Project Structure
+Структура проекта
+text
 vasily_ai/
-├── core/               # Core components
-│   ├── agent.py        # AgentCore — orchestration
-│   ├── react_loop.py   # ReAct reasoning + acting
-│   ├── config.py       # Configuration (env + file + defaults)
+├── core/               # Ядро
+│   ├── agent.py        # AgentCore — оркестрация
+│   ├── react_loop.py   # ReAct-цикл
+│   ├── config.py       # Конфигурация (файл + ENV + дефолты)
 │   ├── plugin_registry.py
 │   ├── token_manager.py
 │   ├── golden_prompts.py
 │   ├── logging_config.py
 │   ├── crash_reporter.py
-│   └── health_check.py
-├── plugins/            # Auto-discovered plugins
+│   ├── health_check.py
+│   ├── metrics.py
+│   ├── backup.py
+│   ├── crypto.py       # Заглушка (NoOp) — задел на будущее
+│   └── scheduler.py    # Периодические задачи
+├── plugins/            # Автодискавери плагинов
 │   ├── art_generator/
 │   ├── web_search/
 │   ├── web_scraper/
 │   ├── danbooru/
+│   ├── local_reader/
 │   └── echo/
-├── memory/             # Memory subsystem (integration in progress)
+├── memory/             # Память
 │   ├── manager.py
 │   ├── long_term.py
 │   └── llm_compressor.py
-├── integrations/       # External services
+├── integrations/       # Внешние сервисы
 │   └── ollama_client.py
-├── tests/              # Test suite
+├── tests/              # Тесты (111 passed)
+├── logs/               # Логи (создаётся автоматически)
+└── data/               # Данные (создаётся автоматически)
+Тестирование
+pytest tests/ -v
+Ключевые сценарии:
+
+python test_intelligence.py   # P2-2: метрики, проход сценариев, точность инструментов
+python test_react_loop.py     # ReAct-цикл с реальной LLM и плагинами
+python test_ollama_client.py  # LLM-клиент с ретраями и crash-репортами
+Логи и мониторинг
+Логи пишутся в logs/ с ротацией каждые 24 часа и хранением 3 дня:
+
+Файл	Категория
+core.log	AgentCore, PluginRegistry, ReActLoop
+interaction.log	Вызовы плагинов из ядра
+plugins.log	Внутренние логи плагинов
+llm.log	Запросы и ответы LLM
+vasily.log	Все логи в одном файле
+Уровни алертов: STATE, REQUEST, WARNING, CRITICAL_WARNING, CRASH
+
+Crash-репорты сохраняются в logs/crash_reports/YYYY-MM-DD/crash_XXX.json и .md.
+
+Лицензия
+MIT
+
+🌐 English Version
+Overview
+Vasily AI is a local AI agent with a ReAct (Reasoning + Acting) architecture. It runs on Ollama, supports plugins, has two-tier memory, structured logging, and crash reporting.
+
+Status: ✅ Stable · Ready for dashboard integration
+
+Features
+Area	Description
+Core	ReAct loop with tool calling · Async asyncio core · Plugin auto-discovery
+Plugins	Art prompt generation · Web search (SearXNG) · Web scraping with SSRF protection · Danbooru search · Local file reading (csv, json, txt, md, xlsx, pdf) · Echo (testing)
+Memory	Two-tier (Hot/Cold) · LLM-powered compression · Dialogue auto-reset every 30 min
+Logging	4 categories (core/interaction/plugins/llm) · 5 alert levels · 72h rotation · PII sanitization
+Security	Crash reports (JSON + MD) · SSRF protection · Path traversal protection · Log sanitization
+Tools	TokenManager · MetricsCollector · BackupManager · Health Check · Ollama auto-start
+Quick Start
+Requirements:
+
+Python 3.14+
+
+Ollama with a compatible model (vasily-qwen or llama3.2)
+
+SearXNG (optional, for web search)
+
+Installation:
+
+git clone https://github.com/Dustowec/vasily-ai.git
+cd vasily-ai
+uv sync --all-extras
+Configuration:
+
+Create vasily_config.json in the project root:
+
+json
+{
+  "llm_url": "http://localhost:11434",
+  "llm_model": "vasily-qwen",
+  "searxng_url": "http://localhost:8080/search",
+  "dev_mode": false,
+  "max_react_iterations": 6
+}
+Or use environment variables:
+
+export VASILY_LLM_MODEL=llama3.2
+export VASILY_DEV_MODE=true
+Run:
+
+python -m vasily_ai
+CLI Commands:
+
+text
+> Draw a samurai in the rain
+> Search for information about Stable Diffusion
+> Read file data/report.json
+> status
+> help
+> exit
+Plugins
+Plugin	Description
+art_generator	Generates detailed prompts for Stable Diffusion / Midjourney
+web_search	Searches via SearXNG (supports mocks in dev_mode)
+web_scraper	Extracts page content with SSRF protection
+danbooru_search	Searches Danbooru posts and tags
+local_reader	Reads files from data/ and reports/ (csv, json, txt, md, xlsx, pdf)
+echo	Test plugin — returns input as-is
+Plugins are auto-discovered. Just drop a new plugin into plugins/ and it will be available.
+
+Project Structure
+text
+vasily_ai/
+├── core/               # Core components
+├── plugins/            # Auto-discovered plugins
+├── memory/             # Memory subsystem
+├── integrations/       # External services
+├── tests/              # Test suite (111 passed)
 ├── logs/               # Rotated logs (auto-created)
 └── data/               # Persistent data (auto-created)
-
-##Testing
-Run the full test suite:
+Testing
 pytest tests/ -v
+Key tests:
 
-Key test scenarios:
-python test_intelligence.py   # P2-2 metrics: scenario pass rate, tool accuracy, graceful error handling
+python test_intelligence.py   # P2-2 metrics: scenario pass rate, tool accuracy
 python test_react_loop.py     # ReAct loop with real LLM and plugins
 python test_ollama_client.py  # LLM client with retries and crash reports
-
-##Logging & Monitoring
+Logging & Monitoring
 Logs are written to logs/ with 24‑hour rotation and 3‑day retention:
 
 File	Category
@@ -119,32 +214,9 @@ interaction.log	Core ↔ Plugin calls
 plugins.log	Plugin internals
 llm.log	LLM requests/responses
 vasily.log	All logs combined
-Alert levels (auto-detected):
+Alert levels: STATE, REQUEST, WARNING, CRITICAL_WARNING, CRASH
 
-STATE — System state
+Crash reports are saved to logs/crash_reports/YYYY-MM-DD/crash_XXX.json and .md.
 
-REQUEST — User requests
-
-WARNING — Warnings
-
-CRITICAL_WARNING — Critical issues
-
-CRASH — Fatal crashes
-
-Crash reports are saved to logs/crash_reports/ in both JSON and Markdown.
-
-
-##Roadmap
-Status	Feature
-✅	ReAct loop with tool calling
-✅	Plugin system with auto-discovery
-✅	Structured logging with rotation
-✅	Crash reporting
-✅	SSRF protection
-✅	Log sanitization
-🔄	Two-tier memory (Hot/Cold) — integration in progress
-🔄	LLM-powered memory compression
-📋	MCP (Model Context Protocol) support
-📋	Web UI / API server
-##License
+License
 MIT
