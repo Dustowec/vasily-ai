@@ -43,7 +43,7 @@ class AgentCore:
         self._active_request_task: asyncio.Task | None = None
         self.scheduler: PeriodicScheduler | None = None
         self._session_requests = 0
-        self.watchdog: Watchdog | None = None  # <-- ДОБАВЛЕНО
+        self.watchdog: Watchdog | None = None
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -120,13 +120,20 @@ class AgentCore:
         try:
             logger.info("Request received", text=user_text[:50])
 
-            # Обработка команд памяти
+            # --- Команды управления (точные совпадения) ---
             if user_text.strip().lower() == "status":
                 stats = self.memory.get_stats()
                 icons = self.watchdog.get_status_icons() if self.watchdog else ""
+                metrics = self.get_metrics()
+                msg = (
+                    f"Память: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}. "
+                    f"Запросов: {metrics['requests_count']}, Ошибок: {metrics['errors_count']}. "
+                    f"Watchdog: {icons}"
+                )
                 return {
                     "status": "success",
-                    "metrics": self.get_metrics(),
+                    "message": msg,
+                    "metrics": metrics,
                     "memory_stats": stats,
                     "watchdog_icons": icons,
                 }
@@ -139,17 +146,6 @@ class AgentCore:
                     "Ctrl+C cancels the current request.",
                 }
 
-            # Команда "забудь"
-            if user_text.strip().lower().startswith("забудь "):
-                topic = user_text.strip()[7:].strip()
-                if not topic:
-                    return {"status": "error", "message": "Укажите тему для забывания."}
-                result = await self.memory.forget(topic)
-                if result:
-                    return {"status": "success", "message": f"Тема '{topic}' забыта."}
-                return {"status": "error", "message": f"Тема '{topic}' не найдена."}
-
-            # Команда "забудь всё"
             if user_text.strip().lower() == "забудь всё":
                 return {
                     "status": "error",
@@ -166,12 +162,21 @@ class AgentCore:
                     }
                 return {"status": "error", "message": "Не удалось выполнить ротацию памяти."}
 
+            if user_text.strip().lower().startswith("забудь "):
+                topic = user_text.strip()[7:].strip()
+                if not topic:
+                    return {"status": "error", "message": "Укажите тему для забывания."}
+                result = await self.memory.forget(topic)
+                if result:
+                    return {"status": "success", "message": f"Тема '{topic}' забыта."}
+                return {"status": "error", "message": f"Тема '{topic}' не найдена."}
+
+            # --- Если не команда, запускаем ReAct ---
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
             structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
 
-            # Строим контекст из памяти
             memory_context = await self.memory.build_context(user_text)
 
             result = await self.react_loop.run(
@@ -186,10 +191,7 @@ class AgentCore:
                 duration_ms=round(duration_ms, 2),
             )
 
-            # Сохраняем диалог в память
             await self._store_dialogue(user_text, result)
-
-            # Применяем остывание после каждого запроса
             await self.memory.decay(self._session_requests)
 
             status = result.get("status")
@@ -244,8 +246,6 @@ class AgentCore:
 
         if not answer:
             return
-
-        # Создаём ключ для диалога на основе времени
 
         timestamp = time.time()
         dialogue_key = f"dialogue_{int(timestamp)}"
@@ -328,7 +328,6 @@ class AgentCore:
         await self.scheduler.start()
         logger.info("LLM-powered memory compression enabled (internal scheduler)")
 
-        # Запускаем Watchdog (если включён в конфиге)
         if self.config.watchdog_enabled:
             self.watchdog = Watchdog(
                 agent=self,
@@ -356,7 +355,6 @@ class AgentCore:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
 
-        # Останавливаем Watchdog (добавлено)
         if self.watchdog:
             await self.watchdog.stop()
 
@@ -387,7 +385,6 @@ class AgentCore:
             "session_requests": self._session_requests,
         }
 
-        # Добавляем статус Watchdog
         if self.watchdog:
             watchdog_status = self.watchdog.get_status()
             base_metrics["watchdog_llm"] = "OK" if watchdog_status["llm"]["available"] else "FAIL"
