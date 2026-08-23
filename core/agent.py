@@ -146,13 +146,17 @@ class AgentCore:
                     "Ctrl+C cancels the current request.",
                 }
 
+            # ---- ОБРАБОТКА "ЗАБЫТЬ ВСЁ" ----
             if "забудь всё" in cmd or "забыть всё" in cmd:
                 if "да" in cmd:
                     result = await self.memory.forget_all(confirm=True)
                     if result:
-                        # Очищаем историю ReAct-цикла
-                        if self.react_loop:
-                            self.react_loop._history = []
+                        # Пересоздаём ReActLoop для полного сброса контекста
+                        self.react_loop = ReActLoop(
+                            config=self.config,
+                            llm_client=self.llm_client,
+                            plugin_registry=self.plugin_registry,
+                        )
                         return {
                             "status": "success",
                             "message": "Память полностью очищена (ротация выполнена).",
@@ -165,6 +169,7 @@ class AgentCore:
                         "Введите 'забудь всё да' для подтверждения.",
                     }
 
+            # ---- ЗАБЫТЬ КОНКРЕТНУЮ ТЕМУ ----
             if cmd.startswith("забудь") or cmd.startswith("забыть"):
                 parts = cmd.split(maxsplit=1)
                 if len(parts) < 2 or not parts[1].strip():
@@ -175,7 +180,7 @@ class AgentCore:
                     return {"status": "success", "message": f"Тема '{topic}' забыта."}
                 return {"status": "error", "message": f"Тема '{topic}' не найдена."}
 
-            # --- Автоматическое определение поисковых запросов ---
+            # ---- АВТОМАТИЧЕСКИЙ ПОИСК ----
             search_keywords = [
                 "поищи",
                 "найди",
@@ -235,6 +240,7 @@ class AgentCore:
                 else:
                     logger.warning("web_search plugin not found, falling back to ReAct")
 
+            # ---- ЕСЛИ НЕ КОМАНДА, ЗАПУСКАЕМ ReAct ----
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 

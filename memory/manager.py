@@ -29,7 +29,6 @@ from typing import Any
 from core.logging_config import get_logger
 
 logger = get_logger("core", "GradientMemory")
-
 # Константы
 TGS_THRESHOLD = 50.0
 HOT_MIN = 0.1
@@ -43,7 +42,9 @@ COMPRESSION_RANGE_HIGH = -4.0
 PROTECTED_HEAT_REQUIRED = 8.0
 DEFAULT_SIMPLE_SCORE = 25.0
 DEFAULT_COMPLEX_SCORE = 40.0
+# Таймаут на захват замка (секунды)
 LOCK_TIMEOUT = 2.0
+# Файлы хранения
 TGS_FILE = "data/tgs_memory.json"
 HOT_FILE = "data/tg_hot_memory.json"
 COLD_FILE = "data/tg_cold_memory.json"
@@ -51,14 +52,17 @@ TEMP_SUFFIX = ".tmp"
 
 
 class GradientMemory:
+    """Градиентно-сессионная память с динамическим охлаждением."""
+
     def __init__(self, data_dir: str = "data"):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.tgs_file = self.data_dir / "tgs_memory.json"
         self.hot_file = self.data_dir / "tg_hot_memory.json"
         self.cold_file = self.data_dir / "tg_cold_memory.json"
-        self._read_lock = asyncio.Semaphore(5)
-        self._write_lock = asyncio.Lock()
+        # Раздельные замки: чтение и запись
+        self._read_lock = asyncio.Semaphore(5)  # до 5 читателей одновременно
+        self._write_lock = asyncio.Lock()  # только 1 писатель
         self._session_requests = 0
         self._session_count = 0
         self._tgs: dict[str, dict] = {}
@@ -66,7 +70,7 @@ class GradientMemory:
         self._cold: dict[str, dict] = {}
         self._load_all()
 
-    # ---------- Lock helpers ----------
+    # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ДЛЯ ЗАХВАТА ЗАМКОВ ====================
     async def _acquire_read(self):
         try:
             await asyncio.wait_for(self._read_lock.acquire(), timeout=LOCK_TIMEOUT)
@@ -87,12 +91,11 @@ class GradientMemory:
     def _release_write(self):
         self._write_lock.release()
 
-    # ---------- Load / Save ----------
+    # ==================== ЗАГРУЗКА / СОХРАНЕНИЕ (БЕЗ ЗАМКОВ) ====================
     def _load_all(self) -> None:
         self._tgs = self._load_zone(self.tgs_file)
         self._hot = self._load_zone(self.hot_file)
         self._cold = self._load_zone(self.cold_file)
-
         # Удаляем дубликаты: если ключ есть в TGS, удаляем из HOT и COLD
         for key in list(self._hot.keys()):
             if key in self._tgs:
@@ -100,7 +103,6 @@ class GradientMemory:
         for key in list(self._cold.keys()):
             if key in self._tgs:
                 del self._cold[key]
-
         logger.info(
             "GradientMemory loaded", tgs=len(self._tgs), hot=len(self._hot), cold=len(self._cold)
         )
@@ -116,7 +118,11 @@ class GradientMemory:
             return {}
 
     async def _save_zone(self, zone: str, data: dict[str, dict]) -> None:
-        path_map = {"tgs": self.tgs_file, "hot": self.hot_file, "cold": self.cold_file}
+        path_map = {
+            "tgs": self.tgs_file,
+            "hot": self.hot_file,
+            "cold": self.cold_file,
+        }
         path = path_map.get(zone)
         if not path:
             raise ValueError(f"Unknown zone: {zone}")
@@ -140,7 +146,7 @@ class GradientMemory:
         await self._save_zone("hot", self._hot)
         await self._save_zone("cold", self._cold)
 
-    # ---------- Основные операции ----------
+    # ==================== ОСНОВНЫЕ ОПЕРАЦИИ ====================
     async def remember(self, key: str, value: Any, complex_query: bool = False) -> None:
         await self._acquire_write()
         try:
@@ -244,7 +250,7 @@ class GradientMemory:
             return "cold"
         return None
 
-    # ---------- Продвижение в TGS ----------
+    # ==================== ПЕРЕМЕЩЕНИЕ МЕЖДУ ЗОНАМИ ====================
     async def _check_promote_to_tgs_unlocked(self, key: str) -> None:
         entry = self._find_entry_unlocked(key)
         if not entry:
@@ -253,7 +259,6 @@ class GradientMemory:
         if score > TGS_THRESHOLD:
             if key in self._tgs:
                 return
-            # Удаляем из HOT или COLD
             if key in self._hot:
                 del self._hot[key]
             elif key in self._cold:
@@ -265,7 +270,7 @@ class GradientMemory:
             await self._save_zone("tgs", self._tgs)
             logger.info("Promoted to TGS", key=key, score=score)
 
-    # ---------- Остывание ----------
+    # ==================== ОСТЫВАНИЕ ====================
     async def decay(self, count_requests: int) -> None:
         await self._acquire_write()
         try:
@@ -284,7 +289,6 @@ class GradientMemory:
                     changed = True
             if changed:
                 await self._save_zone("hot", self._hot)
-
             changed = False
             for key, entry in list(self._cold.items()):
                 new_score = entry.get("score", 0) - (decay_actual * 0.5)
@@ -317,7 +321,6 @@ class GradientMemory:
                     changed = True
             if changed:
                 await self._save_zone("hot", self._hot)
-
             changed = False
             for key, entry in list(self._cold.items()):
                 new_score = entry.get("score", 0) - DECAY_PER_SESSION_CLOSE
@@ -330,13 +333,12 @@ class GradientMemory:
                     changed = True
             if changed:
                 await self._save_zone("cold", self._cold)
-
             self._session_count += 1
             logger.info("Session close applied", session=self._session_count)
         finally:
             self._release_write()
 
-    # ---------- Компрессия ----------
+    # ==================== КОМПРЕССИЯ ====================
     async def compress_cycle(self, compressor: Callable[[Any], Awaitable[str]]) -> int:
         await self._acquire_write()
         try:
@@ -411,7 +413,7 @@ class GradientMemory:
         finally:
             self._release_write()
 
-    # ---------- Команды забыть ----------
+    # ==================== КОМАНДЫ ЗАБЫТЬ ====================
     async def forget(self, key: str) -> bool:
         await self._acquire_write()
         try:
@@ -453,70 +455,34 @@ class GradientMemory:
             self._release_write()
 
     async def forget_all(self, confirm: bool = False) -> bool:
-        """Забыть всё (ротация: TGS→HOT, HOT→COLD). После ротации COLD полностью очищается."""
+        """Забыть всё: снять защиту со всех TGS-записей (переместить в HOT со штрафом -20)."""
         if not confirm:
             return False
         await self._acquire_write()
         try:
-            # Шаг 0: Очищаем COLD (все записи удаляются)
-            self._cold.clear()
-
-            # Шаг 1: TGS → HOT (снимаем защиту, штраф -20)
+            moved = 0
             for key, entry in list(self._tgs.items()):
-                entry["score"] = max(entry.get("score", 50.0) - 20.0, 0.0)
+                current_score = entry.get("score", 50.0)
+                new_score = max(current_score - 20.0, 0.0)
+                entry["score"] = new_score
                 entry["shield"] = False
                 entry["updated_at"] = datetime.now().isoformat()
                 del self._tgs[key]
                 self._hot[key] = entry
-
-            # Шаг 2: HOT → COLD (компрессия, сохраняем score)
-            for key, entry in list(self._hot.items()):
-                current_score = entry.get("score", 0.0)
-                if current_score is None:
-                    current_score = 0.0
-                new_score = max(current_score - 10.0, DELETE_THRESHOLD)
-
-                summary = entry.get("summary")
-                if not summary or summary.startswith("Compressed:"):
-                    value = entry.get("value", {})
-                    if isinstance(value, dict):
-                        user = value.get("user", "")
-                        assistant = value.get("assistant", "")
-                        summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
-                    else:
-                        summary = str(value)[:200]
-
-                cold_entry = {
-                    "value": None,
-                    "score": new_score,
-                    "is_cold": True,
-                    "protected": False,
-                    "shield": False,
-                    "summary": summary,
-                    "created_at": entry.get("created_at", datetime.now().isoformat()),
-                    "updated_at": datetime.now().isoformat(),
-                }
-                del self._hot[key]
-                self._cold[key] = cold_entry
-
-            # Шаг 3: Удаляем из COLD записи с score <= -50.0 (на всякий случай)
-            deleted = 0
-            for key, entry in list(self._cold.items()):
-                if entry.get("score", -5.0) <= DELETE_THRESHOLD:
-                    del self._cold[key]
-                    deleted += 1
-
+                moved += 1
+                logger.info(
+                    "Forget all: moved TGS → HOT",
+                    key=key,
+                    old_score=current_score,
+                    new_score=new_score,
+                )
             await self._save_all()
-            logger.info(
-                "Forget all: rotation completed",
-                cold_entries=len(self._cold),
-                deleted=deleted,
-            )
+            logger.info("Forget all: completed", moved=moved)
             return True
         finally:
             self._release_write()
 
-    # ---------- Build context ----------
+    # ==================== BUILD CONTEXT (ДЛЯ LLM) ====================
     async def build_context(self, query: str, max_tokens: int = 3000) -> str:
         await self._acquire_read()
         try:
@@ -526,7 +492,6 @@ class GradientMemory:
             ]
             for key, entry in tgs_items:
                 parts.append(f"[TGS: {key}] {self._format_value(entry)}")
-
             hot_items = sorted(
                 self._hot.items(),
                 key=lambda x: (x[1].get("protected", False), x[1].get("score", 0)),
@@ -534,7 +499,6 @@ class GradientMemory:
             )[:10]
             for key, entry in hot_items:
                 parts.append(f"[HOT: {key}] {self._format_value(entry)}")
-
             query_words = set(query.lower().split())
             cold_items = []
             for key, entry in self._cold.items():
@@ -544,7 +508,6 @@ class GradientMemory:
             cold_items = sorted(cold_items, key=lambda x: x[1].get("score", 0), reverse=True)[:3]
             for key, entry in cold_items:
                 parts.append(f"[COLD: {key}] {entry.get('summary', '')}")
-
             context = "\n".join(parts)
             return context[:max_tokens]
         finally:
@@ -561,7 +524,7 @@ class GradientMemory:
             return str(value)[:500]
         return str(value)[:500]
 
-    # ---------- Вспомогательные ----------
+    # ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
     def __len__(self) -> int:
         return len(self._tgs) + len(self._hot) + len(self._cold)
 
