@@ -144,7 +144,7 @@ vasily_ai/
 │   └── ollama_client.py
 ├── ui/                 # Веб-дашборд
 │   └── dashboard.py    # Streamlit-приложение
-├── tests/              # Тесты (111 passed)
+├── tests/              # Тесты (151 passed)
 ├── logs/               # Логи (создаётся автоматически)
 └── data/               # Данные и память (создаётся автоматически)
 Тестирование
@@ -276,7 +276,7 @@ vasily_ai/
 ├── memory/             # Gradient Cascade Memory
 ├── integrations/       # External services
 ├── ui/                 # Web dashboard
-├── tests/              # Test suite (111 passed)
+├── tests/              # Test suite (151 passed)
 ├── logs/               # Rotated logs (auto-created)
 └── data/               # Persistent data (auto-created)
 Testing
