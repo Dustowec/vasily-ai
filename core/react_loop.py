@@ -94,11 +94,12 @@ class ReActLoop:
             {"role": "system", "content": system_prompt},
         ]
 
+        # Если есть контекст памяти — добавляем его как системное сообщение
         if memory_context:
             messages.append(
                 {
                     "role": "system",
-                    "content": "Relevant dialogue memory:\n" + memory_context,
+                    "content": "Relevant memory context:\n" + memory_context,
                 }
             )
 

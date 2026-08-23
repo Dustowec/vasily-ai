@@ -16,7 +16,7 @@ from core.react_loop import ReActLoop
 from core.scheduler import PeriodicScheduler
 from core.service_launcher import ensure_ollama_running
 from integrations.ollama_client import LLMUnavailableError, OllamaClient
-from memory.manager import MemoryManager
+from memory.manager import GradientMemory
 
 logger = get_logger("core", "AgentCore")
 
@@ -31,7 +31,7 @@ class AgentCore:
     def __init__(self, config: Config):
         self.config = config
         self.plugin_registry = PluginRegistry()
-        self.memory = MemoryManager()
+        self.memory = GradientMemory(data_dir=str(config.data_dir))
         self.metrics = MetricsCollector()
         self.running = False
         self._start_time = time.time()
@@ -41,6 +41,7 @@ class AgentCore:
         self.react_loop: ReActLoop | None = None
         self._active_request_task: asyncio.Task | None = None
         self.scheduler: PeriodicScheduler | None = None
+        self._session_requests = 0
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -110,30 +111,66 @@ class AgentCore:
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
         """Handle user request using ReAct-powered routing."""
         self._requests_count += 1
+        self._session_requests += 1
         start = time.time()
         user_text = request.get("text", "")
 
         try:
             logger.info("Request received", text=user_text[:50])
 
+            # Обработка команд памяти
             if user_text.strip().lower() == "status":
-                return {"status": "success", "metrics": self.get_metrics()}
+                stats = self.memory.get_stats()
+                return {"status": "success", "metrics": self.get_metrics(), "memory_stats": stats}
 
             if user_text.strip().lower() == "help":
                 return {
                     "status": "success",
-                    "message": "Available commands: status, help, exit. "
+                    "message": "Available commands: status, help, exit, забыть <тема>, забыть всё. "
                     "Any other text is processed by AI with access to plugins. "
                     "Ctrl+C cancels the current request.",
                 }
+
+            # Команда "забудь"
+            if user_text.strip().lower().startswith("забудь "):
+                topic = user_text.strip()[7:].strip()
+                if not topic:
+                    return {"status": "error", "message": "Укажите тему для забывания."}
+                result = await self.memory.forget(topic)
+                if result:
+                    return {"status": "success", "message": f"Тема '{topic}' забыта."}
+                return {"status": "error", "message": f"Тема '{topic}' не найдена."}
+
+            # Команда "забудь всё"
+            if user_text.strip().lower() == "забудь всё":
+                # Здесь нужен механизм двойного подтверждения через CLI
+                # Пока возвращаем сообщение
+                return {
+                    "status": "error",
+                    "message": "Для подтверждения команды 'забудь всё' требуется двойное подтверждение. "
+                    "Введите 'забудь всё да' для подтверждения.",
+                }
+
+            if user_text.strip().lower() == "забудь всё да":
+                result = await self.memory.forget_all(confirm=True)
+                if result:
+                    return {
+                        "status": "success",
+                        "message": "Память полностью очищена (ротация выполнена).",
+                    }
+                return {"status": "error", "message": "Не удалось выполнить ротацию памяти."}
 
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
             structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
 
-            memory_context = await self._build_dialogue_context()
-            result = await self.react_loop.run(user_text, memory_context=memory_context)
+            # Строим контекст из памяти
+            memory_context = await self.memory.build_context(user_text)
+
+            result = await self.react_loop.run(
+                user_text, memory_context=memory_context, prompt_type="default"
+            )
 
             duration_ms = (time.time() - start) * 1000
             logger.info(
@@ -143,7 +180,11 @@ class AgentCore:
                 duration_ms=round(duration_ms, 2),
             )
 
+            # Сохраняем диалог в память
             await self._store_dialogue(user_text, result)
+
+            # Применяем остывание после каждого запроса
+            await self.memory.decay(self._session_requests)
 
             status = result.get("status")
             self.metrics.record_request(
@@ -187,25 +228,8 @@ class AgentCore:
             logger.error("Request failed", error=str(e))
             return {"status": "error", "message": str(e)}
 
-    async def _build_dialogue_context(self) -> str:
-        """Build memory context from the last dialogue turn."""
-        last = await self.memory.recall("dialogue:last")
-
-        if not last:
-            return ""
-
-        user_text = str(last.get("user", ""))
-        assistant_text = str(last.get("assistant", ""))
-
-        if not user_text and not assistant_text:
-            return ""
-
-        return (
-            f"Previous user request: {user_text}\n" f"Previous assistant answer: {assistant_text}"
-        )
-
     async def _store_dialogue(self, user_text: str, result: dict[str, Any]) -> None:
-        """Store the last dialogue turn into hot memory."""
+        """Store dialogue turn in gradient memory."""
         status = result.get("status")
         answer = str(result.get("answer", "") or "").strip()
 
@@ -215,12 +239,19 @@ class AgentCore:
         if not answer:
             return
 
+        # Создаём ключ для диалога на основе времени
+
+        timestamp = time.time()
+        dialogue_key = f"dialogue_{int(timestamp)}"
+
         await self.memory.remember(
-            "dialogue:last",
+            dialogue_key,
             {
                 "user": str(user_text),
                 "assistant": answer,
+                "timestamp": timestamp,
             },
+            complex_query=len(user_text) > 100,
         )
 
     async def _cli_loop(self) -> None:
@@ -255,6 +286,11 @@ class AgentCore:
                     print(f"\n{response.get('message', '')}")
                     if "iterations" in response:
                         print(f"[Iterations: {response['iterations']}]")
+                    if "memory_stats" in response:
+                        stats = response["memory_stats"]
+                        print(
+                            f"[Memory: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}]"
+                        )
                 elif response.get("status") == "interrupted":
                     print(f"\n[Interrupted] {response.get('message', '')}")
                 else:
@@ -281,11 +317,6 @@ class AgentCore:
             COMPRESSION_INTERVAL_SECONDS,
             lambda: self.memory.compress_cycle(llm_compressor.compress),
         )
-        self.scheduler.register(
-            "dialogue_reset",
-            DIALOGUE_RESET_INTERVAL_SECONDS,
-            lambda: self.memory.forget("dialogue:last"),
-        )
         await self.scheduler.start()
         logger.info("LLM-powered memory compression enabled (internal scheduler)")
 
@@ -299,6 +330,9 @@ class AgentCore:
     async def shutdown(self) -> None:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
+
+        # Применяем штраф за закрытие сессии
+        await self.memory.session_close()
 
         if self.scheduler:
             await self.scheduler.stop()
@@ -314,12 +348,17 @@ class AgentCore:
     def get_metrics(self) -> dict[str, Any]:
         """Get current agent metrics."""
         uptime = time.time() - self._start_time
+        stats = self.memory.get_stats()
         base_metrics = {
             "uptime_seconds": round(uptime, 2),
             "requests_count": self._requests_count,
             "errors_count": self._errors_count,
             "plugins_loaded": len(self.plugin_registry),
-            "memory_entries": len(self.memory),
+            "memory_entries": stats["total"],
+            "memory_tgs": stats["tgs"],
+            "memory_hot": stats["hot"],
+            "memory_cold": stats["cold"],
+            "session_requests": self._session_requests,
         }
         base_metrics.update(self.metrics.snapshot())
         return base_metrics
