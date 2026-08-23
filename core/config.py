@@ -34,7 +34,7 @@ class Config:
     # Development mode: allow mock data from plugins
     dev_mode: bool = False
 
-    # Sanitization (T3-016.5)
+    # Sanitization
     sanitize_logs: bool = True
     max_log_field_length: int = 100
     log_sensitive_keys: list[str] = field(
@@ -79,6 +79,12 @@ class Config:
     # External backends (plugins)
     searxng_url: str = "http://localhost:8080/search"
     danbooru_url: str = "https://danbooru.donmai.us"
+
+    # Watchdog (мониторинг и автовосстановление)
+    watchdog_enabled: bool = True
+    watchdog_check_interval: int = 30
+    watchdog_restart_timeout: int = 5
+    watchdog_max_restarts: int = 2
 
     @classmethod
     def load(cls, config_path: str | None = None) -> "Config":

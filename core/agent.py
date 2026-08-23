@@ -15,6 +15,7 @@ from core.plugin_registry import PluginRegistry
 from core.react_loop import ReActLoop
 from core.scheduler import PeriodicScheduler
 from core.service_launcher import ensure_ollama_running
+from core.watchdog import Watchdog
 from integrations.ollama_client import LLMUnavailableError, OllamaClient
 from memory.manager import GradientMemory
 
@@ -42,6 +43,7 @@ class AgentCore:
         self._active_request_task: asyncio.Task | None = None
         self.scheduler: PeriodicScheduler | None = None
         self._session_requests = 0
+        self.watchdog: Watchdog | None = None  # <-- ДОБАВЛЕНО
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -121,7 +123,13 @@ class AgentCore:
             # Обработка команд памяти
             if user_text.strip().lower() == "status":
                 stats = self.memory.get_stats()
-                return {"status": "success", "metrics": self.get_metrics(), "memory_stats": stats}
+                icons = self.watchdog.get_status_icons() if self.watchdog else ""
+                return {
+                    "status": "success",
+                    "metrics": self.get_metrics(),
+                    "memory_stats": stats,
+                    "watchdog_icons": icons,
+                }
 
             if user_text.strip().lower() == "help":
                 return {
@@ -143,8 +151,6 @@ class AgentCore:
 
             # Команда "забудь всё"
             if user_text.strip().lower() == "забудь всё":
-                # Здесь нужен механизм двойного подтверждения через CLI
-                # Пока возвращаем сообщение
                 return {
                     "status": "error",
                     "message": "Для подтверждения команды 'забудь всё' требуется двойное подтверждение. "
@@ -291,6 +297,8 @@ class AgentCore:
                         print(
                             f"[Memory: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}]"
                         )
+                    if "watchdog_icons" in response:
+                        print(f"[Watchdog: {response['watchdog_icons']}]")
                 elif response.get("status") == "interrupted":
                     print(f"\n[Interrupted] {response.get('message', '')}")
                 else:
@@ -320,6 +328,23 @@ class AgentCore:
         await self.scheduler.start()
         logger.info("LLM-powered memory compression enabled (internal scheduler)")
 
+        # Запускаем Watchdog (если включён в конфиге)
+        if self.config.watchdog_enabled:
+            self.watchdog = Watchdog(
+                agent=self,
+                check_interval=self.config.watchdog_check_interval,
+                restart_timeout=self.config.watchdog_restart_timeout,
+                max_restarts=self.config.watchdog_max_restarts,
+            )
+            await self.watchdog.start()
+            logger.info(
+                "Watchdog started",
+                interval=self.config.watchdog_check_interval,
+                max_restarts=self.config.watchdog_max_restarts,
+            )
+        else:
+            logger.info("Watchdog disabled by config")
+
         try:
             await self._cli_loop()
         except asyncio.CancelledError:
@@ -331,8 +356,9 @@ class AgentCore:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
 
-        # Применяем штраф за закрытие сессии
-        await self.memory.session_close()
+        # Останавливаем Watchdog (добавлено)
+        if self.watchdog:
+            await self.watchdog.stop()
 
         if self.scheduler:
             await self.scheduler.stop()
@@ -360,6 +386,19 @@ class AgentCore:
             "memory_cold": stats["cold"],
             "session_requests": self._session_requests,
         }
+
+        # Добавляем статус Watchdog
+        if self.watchdog:
+            watchdog_status = self.watchdog.get_status()
+            base_metrics["watchdog_llm"] = "OK" if watchdog_status["llm"]["available"] else "FAIL"
+            base_metrics["watchdog_plugins"] = (
+                "OK" if watchdog_status["plugins"]["available"] else "FAIL"
+            )
+            base_metrics["watchdog_memory"] = (
+                "OK" if watchdog_status["memory"]["available"] else "FAIL"
+            )
+            base_metrics["watchdog_disk"] = "OK" if watchdog_status["disk"]["available"] else "FAIL"
+
         base_metrics.update(self.metrics.snapshot())
         return base_metrics
 
