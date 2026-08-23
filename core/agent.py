@@ -112,7 +112,6 @@ class AgentCore:
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
         """Handle user request using ReAct-powered routing."""
         self._requests_count += 1
-        # Ограничение для стабильности decay
         self._session_requests = min(self._session_requests + 1, 1000)
         start = time.time()
         user_text = request.get("text", "")
@@ -120,7 +119,6 @@ class AgentCore:
         try:
             logger.info("Request received", text=user_text[:50])
 
-            # --- Команды управления (гибкое распознавание) ---
             cmd = user_text.strip().lower()
 
             if cmd == "status":
@@ -173,6 +171,66 @@ class AgentCore:
                 if result:
                     return {"status": "success", "message": f"Тема '{topic}' забыта."}
                 return {"status": "error", "message": f"Тема '{topic}' не найдена."}
+
+            # --- Автоматическое определение поисковых запросов ---
+            search_keywords = [
+                "поищи",
+                "найди",
+                "погода",
+                "новости",
+                "цена",
+                "курс",
+                "сколько стоит",
+                "узнай",
+                "расскажи про",
+                "что такое",
+                "как работает",
+                "когда",
+                "где",
+                "кто такой",
+                "что происходит",
+            ]
+            text_lower = user_text.lower()
+            if any(kw in text_lower for kw in search_keywords):
+                web_search_tool = self.plugin_registry.get("web_search")
+                if web_search_tool:
+                    logger.info(
+                        "Auto-detected search query, calling web_search directly",
+                        text=user_text[:50],
+                    )
+                    try:
+                        result = await web_search_tool.execute(query=user_text, limit=5)
+                        if result.get("status") == "success":
+                            results = result.get("results", [])
+                            if results:
+                                answer = f"Результаты поиска по запросу '{user_text}':\n\n"
+                                for i, r in enumerate(results[:5], 1):
+                                    title = r.get("title", "Без названия")
+                                    snippet = r.get("snippet", "")
+                                    url = r.get("url", "")
+                                    answer += f"{i}. **{title}**\n"
+                                    if snippet:
+                                        answer += f"   {snippet}\n"
+                                    if url:
+                                        answer += f"   Источник: {url}\n"
+                                    answer += "\n"
+                                return {"status": "success", "message": answer, "iterations": 0}
+                            else:
+                                return {
+                                    "status": "success",
+                                    "message": f"По запросу '{user_text}' ничего не найдено.",
+                                }
+                        else:
+                            error_msg = result.get("message", "Неизвестная ошибка при поиске")
+                            return {"status": "error", "message": f"Ошибка поиска: {error_msg}"}
+                    except Exception as e:
+                        logger.error("Web search failed", error=str(e))
+                        return {
+                            "status": "error",
+                            "message": f"Ошибка при выполнении поиска: {str(e)}",
+                        }
+                else:
+                    logger.warning("web_search plugin not found, falling back to ReAct")
 
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
