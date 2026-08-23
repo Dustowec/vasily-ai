@@ -1,43 +1,67 @@
-Vasily AI
-English version below
+# Vasily AI
 
-🇷🇺 Русская версия
-Vasily AI — локальный ИИ-агент с архитектурой ReAct (Reasoning + Acting). Работает через Ollama, поддерживает плагины, имеет градиентно-сессионную память с динамическим охлаждением, структурированное логирование и систему crash-репортов.
+[English version below](#english-version)
 
-Статус: ✅ Стабильная версия · Память обновлена до Gradient Cascade · Готов к дашборду
+## 🇷🇺 Русская версия
 
-Возможности
-Область	Описание
-Ядро	ReAct-цикл с вызовом инструментов · Асинхронное ядро (asyncio) · Автодискавери плагинов
-Память	Градиентно-сессионная (Gradient Cascade): три зоны (TGS, Hot, Cold), динамическое охлаждение, защита protected и shield, атомарная запись
-Плагины	Генерация арт-промптов · Веб-поиск (SearXNG) · Веб-скрапинг с SSRF-защитой · Поиск по Danbooru · Чтение локальных файлов (csv, json, txt, md, xlsx, pdf) · Echo (для тестов)
-Логирование	4 категории (core/interaction/plugins/llm) · 5 уровней алертов · Ротация 72 часа · Санация PII
-Безопасность	Crash-репорты (JSON + MD) · SSRF-защита · Защита от path traversal · Санация логов · Атомарная запись памяти
-Инструменты	TokenManager · MetricsCollector · BackupManager · Health Check · Автозапуск Ollama · Команды управления памятью
-Новая архитектура памяти (Gradient Cascade Memory)
+**Vasily AI** — локальный ИИ-агент с архитектурой ReAct (Reasoning + Acting). Работает через Ollama, поддерживает плагины, имеет градиентно-сессионную память с динамическим охлаждением, структурированное логирование, систему мониторинга (Watchdog) и веб-дашборд.
+
+**Статус:** ✅ Стабильная версия · Готов к использованию
+
+---
+
+### Возможности
+
+| Область | Описание |
+|---------|----------|
+| **Ядро** | ReAct-цикл с вызовом инструментов · Асинхронное ядро (asyncio) · Автодискавери плагинов |
+| **Память** | **Градиентно-сессионная (Gradient Cascade)**: три зоны (TGS, Hot, Cold), динамическое охлаждение, защита protected и shield, атомарная запись |
+| **Мониторинг** | Watchdog: фоновый мониторинг LLM, плагинов, памяти и диска · Автоматическое восстановление (до 2 попыток) · Crash-репорты · Уведомления пользователя |
+| **Плагины** | Генерация арт-промптов · Веб-поиск (SearXNG) · Веб-скрапинг с SSRF-защитой · Поиск по Danbooru · Чтение локальных файлов (csv, json, txt, md, xlsx, pdf) · Echo (для тестов) |
+| **Логирование** | 4 категории (core/interaction/plugins/llm) · 5 уровней алертов · Ротация 72 часа · Санация PII · Отдельный лог для Watchdog |
+| **Безопасность** | Crash-репорты (JSON + MD) · SSRF-защита · Защита от path traversal · Санация логов · Атомарная запись памяти |
+| **Интерфейс** | Веб-дашборд (Streamlit) · История чата в реальном времени · Статус модулей · Управление памятью · Краш-лог |
+
+---
+
+### Новая архитектура памяти (Gradient Cascade Memory)
+
 Память больше не привязана к календарю — она остывает от действий пользователя.
 
-Принципы:
+**Принципы:**
+- 1 тик = 1 сообщение (запрос + ответ)
+- Остывание замедляется при интенсивной сессии (Floating Decay)
+- Три зоны: TGS (защита), Hot (активная), Cold (сжатые саммари)
+- Нагрев: +5.0 при recall, +10.0 при remember
+- Защита protected: тема не сжимается повторно до мутации
+- Команды: `забудь <тема>` и `забудь всё` (с подтверждением)
 
-1 тик = 1 сообщение (запрос + ответ)
+**Файлы хранения:**
+- `data/tgs_memory.json` — защищённые темы
+- `data/tg_hot_memory.json` — активные темы
+- `data/tg_cold_memory.json` — архив с саммари
 
-Остывание замедляется при интенсивной сессии (Floating Decay)
+---
 
-Три зоны: TGS (защита), Hot (активная), Cold (сжатые саммари)
+### Веб-дашборд (Streamlit)
 
-Нагрев: +5.0 при recall, +10.0 при remember
+Запустите дашборд через `start_dashboard.bat` или командой:
 
-Защита protected: тема не сжимается повторно до мутации
+```bash
+streamlit run ui/dashboard.py
+Дашборд предоставляет:
 
-Команды: забудь <тема> и забудь всё (с подтверждением)
+Историю чата в реальном времени.
 
-Файлы хранения:
+Статус всех модулей (LLM, плагины, память, диск) с цветовыми индикаторами.
 
-data/tgs_memory.json — защищённые темы
+Отображение текущего RAG-контекста (что будет передано в LLM).
 
-data/tg_hot_memory.json — активные темы
+Кнопки управления: «Забыть всё», «Перезапуск агента», «Выход».
 
-data/tg_cold_memory.json — архив с саммари
+Краш-лог — показывает последний отчёт об ошибке.
+
+Автоматическое обновление статуса каждые 5 секунд.
 
 Быстрый старт
 Требования:
@@ -73,22 +97,19 @@ export VASILY_LLM_MODEL=llama3.2
 export VASILY_DEV_MODE=true
 Запуск:
 
-bash
-python -m vasily_ai
-Или двойным кликом по run_agent.bat.
+CLI-версия: run_agent.bat или python -m core.agent
+
+Дашборд: start_dashboard.bat или streamlit run ui/dashboard.py
 
 Команды:
 
 text
-> привет
-> нарисуй самурая под дождём
-> найди погоду на завтра
-> прочитай файл data/report.json
-> статус
-> забыть про самурая
-> забыть всё
-> help
-> exit
+> status                         — показать состояние агента и памяти
+> help                            — справка
+> забыть <тема>                  — забыть конкретную тему
+> забыть всё                      — запрос на полную очистку
+> забыть всё да                   — подтверждение полной очистки
+> exit                            — выход (только в CLI)
 Плагины
 Плагин	Описание
 art_generator	Генерирует детальные промпты для Stable Diffusion / Midjourney
@@ -113,13 +134,16 @@ vasily_ai/
 │   ├── metrics.py
 │   ├── backup.py
 │   ├── crypto.py       # Заглушка (NoOp) — задел на будущее
-│   └── scheduler.py    # Периодические задачи
+│   ├── scheduler.py    # Периодические задачи
+│   └── watchdog.py     # Мониторинг и автовосстановление
 ├── plugins/            # Автодискавери плагинов
 ├── memory/             # Память (Gradient Cascade)
 │   ├── manager.py      # Основная логика
 │   └── llm_compressor.py
 ├── integrations/       # Внешние сервисы
 │   └── ollama_client.py
+├── ui/                 # Веб-дашборд
+│   └── dashboard.py    # Streamlit-приложение
 ├── tests/              # Тесты (111 passed)
 ├── logs/               # Логи (создаётся автоматически)
 └── data/               # Данные и память (создаётся автоматически)
@@ -138,6 +162,7 @@ core.log	AgentCore, PluginRegistry, ReActLoop
 interaction.log	Вызовы плагинов
 plugins.log	Внутренние логи плагинов
 llm.log	Запросы и ответы LLM
+watchdog.log	События мониторинга (ротация 50 записей)
 vasily.log	Все логи в одном файле
 Уровни алертов: STATE, REQUEST, WARNING, CRITICAL_WARNING, CRASH
 
@@ -148,18 +173,19 @@ MIT
 
 🌐 English Version
 Overview
-Vasily AI is a local AI agent with a ReAct (Reasoning + Acting) architecture. It runs on Ollama, supports plugins, has gradient-session memory with dynamic cooling, structured logging, and crash reporting.
+Vasily AI is a local AI agent with a ReAct (Reasoning + Acting) architecture. It runs on Ollama, supports plugins, has gradient-session memory with dynamic cooling, structured logging, a monitoring system (Watchdog), and a web dashboard.
 
-Status: ✅ Stable · Memory upgraded to Gradient Cascade · Ready for dashboard
+Status: ✅ Stable · Ready for use
 
 Features
 Area	Description
 Core	ReAct loop with tool calling · Async asyncio core · Plugin auto-discovery
 Memory	Gradient Cascade: three zones (TGS, Hot, Cold), dynamic cooling, protected/shield flags, atomic write
+Monitoring	Watchdog: background monitoring of LLM, plugins, memory, disk · Auto-recovery (up to 2 attempts) · Crash reports · User notifications
 Plugins	Art generation · Web search · Web scraping with SSRF protection · Danbooru search · Local file reading (csv, json, txt, md, xlsx, pdf) · Echo
-Logging	4 categories · 5 alert levels · 72h rotation · PII sanitization
+Logging	4 categories · 5 alert levels · 72h rotation · PII sanitization · Separate watchdog log
 Security	Crash reports (JSON + MD) · SSRF protection · Path traversal protection · Atomic memory write
-Tools	TokenManager · MetricsCollector · BackupManager · Health Check · Ollama auto-start · Memory commands
+Interface	Web dashboard (Streamlit) · Real-time chat history · Module status · Memory management · Crash log
 Gradient Cascade Memory
 Memory is no longer tied to calendar time — it cools based on user actions.
 
@@ -185,6 +211,25 @@ data/tg_hot_memory.json — active topics
 
 data/tg_cold_memory.json — archived summaries
 
+Web Dashboard (Streamlit)
+Run the dashboard with start_dashboard.bat or:
+
+bash
+streamlit run ui/dashboard.py
+The dashboard provides:
+
+Real-time chat history.
+
+Module status (LLM, plugins, memory, disk) with color indicators.
+
+Current RAG context (what will be sent to LLM).
+
+Control buttons: «Forget All», «Restart Agent», «Exit».
+
+Crash log — shows the latest error report.
+
+Auto-refresh every 5 seconds.
+
 Quick Start
 Requirements:
 
@@ -202,22 +247,19 @@ cd vasily-ai
 uv sync --all-extras
 Run:
 
-bash
-python -m vasily_ai
-Or double-click run_agent.bat.
+CLI: run_agent.bat or python -m core.agent
+
+Dashboard: start_dashboard.bat or streamlit run ui/dashboard.py
 
 Commands:
 
 text
-> hello
-> draw a samurai in the rain
-> search for weather tomorrow
-> read file data/report.json
-> status
-> forget about samurai
-> forget all
-> help
-> exit
+> status                         — show agent and memory status
+> help                            — show help
+> forget <topic>                  — forget a specific topic
+> forget all                      — request full memory wipe
+> forget all yes                  — confirm full memory wipe
+> exit                            — exit (CLI only)
 Plugins
 Plugin	Description
 art_generator	Generates detailed prompts for Stable Diffusion / Midjourney
@@ -233,6 +275,7 @@ vasily_ai/
 ├── plugins/            # Auto-discovered plugins
 ├── memory/             # Gradient Cascade Memory
 ├── integrations/       # External services
+├── ui/                 # Web dashboard
 ├── tests/              # Test suite (111 passed)
 ├── logs/               # Rotated logs (auto-created)
 └── data/               # Persistent data (auto-created)
@@ -248,6 +291,7 @@ core.log	AgentCore, PluginRegistry, ReActLoop
 interaction.log	Core ↔ Plugin calls
 plugins.log	Plugin internals
 llm.log	LLM requests/responses
+watchdog.log	Monitoring events (50-entry rotation)
 vasily.log	All logs combined
 Crash reports: logs/crash_reports/YYYY-MM-DD/crash_XXX.json and .md
 
