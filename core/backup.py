@@ -1,11 +1,13 @@
 """Byte-level backup manager for TZ-025.
 
 Encryption-agnostic: copies files as raw bytes without interpreting content.
+Supports optional CryptoProvider for future encryption.
 """
 
 from datetime import datetime
 from pathlib import Path
 
+from core.crypto import NoOpCrypto
 from core.logging_config import get_logger
 
 logger = get_logger("core", "BackupManager")
@@ -19,10 +21,13 @@ class BackupManager:
         source_base: Path,
         source_paths: list[Path],
         backup_root: Path,
+        crypto=None,  # опционально: CryptoProvider для шифрования
     ):
         self.source_base = Path(source_base)
         self.source_paths = [Path(p) for p in source_paths]
         self.backup_root = Path(backup_root)
+        # Если crypto не передан — используем заглушку (NoOp)
+        self.crypto = crypto or NoOpCrypto()
 
     def create_backup(self) -> Path:
         """Create a timestamped backup folder and copy files byte-for-byte.
@@ -50,8 +55,10 @@ class BackupManager:
             destination = backup_dir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
 
+            # Читаем и пишем через CryptoProvider
             data = source_path.read_bytes()
-            destination.write_bytes(data)
+            encrypted = self.crypto.encrypt(data)
+            destination.write_bytes(encrypted)
             copied += 1
 
         logger.info(
@@ -59,6 +66,7 @@ class BackupManager:
             backup_dir=str(backup_dir),
             copied=copied,
             skipped=skipped,
+            encryption=str(self.crypto.__class__.__name__),
         )
         return backup_dir
 
