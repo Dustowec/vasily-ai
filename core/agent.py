@@ -121,7 +121,10 @@ class AgentCore:
             logger.info("Request received", text=user_text[:50])
 
             # --- Команды управления (точные совпадения) ---
-            if user_text.strip().lower() == "status":
+            # --- Команды управления (гибкое распознавание) ---
+            cmd = user_text.strip().lower()
+
+            if cmd == "status":
                 stats = self.memory.get_stats()
                 icons = self.watchdog.get_status_icons() if self.watchdog else ""
                 metrics = self.get_metrics()
@@ -138,7 +141,7 @@ class AgentCore:
                     "watchdog_icons": icons,
                 }
 
-            if user_text.strip().lower() == "help":
+            if cmd == "help":
                 return {
                     "status": "success",
                     "message": "Available commands: status, help, exit, забыть <тема>, забыть всё. "
@@ -146,26 +149,31 @@ class AgentCore:
                     "Ctrl+C cancels the current request.",
                 }
 
-            if user_text.strip().lower() == "забудь всё":
-                return {
-                    "status": "error",
-                    "message": "Для подтверждения команды 'забудь всё' требуется двойное подтверждение. "
-                    "Введите 'забудь всё да' для подтверждения.",
-                }
-
-            if user_text.strip().lower() == "забудь всё да":
-                result = await self.memory.forget_all(confirm=True)
-                if result:
+            # Распознаём "забудь всё" или "забыть всё"
+            if "забудь всё" in cmd or "забыть всё" in cmd:
+                # Проверяем, есть ли "да" для подтверждения
+                if "да" in cmd:
+                    result = await self.memory.forget_all(confirm=True)
+                    if result:
+                        return {
+                            "status": "success",
+                            "message": "Память полностью очищена (ротация выполнена).",
+                        }
+                    return {"status": "error", "message": "Не удалось выполнить ротацию памяти."}
+                else:
                     return {
-                        "status": "success",
-                        "message": "Память полностью очищена (ротация выполнена).",
+                        "status": "error",
+                        "message": "Для подтверждения команды 'забудь всё' требуется двойное подтверждение. "
+                        "Введите 'забудь всё да' для подтверждения.",
                     }
-                return {"status": "error", "message": "Не удалось выполнить ротацию памяти."}
 
-            if user_text.strip().lower().startswith("забудь "):
-                topic = user_text.strip()[7:].strip()
-                if not topic:
+            # Распознаём "забудь <тема>" или "забыть <тема>"
+            if cmd.startswith("забудь ") or cmd.startswith("забыть "):
+                # Извлекаем тему (после первого пробела)
+                parts = cmd.split(maxsplit=1)
+                if len(parts) < 2 or not parts[1].strip():
                     return {"status": "error", "message": "Укажите тему для забывания."}
+                topic = parts[1].strip()
                 result = await self.memory.forget(topic)
                 if result:
                     return {"status": "success", "message": f"Тема '{topic}' забыта."}
