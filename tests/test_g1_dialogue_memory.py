@@ -2,7 +2,6 @@
 
 import pytest
 
-import memory.manager as mm
 from core.agent import AgentCore
 from core.config import Config
 
@@ -21,7 +20,6 @@ class FakeReActLoop:
                 "memory_context": memory_context,
             }
         )
-
         return {
             "status": "success",
             "answer": "test answer",
@@ -33,8 +31,17 @@ class FakeReActLoop:
 @pytest.fixture
 def memory_paths(tmp_path, monkeypatch):
     """Isolate memory files in a temporary directory."""
-    monkeypatch.setattr(mm, "HOT_FILE", str(tmp_path / "hot.json"))
-    monkeypatch.setattr(mm, "COLD_FILE", str(tmp_path / "cold.json"))
+    # Сохраняем оригинальный метод загрузки
+    original_load = Config.load
+
+    # Создаём обёртку, которая принудительно устанавливает data_dir во временную папку
+    def mock_load(*args, **kwargs):
+        cfg = original_load(*args, **kwargs)
+        cfg.data_dir = tmp_path
+        return cfg
+
+    # Подменяем метод загрузки для всех тестов, использующих эту фикстуру
+    monkeypatch.setattr(Config, "load", mock_load)
     return tmp_path
 
 
@@ -45,11 +52,9 @@ async def test_handle_request_stores_last_dialogue(memory_paths):
     agent.react_loop = FakeReActLoop()
 
     response = await agent.handle_request({"id": "1", "text": "Привет"})
-
     assert response["status"] == "success"
 
     stored = await agent.memory.recall("dialogue:last")
-
     assert stored is not None
     assert stored["user"] == "Привет"
     assert stored["assistant"] == "test answer"
@@ -72,7 +77,10 @@ async def test_handle_request_passes_memory_context(memory_paths):
     first_context = react_loop.calls[0]["memory_context"]
     second_context = react_loop.calls[1]["memory_context"]
 
+    # Первый запрос должен получить пустой контекст (память чистая)
     assert first_context == ""
+
+    # Второй запрос должен получить контекст с первым запросом и ответом
     assert "Первый запрос" in second_context
     assert "test answer" in second_context
 

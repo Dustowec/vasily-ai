@@ -53,7 +53,6 @@ class AgentCore:
             json_logs=self.config.json_logs,
         )
         install_crash_handler(self.config.log_dir)
-
         loop = asyncio.get_running_loop()
         install_async_exception_handler(loop, self.config.log_dir)
 
@@ -113,15 +112,14 @@ class AgentCore:
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
         """Handle user request using ReAct-powered routing."""
         self._requests_count += 1
-        self._session_requests += 1
+        # Ограничение для стабильности decay
+        self._session_requests = min(self._session_requests + 1, 1000)
         start = time.time()
         user_text = request.get("text", "")
 
         try:
             logger.info("Request received", text=user_text[:50])
 
-            # --- Команды управления (точные совпадения) ---
-            # --- Команды управления (гибкое распознавание) ---
             cmd = user_text.strip().lower()
 
             if cmd == "status":
@@ -149,9 +147,7 @@ class AgentCore:
                     "Ctrl+C cancels the current request.",
                 }
 
-            # Распознаём "забудь всё" или "забыть всё"
             if "забудь всё" in cmd or "забыть всё" in cmd:
-                # Проверяем, есть ли "да" для подтверждения
                 if "да" in cmd:
                     result = await self.memory.forget_all(confirm=True)
                     if result:
@@ -167,9 +163,7 @@ class AgentCore:
                         "Введите 'забудь всё да' для подтверждения.",
                     }
 
-            # Распознаём "забудь <тема>" или "забыть <тема>"
             if cmd.startswith("забудь ") or cmd.startswith("забыть "):
-                # Извлекаем тему (после первого пробела)
                 parts = cmd.split(maxsplit=1)
                 if len(parts) < 2 or not parts[1].strip():
                     return {"status": "error", "message": "Укажите тему для забывания."}
@@ -179,12 +173,10 @@ class AgentCore:
                     return {"status": "success", "message": f"Тема '{topic}' забыта."}
                 return {"status": "error", "message": f"Тема '{topic}' не найдена."}
 
-            # --- Если не команда, запускаем ReAct ---
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
             structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
-
             memory_context = await self.memory.build_context(user_text)
 
             result = await self.react_loop.run(
@@ -248,15 +240,14 @@ class AgentCore:
         """Store dialogue turn in gradient memory."""
         status = result.get("status")
         answer = str(result.get("answer", "") or "").strip()
-
         if status not in ("success", "interrupted"):
             return
-
         if not answer:
             return
-
         timestamp = time.time()
-        dialogue_key = f"dialogue_{int(timestamp)}"
+
+        # Жёсткий ключ вместо генерации по времени
+        dialogue_key = "dialogue:last"
 
         await self.memory.remember(
             dialogue_key,
@@ -327,11 +318,18 @@ class AgentCore:
         from memory.llm_compressor import LLMCompressor
 
         llm_compressor = LLMCompressor(self.llm_client)
+
         self.scheduler = PeriodicScheduler()
         self.scheduler.register(
             "memory_compression",
             COMPRESSION_INTERVAL_SECONDS,
             lambda: self.memory.compress_cycle(llm_compressor.compress),
+        )
+        # Регистрация задачи сброса диалога
+        self.scheduler.register(
+            "dialogue_reset",
+            DIALOGUE_RESET_INTERVAL_SECONDS,
+            lambda: self.memory.forget("dialogue:last"),
         )
         await self.scheduler.start()
         logger.info("LLM-powered memory compression enabled (internal scheduler)")
@@ -365,15 +363,14 @@ class AgentCore:
 
         if self.watchdog:
             await self.watchdog.stop()
-
         if self.scheduler:
             await self.scheduler.stop()
-
         if self.llm_client:
             await self.llm_client.close()
 
         metrics = self.get_metrics()
         logger.info("Final metrics", **metrics)
+
         self.running = False
         logger.info("Agent shut down cleanly")
 
@@ -381,6 +378,7 @@ class AgentCore:
         """Get current agent metrics."""
         uptime = time.time() - self._start_time
         stats = self.memory.get_stats()
+
         base_metrics = {
             "uptime_seconds": round(uptime, 2),
             "requests_count": self._requests_count,
@@ -426,8 +424,10 @@ async def main():
     """Entry point."""
     config = Config.load()
     config.validate()
+
     agent = AgentCore(config)
     await agent.initialize()
+
     setup_signal_handlers(agent)
 
     try:

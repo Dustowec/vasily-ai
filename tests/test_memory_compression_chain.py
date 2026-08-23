@@ -1,7 +1,5 @@
-"""Memory compression chain tests (Coverage Hardening, file 2 of 3).
-
-Verifies the P1-1 async compression pipeline end-to-end:
-compress_to_cold, compress_all_expired, background worker, build_context.
+"""Memory compression chain tests for GradientMemory.
+Verifies the compression pipeline: compress_cycle, build_context.
 """
 
 import asyncio
@@ -29,86 +27,99 @@ class FakeCompressor:
 @pytest.fixture
 def memory_paths(tmp_path, monkeypatch):
     """Point memory files to a temp dir for isolation."""
+    monkeypatch.setattr(mm, "TGS_FILE", str(tmp_path / "tgs.json"))
     monkeypatch.setattr(mm, "HOT_FILE", str(tmp_path / "hot.json"))
     monkeypatch.setattr(mm, "COLD_FILE", str(tmp_path / "cold.json"))
     return tmp_path
 
 
-async def test_compress_to_cold_moves_entry(memory_paths):
-    manager = mm.MemoryManager()
+async def test_compress_cycle_moves_entry_to_cold(memory_paths):
+    """compress_cycle should compress entries in range 5..-4."""
+    from memory.manager import GradientMemory
+
+    manager = GradientMemory(data_dir=str(memory_paths))
     await manager.remember("k1", "important fact")
+
+    # Устанавливаем score вручную для попадания в диапазон компрессии
+    manager._hot["k1"]["score"] = 3.0
+
     compressor = FakeCompressor()
+    count = await manager.compress_cycle(compressor)
 
-    ok = await manager.compress_to_cold("k1", compressor)
-
-    assert ok is True
+    assert count == 1
     assert compressor.calls == ["important fact"]
-    assert "k1" not in manager.hot.get_all_entries()
-    assert manager._cold_data["k1"]["summary"] == "SUMMARY of important fact"
-    # recall now serves the cold summary
-    assert await manager.recall("k1") == "SUMMARY of important fact"
+    assert "k1" not in manager._hot
+    assert "k1" in manager._cold
+    assert manager._cold["k1"]["summary"] == "SUMMARY of important fact"
+
+    # recall возвращает value (None для cold), но запись есть в cold
+    recalled = await manager.recall("k1")
+    assert recalled is None  # value = None для cold записей
+
+    # Проверяем, что запись переместилась в hot с protected=True
+    assert "k1" in manager._hot
+    assert manager._hot["k1"]["protected"] is True
+    assert manager._hot["k1"]["score"] == 10.0  # recall нагревает до 10.0
 
 
-async def test_compress_to_cold_missing_key(memory_paths):
-    manager = mm.MemoryManager()
+async def test_compress_cycle_skips_out_of_range(memory_paths):
+    """compress_cycle should skip entries outside 5..-4 range."""
+    from memory.manager import GradientMemory
+
+    manager = GradientMemory(data_dir=str(memory_paths))
+    await manager.remember("k1", "data")
+
+    # score = 25.0 (default) — вне диапазона
     compressor = FakeCompressor()
-
-    ok = await manager.compress_to_cold("nope", compressor)
-
-    assert ok is False
-    assert compressor.calls == []
-
-
-async def test_compress_all_expired_compresses_expired(memory_paths, monkeypatch):
-    monkeypatch.setattr(mm, "HOT_RETENTION_HOURS", 0)
-    manager = mm.MemoryManager()
-    await manager.remember("a", "value-a")
-    await manager.remember("b", "value-b")
-    compressor = FakeCompressor()
-
-    count = await manager.compress_all_expired(compressor)
-
-    assert count == 2
-    assert len(compressor.calls) == 2
-    assert "a" not in manager.hot.get_all_entries()
-    assert "b" not in manager.hot.get_all_entries()
-    assert set(manager._cold_data.keys()) == {"a", "b"}
-
-
-async def test_compress_all_expired_skips_fresh(memory_paths):
-    manager = mm.MemoryManager()
-    await manager.remember("fresh", "value-fresh")
-    compressor = FakeCompressor()
-
-    count = await manager.compress_all_expired(compressor)
+    count = await manager.compress_cycle(compressor)
 
     assert count == 0
     assert compressor.calls == []
-    assert "fresh" in manager.hot.get_all_entries()
+    assert "k1" in manager._hot
 
 
-async def test_failing_compressor_keeps_entry(memory_paths, monkeypatch):
-    monkeypatch.setattr(mm, "HOT_RETENTION_HOURS", 0)
-    manager = mm.MemoryManager()
-    await manager.remember("k1", "data")
-    compressor = FakeCompressor(fail=True)
+async def test_compress_cycle_skips_protected(memory_paths):
+    """compress_cycle should skip protected entries."""
+    from memory.manager import GradientMemory
 
-    ok = await manager.compress_to_cold("k1", compressor)
+    manager = GradientMemory(data_dir=str(memory_paths))
+    await manager.remember("k1", "protected data")
+    manager._hot["k1"]["score"] = 3.0
+    manager._hot["k1"]["protected"] = True
 
-    assert ok is False
-    assert "k1" in manager.hot.get_all_entries()
-    assert "k1" not in manager._cold_data
-
-
-async def test_compress_cycle_runs_through_scheduler(memory_paths, monkeypatch):
-    """ADR-005: compression is driven by PeriodicScheduler, not by own worker."""
-    monkeypatch.setattr(mm, "HOT_RETENTION_HOURS", 0)
-    manager = mm.MemoryManager()
-    await manager.remember("k", "data")
     compressor = FakeCompressor()
+    count = await manager.compress_cycle(compressor)
 
+    assert count == 0
+    assert "k1" in manager._hot
+
+
+async def test_failing_compressor_keeps_entry(memory_paths):
+    """If compressor fails, entry should stay in hot."""
+    from memory.manager import GradientMemory
+
+    manager = GradientMemory(data_dir=str(memory_paths))
+    await manager.remember("k1", "data")
+    manager._hot["k1"]["score"] = 3.0
+
+    compressor = FakeCompressor(fail=True)
+    count = await manager.compress_cycle(compressor)
+
+    assert count == 0
+    assert "k1" in manager._hot
+    assert "k1" not in manager._cold
+
+
+async def test_compress_cycle_runs_through_scheduler(memory_paths):
+    """ADR-005: compression is driven by PeriodicScheduler."""
     from core.scheduler import PeriodicScheduler
+    from memory.manager import GradientMemory
 
+    manager = GradientMemory(data_dir=str(memory_paths))
+    await manager.remember("k", "data")
+    manager._hot["k"]["score"] = 3.0
+
+    compressor = FakeCompressor()
     scheduler = PeriodicScheduler()
     scheduler.register("compress", 0.05, lambda: manager.compress_cycle(compressor))
     await scheduler.start()
@@ -117,24 +128,33 @@ async def test_compress_cycle_runs_through_scheduler(memory_paths, monkeypatch):
         if compressor.calls:
             break
         await asyncio.sleep(0.05)
-    await scheduler.stop()
 
+    await scheduler.stop()
     assert compressor.calls == ["data"]
 
 
 async def test_build_context_includes_hot_and_cold(memory_paths):
-    manager = mm.MemoryManager()
+    """build_context should include both hot and cold entries."""
+    from memory.manager import GradientMemory
+
+    manager = GradientMemory(data_dir=str(memory_paths))
     await manager.remember("note1", "the weather is sunny today")
-    manager._cold_data["archive1"] = {
+
+    # Добавляем запись в cold вручную
+    manager._cold["archive1"] = {
+        "value": None,
+        "score": -5.0,
+        "is_cold": True,
+        "protected": False,
+        "shield": False,
         "summary": "stable diffusion is a generative model",
-        "compressed_at": datetime.now().isoformat(),
-        "original_created": datetime.now().isoformat(),
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
     }
 
-    # wait_for guards against the lock-deadlock regression
     context = await asyncio.wait_for(
         manager.build_context("tell me about stable diffusion"), timeout=2.0
     )
 
-    assert "note1" in context
+    assert "note1" in context or "sunny" in context
     assert "stable diffusion" in context

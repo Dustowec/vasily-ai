@@ -78,24 +78,20 @@ class Watchdog:
         self.max_restarts = max_restarts
         self._running = False
         self._task: asyncio.Task | None = None
-
         # Состояние модулей (только для статуса)
         self.llm_available = True
         self.plugins_available = True
         self.memory_available = True
         self.disk_available = True
-
         # Счётчики ошибок
         self.llm_failures = 0
         self.plugins_failures = 0
         self.memory_failures = 0
-
         # Режим тишины (подавление дублирующихся ошибок)
         self._llm_notified = False
         self._plugins_notified = False
         self._memory_notified = False
         self._disk_notified = False
-
         # Отдельный логгер
         self._wd_logger = WatchdogLogger(self.agent.config.log_dir)
 
@@ -140,7 +136,6 @@ class Watchdog:
             else:
                 self.llm_failures = 0
                 self._llm_notified = False
-
         # 2. Проверка плагинов — только наличие в реестре
         ok = await self._check_plugins()
         if not ok:
@@ -148,7 +143,6 @@ class Watchdog:
         else:
             self.plugins_failures = 0
             self._plugins_notified = False
-
         # 3. Проверка памяти — только валидность файлов
         ok = await self._check_memory()
         if not ok:
@@ -156,12 +150,10 @@ class Watchdog:
         else:
             self.memory_failures = 0
             self._memory_notified = False
-
         # 4. Проверка диска
         await self._check_disk()
 
     # ==================== LLM ====================
-
     async def _check_llm(self) -> bool:
         try:
             ok = await self.agent.llm_client.health_check()
@@ -183,8 +175,15 @@ class Watchdog:
                 "WARNING", "LLM unavailable, restart attempt", attempt=self.llm_failures
             )
             await asyncio.sleep(self.restart_timeout)
-
             from integrations.ollama_client import OllamaClient
+
+            # ИСПРАВЛЕНИЕ №7: закрываем старый клиент перед созданием нового
+            # (избегаем утечки aiohttp.ClientSession)
+            if self.agent.llm_client:
+                try:
+                    await self.agent.llm_client.close()
+                except Exception as e:
+                    logger.warning("Failed to close old LLM client", error=str(e))
 
             self.agent.llm_client = OllamaClient(
                 base_url=self.agent.config.llm_url,
@@ -196,7 +195,6 @@ class Watchdog:
             )
             if self.agent.react_loop:
                 self.agent.react_loop.llm = self.agent.llm_client
-
             ok = await self._check_llm()
             if ok:
                 logger.info("LLM восстановлен после попытки", attempt=self.llm_failures)
@@ -205,7 +203,6 @@ class Watchdog:
                 )
                 self.llm_failures = 0
                 return
-
         if not self._llm_notified:
             logger.critical("LLM недоступен после всех попыток")
             self._wd_logger.log("CRITICAL", "LLM unavailable after all attempts")
@@ -222,14 +219,12 @@ class Watchdog:
             logger.error("Crash-репорт сгенерирован", json=str(json_path), md=str(md_path))
         except Exception as e:
             logger.error("Не удалось создать crash-репорт", error=str(e))
-
         print("\n" + "=" * 60)
         print(LLM_CRASH_MESSAGE)
         print("=" * 60 + "\n")
         self.llm_available = False
 
     # ==================== ПЛАГИНЫ ====================
-
     async def _check_plugins(self) -> bool:
         # Только проверяем наличие echo в реестре
         echo_tool = self.agent.plugin_registry.get("echo")
@@ -247,7 +242,9 @@ class Watchdog:
                 "Плагины недоступны, перезагрузка реестра", attempt=self.plugins_failures
             )
             self._wd_logger.log(
-                "WARNING", "Plugins unavailable, reloading registry", attempt=self.plugins_failures
+                "WARNING",
+                "Plugins unavailable, reloading registry",
+                attempt=self.plugins_failures,
             )
             await asyncio.sleep(self.restart_timeout)
             self.agent.plugin_registry.discover_plugins(self.agent.config.plugins_dir)
@@ -257,7 +254,6 @@ class Watchdog:
                 self._wd_logger.log("INFO", "Plugins recovered", attempt=self.plugins_failures)
                 self.plugins_failures = 0
                 return
-
         if not self._plugins_notified:
             logger.critical("Плагины недоступны после всех попыток")
             self._wd_logger.log("CRITICAL", "Plugins unavailable after all attempts")
@@ -265,7 +261,6 @@ class Watchdog:
             self._plugins_notified = True
 
     # ==================== ПАМЯТЬ ====================
-
     async def _check_memory(self) -> bool:
         try:
             data_dir = Path(self.agent.config.data_dir)
@@ -278,6 +273,7 @@ class Watchdog:
                             json.load(f)
                     except (json.JSONDecodeError, OSError):
                         await self._restore_memory_file(path)
+                        self.memory_available = False
                         return False
             self.memory_available = True
             return True
@@ -295,6 +291,7 @@ class Watchdog:
                 return True
             except Exception as e:
                 logger.error("Не удалось восстановить файл памяти", file=path.name, error=str(e))
+                return False
         return False
 
     async def _handle_memory_failure(self) -> None:
@@ -312,7 +309,6 @@ class Watchdog:
                 self._wd_logger.log("INFO", "Memory recovered", attempt=self.memory_failures)
                 self.memory_failures = 0
                 return
-
         if not self._memory_notified:
             logger.critical("Память недоступна после всех попыток")
             self._wd_logger.log("CRITICAL", "Memory unavailable after all attempts")
@@ -320,7 +316,6 @@ class Watchdog:
             self._memory_notified = True
 
     # ==================== ДИСК ====================
-
     async def _check_disk(self) -> None:
         try:
             usage = shutil.disk_usage(self.agent.config.log_dir)
@@ -328,7 +323,7 @@ class Watchdog:
             if free_mb < 500:
                 if not self._disk_notified:
                     logger.warning("Мало свободного места на диске", free_mb=round(free_mb, 1))
-                    self._wd_logger.log("WARNING", f"Low disk space: {round(free_mb,1)} MB")
+                    self._wd_logger.log("WARNING", f"Low disk space: {round(free_mb, 1)} MB")
                     self._disk_notified = True
                 self.disk_available = False
             else:
@@ -338,12 +333,17 @@ class Watchdog:
             pass
 
     # ==================== СТАТУС ====================
-
     def get_status(self) -> dict[str, Any]:
         return {
             "llm": {"available": self.llm_available, "failures": self.llm_failures},
-            "plugins": {"available": self.plugins_available, "failures": self.plugins_failures},
-            "memory": {"available": self.memory_available, "failures": self.memory_failures},
+            "plugins": {
+                "available": self.plugins_available,
+                "failures": self.plugins_failures,
+            },
+            "memory": {
+                "available": self.memory_available,
+                "failures": self.memory_failures,
+            },
             "disk": {"available": self.disk_available},
         }
 
@@ -351,4 +351,9 @@ class Watchdog:
         def icon(ok: bool) -> str:
             return "🟢" if ok else "🔴"
 
-        return f"[LLM {icon(self.llm_available)} | Плагины {icon(self.plugins_available)} | Память {icon(self.memory_available)} | Диск {icon(self.disk_available)}]"
+        return (
+            f"[LLM {icon(self.llm_available)} | "
+            f"Плагины {icon(self.plugins_available)} | "
+            f"Память {icon(self.memory_available)} | "
+            f"Диск {icon(self.disk_available)}]"
+        )

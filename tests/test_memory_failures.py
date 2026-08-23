@@ -1,9 +1,10 @@
-"""Failure tests for memory subsystem (Sprint 1, Step 0)."""
+"""Failure tests for memory subsystem (GradientMemory)."""
 
 import asyncio
 
 import memory.manager as mm
 from memory.llm_compressor import LLMCompressor
+from memory.manager import GradientMemory
 
 
 class FakeLLM:
@@ -12,18 +13,20 @@ class FakeLLM:
 
 
 async def test_llm_compressor_async():
-    """GREEN now: async compressor works correctly."""
+    """GREEN: async compressor works correctly."""
     compressor = LLMCompressor(FakeLLM())
     long_text = "important fact. " * 50
     result = await compressor.compress(long_text)
     assert result == "LLM SUMMARY"
 
 
-async def test_memory_manager_concurrent_access(tmp_path, monkeypatch):
-    """GREEN now: asyncio.Lock protects concurrent access."""
+async def test_gradient_memory_concurrent_access(tmp_path, monkeypatch):
+    """GREEN: asyncio locks protect concurrent access."""
+    monkeypatch.setattr(mm, "TGS_FILE", str(tmp_path / "tgs.json"))
     monkeypatch.setattr(mm, "HOT_FILE", str(tmp_path / "hot.json"))
     monkeypatch.setattr(mm, "COLD_FILE", str(tmp_path / "cold.json"))
-    manager = mm.MemoryManager()
+
+    manager = GradientMemory(data_dir=str(tmp_path))
 
     async def writer(n):
         for i in range(20):
@@ -37,3 +40,36 @@ async def test_memory_manager_concurrent_access(tmp_path, monkeypatch):
 
     await asyncio.gather(writer(0), writer(1), reader())
     assert len(manager) >= 40
+
+
+async def test_gradient_memory_decay(tmp_path, monkeypatch):
+    """Test decay reduces scores."""
+    monkeypatch.setattr(mm, "TGS_FILE", str(tmp_path / "tgs.json"))
+    monkeypatch.setattr(mm, "HOT_FILE", str(tmp_path / "hot.json"))
+    monkeypatch.setattr(mm, "COLD_FILE", str(tmp_path / "cold.json"))
+
+    manager = GradientMemory(data_dir=str(tmp_path))
+    await manager.remember("key1", "value1")
+
+    initial_score = manager._hot["key1"]["score"]
+    await manager.decay(count_requests=10)
+    new_score = manager._hot["key1"]["score"]
+
+    assert new_score < initial_score
+
+
+async def test_gradient_memory_session_close(tmp_path, monkeypatch):
+    """Test session_close applies penalty."""
+    monkeypatch.setattr(mm, "TGS_FILE", str(tmp_path / "tgs.json"))
+    monkeypatch.setattr(mm, "HOT_FILE", str(tmp_path / "hot.json"))
+    monkeypatch.setattr(mm, "COLD_FILE", str(tmp_path / "cold.json"))
+
+    manager = GradientMemory(data_dir=str(tmp_path))
+    await manager.remember("key1", "value1")
+
+    initial_score = manager._hot["key1"]["score"]
+    await manager.session_close()
+    new_score = manager._hot["key1"]["score"]
+
+    assert new_score < initial_score
+    assert manager._session_count == 1
