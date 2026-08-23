@@ -163,22 +163,30 @@ class GradientMemory:
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
             }
+
             existing = self._find_entry_unlocked(key)
+
             if existing:
+                # Обновляем существующую запись
                 entry["score"] = existing.get("score", 0) + REINFORCE_HEAT
                 entry["summary"] = existing.get("summary")
                 entry["created_at"] = existing.get("created_at", datetime.now().isoformat())
                 entry["is_cold"] = False
+
                 if key in self._tgs:
                     self._tgs[key] = entry
                     await self._save_zone("tgs", self._tgs)
                     logger.info("Remember: updated in TGS", key=key, score=entry["score"])
                     return
+
                 if key in self._hot:
                     self._hot[key] = entry
                     await self._save_zone("hot", self._hot)
                     logger.info("Remember: updated in HOT", key=key, score=entry["score"])
+                    # Проверяем, не пора ли в TGS
+                    await self._check_promote_to_tgs_unlocked(key)
                     return
+
                 if key in self._cold:
                     entry["protected"] = True
                     entry["summary"] = self._cold[key].get("summary")
@@ -186,12 +194,18 @@ class GradientMemory:
                     await self._save_zone("cold", self._cold)
                     self._hot[key] = entry
                     await self._save_zone("hot", self._hot)
+                    logger.info("Remember: moved from COLD to HOT", key=key, score=entry["score"])
                     await self._check_promote_to_tgs_unlocked(key)
-                    logger.info("Remember: stored", key=key, score=entry["score"])
-            else:
-                self._hot[key] = entry
-                await self._save_zone("hot", self._hot)
-                logger.info("Remember: stored", key=key, score=entry["score"])
+                    return
+
+            # Новая запись
+            self._hot[key] = entry
+            await self._save_zone("hot", self._hot)
+            logger.info("Remember: stored (new)", key=key, score=entry["score"])
+
+            # ВСЕГДА ПРОВЕРЯЕМ ПОСЛЕ СОХРАНЕНИЯ
+            await self._check_promote_to_tgs_unlocked(key)
+
         finally:
             self._release_write()
 
@@ -251,21 +265,23 @@ class GradientMemory:
         entry = self._find_entry_unlocked(key)
         if not entry:
             return
-        if entry.get("score", 0) > TGS_THRESHOLD:
+
+        score = entry.get("score", 0)
+        if score > TGS_THRESHOLD:
+            # Если уже в TGS — ничего не делаем
             if key in self._tgs:
-                self._tgs[key] = entry
-                await self._save_zone("tgs", self._tgs)
                 return
+
+            # Удаляем из HOT или COLD
             if key in self._hot:
                 del self._hot[key]
-                await self._save_zone("hot", self._hot)
             elif key in self._cold:
                 del self._cold[key]
-                await self._save_zone("cold", self._cold)
+
             entry["shield"] = True
             self._tgs[key] = entry
             await self._save_zone("tgs", self._tgs)
-            logger.info("Promoted to TGS", key=key, score=entry["score"])
+            logger.info("Promoted to TGS", key=key, score=score)
 
     # ==================== ОСТЫВАНИЕ ====================
     async def decay(self, count_requests: int) -> None:
@@ -350,8 +366,9 @@ class GradientMemory:
                 if entry.get("protected", False):
                     logger.debug("Compression skipped: protected", key=key)
                     continue
+
                 existing_summary = entry.get("summary")
-                if existing_summary:
+                if existing_summary and not existing_summary.startswith("Compressed:"):
                     cold_entry = {
                         "value": None,
                         "score": -5.0,
@@ -365,19 +382,39 @@ class GradientMemory:
                 else:
                     try:
                         summary = await compressor(entry.get("value", ""))
-                        cold_entry = {
-                            "value": None,
-                            "score": -5.0,
-                            "is_cold": True,
-                            "protected": False,
-                            "shield": False,
-                            "summary": summary,
-                            "created_at": entry.get("created_at", datetime.now().isoformat()),
-                            "updated_at": datetime.now().isoformat(),
-                        }
+                        if summary and not summary.startswith("Compressed:"):
+                            cold_entry = {
+                                "value": None,
+                                "score": -5.0,
+                                "is_cold": True,
+                                "protected": False,
+                                "shield": False,
+                                "summary": summary,
+                                "created_at": entry.get("created_at", datetime.now().isoformat()),
+                                "updated_at": datetime.now().isoformat(),
+                            }
+                        else:
+                            value = entry.get("value", {})
+                            if isinstance(value, dict):
+                                user = value.get("user", "")
+                                assistant = value.get("assistant", "")
+                                summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
+                            else:
+                                summary = str(value)[:300]
+                            cold_entry = {
+                                "value": None,
+                                "score": -5.0,
+                                "is_cold": True,
+                                "protected": False,
+                                "shield": False,
+                                "summary": summary,
+                                "created_at": entry.get("created_at", datetime.now().isoformat()),
+                                "updated_at": datetime.now().isoformat(),
+                            }
                     except Exception as e:
                         logger.error("Compression failed", key=key, error=str(e))
                         continue
+
                 del self._hot[key]
                 await self._save_zone("hot", self._hot)
                 self._cold[key] = cold_entry
@@ -435,23 +472,40 @@ class GradientMemory:
             self._release_write()
 
     async def forget_all(self, confirm: bool = False) -> bool:
-        """Забыть всё (ротация памяти). Требует двойного подтверждения."""
+        """Забыть всё (ротация: TGS→HOT, HOT→COLD)."""
         if not confirm:
             return False
         await self._acquire_write()
         try:
+            # Шаг 1: TGS → HOT (снимаем защиту, штраф -20)
             for key, entry in list(self._tgs.items()):
-                entry["score"] = max(entry.get("score", 0) - 20.0, 0.0)
+                entry["score"] = max(entry.get("score", 50.0) - 20.0, 0.0)
                 entry["shield"] = False
+                entry["updated_at"] = datetime.now().isoformat()
                 del self._tgs[key]
                 self._hot[key] = entry
+
+            # Шаг 2: HOT → COLD (с сохранением score)
             for key, entry in list(self._hot.items()):
-                summary = (
-                    entry.get("summary") or f"Compressed: {str(entry.get('value', ''))[:200]}..."
-                )
+                current_score = entry.get("score", 0.0)
+                if current_score is None:
+                    current_score = 0.0
+                # Уменьшаем на 10 при каждой ротации
+                new_score = max(current_score - 10.0, DELETE_THRESHOLD)
+
+                summary = entry.get("summary")
+                if not summary or summary.startswith("Compressed:"):
+                    value = entry.get("value", {})
+                    if isinstance(value, dict):
+                        user = value.get("user", "")
+                        assistant = value.get("assistant", "")
+                        summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
+                    else:
+                        summary = str(value)[:200]
+
                 cold_entry = {
                     "value": None,
-                    "score": -5.0,
+                    "score": new_score,
                     "is_cold": True,
                     "protected": False,
                     "shield": False,
@@ -461,11 +515,20 @@ class GradientMemory:
                 }
                 del self._hot[key]
                 self._cold[key] = cold_entry
+
+            # Шаг 3: Удаляем из COLD записи с score <= -50.0
+            deleted = 0
             for key, entry in list(self._cold.items()):
-                if entry.get("score", 0) <= DELETE_THRESHOLD:
+                if entry.get("score", -5.0) <= DELETE_THRESHOLD:
                     del self._cold[key]
+                    deleted += 1
+
             await self._save_all()
-            logger.info("Forget all: rotation completed")
+            logger.info(
+                "Forget all: rotation completed",
+                cold_entries=len(self._cold),
+                deleted=deleted,
+            )
             return True
         finally:
             self._release_write()

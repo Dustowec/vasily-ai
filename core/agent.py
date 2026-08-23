@@ -150,6 +150,9 @@ class AgentCore:
                 if "да" in cmd:
                     result = await self.memory.forget_all(confirm=True)
                     if result:
+                        # Очищаем историю ReAct-цикла
+                        if self.react_loop:
+                            self.react_loop._history = []
                         return {
                             "status": "success",
                             "message": "Память полностью очищена (ротация выполнена).",

@@ -51,6 +51,7 @@ class ReActLoop:
         self.tools = self._build_tools()
         self.token_manager = TokenManager(config.llm_num_ctx, config.llm_safety_margin)
         self.prompts_library = GoldenPromptsLibrary()
+        self._history = []
 
     def _build_tools(self) -> list[dict[str, Any]]:
         """Convert plugin schemas to Ollama tool format."""

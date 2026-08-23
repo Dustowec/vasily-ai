@@ -1,5 +1,5 @@
 # ruff: noqa: E402
-"""Streamlit дашборд для Vasily AI (финальная версия)."""
+"""Streamlit дашборд для Vasily AI (с диагностикой web_search)."""
 
 import asyncio
 import os
@@ -7,7 +7,6 @@ import sys
 import time
 from pathlib import Path
 
-# Добавляем корень проекта в sys.path перед импортом core
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
@@ -45,9 +44,7 @@ st.markdown(
         font-size: 0.95rem;
     }
     .status-ok { color: #4caf50; }
-    .status-warning { color: #ff9800; }
     .status-error { color: #f44336; }
-    .status-idle { color: #2196f3; }
     .stButton button { width: 100%; }
     .red-button button {
         background-color: #f44336;
@@ -85,13 +82,12 @@ if "agent" not in st.session_state:
     config.validate()
     agent = AgentCore(config)
     loop.run_until_complete(agent.initialize())
+
     st.session_state.agent = agent
     st.session_state.messages = []
     st.session_state.initialized = True
-    st.session_state.last_context = ""
-    st.session_state.last_status = {}
-    st.session_state.last_crash = None
     st.session_state.last_refresh = time.time()
+    st.session_state.last_status = {}
 
 
 def send_message(user_input: str):
@@ -100,7 +96,17 @@ def send_message(user_input: str):
     st.session_state.messages.append({"role": "user", "content": user_input})
     agent = st.session_state.agent
     loop = st.session_state.loop
-    response = loop.run_until_complete(agent.handle_request({"text": user_input}))
+    try:
+        response = loop.run_until_complete(agent.handle_request({"text": user_input}))
+    except RuntimeError as e:
+        if "closed" in str(e):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            st.session_state.loop = loop
+            response = loop.run_until_complete(agent.handle_request({"text": user_input}))
+        else:
+            raise
+
     if response.get("status") == "success":
         answer = response.get("message", "Нет ответа")
     else:
@@ -108,50 +114,77 @@ def send_message(user_input: str):
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
+def get_agent_status(agent, loop):
+    """Получить статус модулей напрямую из агента."""
+    status = {
+        "llm": {"available": False},
+        "memory": {"available": False},
+        "plugins": {"available": False},
+        "web_search": {"available": False},
+        "disk": {"available": False},
+    }
+
+    # Проверяем LLM
+    if agent and agent.llm_client:
+        try:
+            status["llm"]["available"] = True
+        except Exception:
+            pass
+
+    # Проверяем память
+    if agent and hasattr(agent, "memory"):
+        try:
+            if agent.memory:
+                status["memory"]["available"] = True
+        except Exception:
+            pass
+
+    # Проверяем плагины (только наличие в реестре)
+    if agent and hasattr(agent, "plugin_registry"):
+        try:
+            if len(agent.plugin_registry) > 0:
+                status["plugins"]["available"] = True
+        except Exception:
+            pass
+
+    # Проверяем web_search (тестовый пинг)
+    if agent and hasattr(agent, "plugin_registry"):
+        try:
+            web_search = agent.plugin_registry.get("web_search")
+            if web_search:
+                try:
+                    result = loop.run_until_complete(web_search.execute(query="ping", limit=1))
+                    if result.get("status") == "success":
+                        status["web_search"]["available"] = True
+                    else:
+                        status["web_search"]["available"] = False
+                        status["web_search"]["error"] = result.get("message", "Неизвестная ошибка")
+                except Exception as e:
+                    status["web_search"]["available"] = False
+                    status["web_search"]["error"] = str(e)
+        except Exception:
+            pass
+
+    # Проверяем диск
+    try:
+        logs_path = Path("logs")
+        if logs_path.exists():
+            status["disk"]["available"] = True
+    except Exception:
+        pass
+
+    return status
+
+
 def refresh_status():
+    """Обновить статус модулей."""
     agent = st.session_state.agent
     loop = st.session_state.loop
-    if agent and hasattr(agent, "watchdog") and agent.watchdog:
-        status = agent.watchdog.get_status()
+    if agent:
+        status = get_agent_status(agent, loop)
         st.session_state.last_status = status
-    if agent and hasattr(agent, "memory"):
-        context = loop.run_until_complete(agent.memory.build_context("", max_tokens=3000))
-        st.session_state.last_context = context
-    # Краш-репорты
-    crash_dir = Path("logs/crash_reports")
-    if crash_dir.exists():
-        reports = list(crash_dir.glob("**/crash_*.md"))
-        if reports:
-            latest = max(reports, key=lambda p: p.stat().st_mtime)
-            if st.session_state.last_crash != str(latest):
-                try:
-                    with open(latest, encoding="utf-8") as f:
-                        content = f.read()
-                        lines = content.split("\n")
-                        summary = []
-                        in_summary = False
-                        for line in lines:
-                            if "Error Summary" in line:
-                                in_summary = True
-                                continue
-                            if in_summary and line.strip().startswith("-"):
-                                summary.append(line.strip())
-                            if in_summary and line.strip().startswith("##"):
-                                break
-                        st.session_state.last_crash = {
-                            "file": latest.name,
-                            "summary": "\n".join(summary) if summary else "Ошибка неизвестна",
-                        }
-                except Exception:
-                    st.session_state.last_crash = {
-                        "file": latest.name,
-                        "summary": "Не удалось прочитать",
-                    }
-        else:
-            st.session_state.last_crash = None
 
 
-# Автообновление
 now = time.time()
 if st.session_state.initialized and (now - st.session_state.last_refresh > 5):
     refresh_status()
@@ -195,11 +228,12 @@ with col2:
 
 with col3:
     st.markdown("## 📊 Статус модулей")
-    status = st.session_state.last_status
+    status = st.session_state.get("last_status", {})
     if status:
         llm_ok = status.get("llm", {}).get("available", False)
         plugins_ok = status.get("plugins", {}).get("available", False)
         memory_ok = status.get("memory", {}).get("available", False)
+        web_search_ok = status.get("web_search", {}).get("available", False)
         disk_ok = status.get("disk", {}).get("available", False)
 
         def icon(ok):
@@ -208,24 +242,14 @@ with col3:
         st.markdown(f"- **LLM** {icon(llm_ok)}")
         st.markdown(f"- **Плагины** {icon(plugins_ok)}")
         st.markdown(f"- **Память** {icon(memory_ok)}")
+        st.markdown(f"- **Поиск** {icon(web_search_ok)}")
+        if not web_search_ok and status.get("web_search", {}).get("error"):
+            st.caption(f"⚠️ {status['web_search']['error'][:50]}")
         st.markdown(f"- **Диск** {icon(disk_ok)}")
         st.markdown("---")
         st.caption("Легенда: 🟢 работает, 🔴 упал")
     else:
         st.info("Статус не загружен")
-
-    st.markdown("## 🧠 Контекст LLM")
-    context = st.session_state.last_context
-    if context:
-        st.text_area(
-            "Контекст LLM",
-            context[:1000],
-            height=140,
-            key="context_display",
-            label_visibility="collapsed",
-        )
-    else:
-        st.info("Контекст пуст")
 
 # Нижний ярус
 st.divider()
@@ -237,7 +261,16 @@ with col4:
         agent = st.session_state.agent
         if agent and hasattr(agent, "memory"):
             loop = st.session_state.loop
-            result = loop.run_until_complete(agent.memory.forget_all(confirm=True))
+            try:
+                result = loop.run_until_complete(agent.memory.forget_all(confirm=True))
+            except RuntimeError as e:
+                if "closed" in str(e):
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    st.session_state.loop = loop
+                    result = loop.run_until_complete(agent.memory.forget_all(confirm=True))
+                else:
+                    raise
             if result:
                 st.success("Память очищена")
                 st.rerun()
@@ -248,8 +281,18 @@ with col4:
         agent = st.session_state.agent
         loop = st.session_state.loop
         if agent:
-            loop.run_until_complete(agent.shutdown())
-            loop.run_until_complete(agent.initialize())
+            try:
+                loop.run_until_complete(agent.shutdown())
+                loop.run_until_complete(agent.initialize())
+            except RuntimeError as e:
+                if "closed" in str(e):
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    st.session_state.loop = loop
+                    loop.run_until_complete(agent.shutdown())
+                    loop.run_until_complete(agent.initialize())
+                else:
+                    raise
             st.success("Агент перезапущен")
             st.rerun()
 
@@ -258,7 +301,10 @@ with col4:
         agent = st.session_state.agent
         loop = st.session_state.loop
         if agent:
-            loop.run_until_complete(agent.shutdown())
+            try:
+                loop.run_until_complete(agent.shutdown())
+            except RuntimeError:
+                pass
         st.success("Агент остановлен. Дашборд закрывается...")
         time.sleep(0.5)
         os._exit(0)
@@ -274,7 +320,32 @@ with col5:
 
 with col6:
     st.markdown("## 💥 Краш-лог")
-    crash_info = st.session_state.last_crash
+    crash_dir = Path("logs/crash_reports")
+    crash_info = None
+    if crash_dir.exists():
+        reports = list(crash_dir.glob("**/crash_*.md"))
+        if reports:
+            latest = max(reports, key=lambda p: p.stat().st_mtime)
+            try:
+                with open(latest, encoding="utf-8") as f:
+                    content = f.read()
+                    lines = content.split("\n")
+                    summary = []
+                    in_summary = False
+                    for line in lines:
+                        if "Error Summary" in line:
+                            in_summary = True
+                            continue
+                        if in_summary and line.strip().startswith("-"):
+                            summary.append(line.strip())
+                        if in_summary and line.strip().startswith("##"):
+                            break
+                    crash_info = {
+                        "file": latest.name,
+                        "summary": "\n".join(summary) if summary else "Ошибка неизвестна",
+                    }
+            except Exception:
+                crash_info = {"file": latest.name, "summary": "Не удалось прочитать"}
     if crash_info:
         st.warning(f"Сбой: {crash_info['file']}")
         st.text_area(
