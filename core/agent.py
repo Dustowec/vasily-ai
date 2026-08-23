@@ -120,6 +120,7 @@ class AgentCore:
         try:
             logger.info("Request received", text=user_text[:50])
 
+            # --- Команды управления (гибкое распознавание) ---
             cmd = user_text.strip().lower()
 
             if cmd == "status":
@@ -163,7 +164,7 @@ class AgentCore:
                         "Введите 'забудь всё да' для подтверждения.",
                     }
 
-            if cmd.startswith("забудь ") or cmd.startswith("забыть "):
+            if cmd.startswith("забудь") or cmd.startswith("забыть"):
                 parts = cmd.split(maxsplit=1)
                 if len(parts) < 2 or not parts[1].strip():
                     return {"status": "error", "message": "Укажите тему для забывания."}
