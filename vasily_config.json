@@ -1,0 +1,9 @@
+{
+  "llm_model": "huihui-qwen3.5-4b",
+  "llm_num_ctx": 8192,
+  "llm_safety_margin": 4096,
+  "llm_timeout": 120.0,
+  "request_timeout": 180.0,
+  "max_react_iterations": 7,
+  "dev_mode": false
+}

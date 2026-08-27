@@ -215,11 +215,15 @@ def test_cancel_active_request_none(agent):
 
 
 async def test_store_dialogue_success(agent):
-    """_store_dialogue should save dialogue to memory."""
+    """_store_dialogue should save dialogue to sliding window."""
     await agent.initialize()
     result = {"status": "success", "answer": "test answer"}
     await agent._store_dialogue("user question", result)
-    agent.memory.remember.assert_called_once()
+    assert len(agent._dialogue_window) == 2
+    assert agent._dialogue_window[0]["role"] == "user"
+    assert agent._dialogue_window[0]["content"] == "user question"
+    assert agent._dialogue_window[1]["role"] == "assistant"
+    assert agent._dialogue_window[1]["content"] == "test answer"
 
 
 async def test_store_dialogue_skips_error(agent):
@@ -227,7 +231,7 @@ async def test_store_dialogue_skips_error(agent):
     await agent.initialize()
     result = {"status": "error", "answer": "error message"}
     await agent._store_dialogue("user question", result)
-    agent.memory.remember.assert_not_called()
+    assert len(agent._dialogue_window) == 0
 
 
 async def test_store_dialogue_skips_empty_answer(agent):
@@ -235,4 +239,4 @@ async def test_store_dialogue_skips_empty_answer(agent):
     await agent.initialize()
     result = {"status": "success", "answer": ""}
     await agent._store_dialogue("user question", result)
-    agent.memory.remember.assert_not_called()
+    assert len(agent._dialogue_window) == 0

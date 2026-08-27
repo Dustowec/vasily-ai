@@ -1,5 +1,4 @@
 """OllamaClient - async LLM client with retries and crash reporting.
-
 Requirements (T3-015):
 - Model: vasily-qwen (abliterated Qwen2.5-3B, q4_k_s, 32k context)
 - Temperature: 0.1 (strict, for stable function calling)
@@ -11,6 +10,7 @@ Requirements (T3-015):
 """
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +78,7 @@ class OllamaClient:
         """Close the HTTP session."""
         if self._session and not self._session.closed:
             await self._session.close()
-            self._session = None
+        self._session = None
 
     async def health_check(self) -> bool:
         """Quick check if Ollama is available."""
@@ -107,7 +107,6 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
-
         return await self._request_with_retries("/api/chat", payload)
 
     async def generate(self, prompt: str, **kwargs) -> dict[str, Any]:
@@ -120,15 +119,32 @@ class OllamaClient:
         }
         return await self._request_with_retries("/api/generate", payload)
 
+    @staticmethod
+    def extract_thinking_and_answer(content: str) -> tuple[str, str]:
+        """Extracts <think>...</think> block and the rest of the content.
+        Returns (thinking_text, answer_text).
+        ADR-011: Used to separate reasoning from final answer.
+        """
+        if not content:
+            return "", ""
+
+        # Ищем блок <think>...</think> (регистронезависимо, с переносами строк)
+        match = re.search(r"<think>(.*?)</think>", content, re.DOTALL | re.IGNORECASE)
+        if match:
+            thinking = match.group(1).strip()
+            # Удаляем блок из оригинального контента, чтобы получить чистый ответ
+            answer = content[: match.start()] + content[match.end() :]
+            return thinking, answer.strip()
+
+        return "", content.strip()
+
     async def _request_with_retries(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Make request with exactly 2 retries. On failure: crash report."""
         last_error = None
-
         for attempt in range(self.max_retries + 1):
             try:
                 session = await self._get_session()
                 url = f"{self.base_url}{endpoint}"
-
                 logger.info(
                     "LLM request",
                     endpoint=endpoint,
@@ -136,7 +152,6 @@ class OllamaClient:
                     attempt=attempt + 1,
                     max_retries=self.max_retries,
                 )
-
                 async with session.post(url, json=payload) as response:
                     if response.status == 200:
                         result = await response.json()
@@ -155,7 +170,6 @@ class OllamaClient:
                         attempt=attempt + 1,
                     )
                     last_error = f"HTTP {response.status}: {error_text[:200]}"
-
             except TimeoutError:
                 logger.warning(
                     "LLM request timeout",
@@ -164,7 +178,6 @@ class OllamaClient:
                     attempt=attempt + 1,
                 )
                 last_error = f"Timeout after {self.timeout.total}s"
-
             except aiohttp.ClientError as e:
                 logger.warning(
                     "LLM connection error",
@@ -173,7 +186,6 @@ class OllamaClient:
                     attempt=attempt + 1,
                 )
                 last_error = str(e)
-
             except Exception as e:
                 logger.error(
                     "LLM unexpected error",
@@ -194,7 +206,6 @@ class OllamaClient:
             attempts=self.max_retries + 1,
             last_error=last_error,
         )
-
         error = LLMUnavailableError(
             f"Ollama unavailable at {self.base_url} after "
             f"{self.max_retries + 1} attempts. Last error: {last_error}"
@@ -208,5 +219,4 @@ class OllamaClient:
             )
         except Exception as report_error:
             logger.error("Failed to generate crash report", error=str(report_error))
-
         raise error

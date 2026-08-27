@@ -1,5 +1,4 @@
 """ReAct loop - Reasoning + Acting pattern (T3-016).
-
 Mandatory requirements implemented:
 - R1: Plugin errors caught and returned to LLM history, cycle continues.
 - R2: Tool call limit (config.max_tool_calls_per_tool), force stop on exceed.
@@ -9,10 +8,11 @@ Mandatory requirements implemented:
 - Golden Prompts: curated system prompts per task type (T3-020).
 - P1-3: mock data blocked outside dev_mode.
 - P1-4: tool_calls kept in history, defensive arguments parsing,
-  session timeout, graceful LLM-unavailable result.
+session timeout, graceful LLM-unavailable result.
 - T3-017.5: deduplication of identical calls with hard limit.
 - P2-1: limits and preview length taken from Config.
 - P3-3: strict TypedDict for ReActResult, ReActStep, TokenUsage.
+- ADR-011: Parsing  tags, Sliding Window support.
 """
 
 import asyncio
@@ -24,7 +24,7 @@ from core.golden_prompts import GoldenPromptsLibrary
 from core.logging_config import get_logger
 from core.react_types import ReActResult, ReActStep
 from core.token_manager import TokenManager
-from integrations.ollama_client import LLMUnavailableError
+from integrations.ollama_client import LLMUnavailableError, OllamaClient
 
 core_logger = get_logger("core", "ReActLoop")
 llm_logger = get_logger("llm", "ReActLoop")
@@ -66,7 +66,6 @@ class ReActLoop:
                 }
                 if param_def.get("required"):
                     required.append(param_name)
-
             tools.append(
                 {
                     "type": "function",
@@ -87,22 +86,19 @@ class ReActLoop:
         self,
         user_request: str,
         prompt_type: str = "default",
-        memory_context: str = "",
+        dialogue_history: list[dict] | None = None,
     ) -> ReActResult:
-        """Run the ReAct cycle for a user request."""
+        """Run the ReAct cycle for a user request.
+        ADR-011: dialogue_history is a sliding window of last 5 pairs (user/assistant).
+        """
         system_prompt = self.prompts_library.get_prompt(prompt_type) or DEFAULT_SYSTEM_PROMPT
         messages = [
             {"role": "system", "content": system_prompt},
         ]
 
-        # Если есть контекст памяти — добавляем его как системное сообщение
-        if memory_context:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Relevant memory context:\n" + memory_context,
-                }
-            )
+        # ADR-011: Add sliding window history before current request
+        if dialogue_history:
+            messages.extend(dialogue_history)
 
         messages.append({"role": "user", "content": user_request})
 
@@ -137,7 +133,6 @@ class ReActLoop:
                 )
 
             core_logger.info("ReAct iteration started", iteration=iteration + 1)
-
             messages = self.token_manager.trim_messages(messages)
             usage = self.token_manager.get_usage_report(messages)
             core_logger.info(
@@ -179,7 +174,13 @@ class ReActLoop:
             tool_calls = message.get("tool_calls") or []
             content = message.get("content", "")
 
+            # ADR-011: Extract thinking block.
+            # We keep full content (with ) in history for LLM context,
+            # but use clean_answer for the final result returned to user/memory.
+            _, clean_answer = OllamaClient.extract_thinking_and_answer(content)
+
             # P1-4: keep tool_calls in history so the model tracks its actions
+            # ADR-011: Keep full content (with ) in history
             assistant_message = {"role": "assistant", "content": content}
             if tool_calls:
                 assistant_message["tool_calls"] = tool_calls
@@ -189,7 +190,7 @@ class ReActLoop:
                 core_logger.info("ReAct loop finished", iterations=iteration + 1)
                 return ReActResult(
                     status="success",
-                    answer=content,
+                    answer=clean_answer,  # ADR-011: Return clean answer
                     iterations=iteration + 1,
                     steps=steps,
                     token_usage=usage,
@@ -316,5 +317,7 @@ class ReActLoop:
         """Return last assistant content for partial progress."""
         for message in reversed(messages):
             if message.get("role") == "assistant" and message.get("content"):
-                return message["content"]
+                # ADR-011: Clean thinking tags even in partial results
+                _, clean = OllamaClient.extract_thinking_and_answer(message["content"])
+                return clean
         return "No partial result available."

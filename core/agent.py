@@ -1,4 +1,6 @@
-"""AgentCore - orchestration layer with ReAct-powered routing."""
+﻿"""AgentCore - orchestration layer with ReAct-powered routing.
+ADR-011: Sliding Window, Lazy Retrieval, Dialogue Buffer Compression.
+"""
 
 import asyncio
 import signal
@@ -21,9 +23,9 @@ from memory.manager import GradientMemory
 
 logger = get_logger("core", "AgentCore")
 
+
 # ADR-005: internal periodic task intervals (seconds)
 COMPRESSION_INTERVAL_SECONDS = 6 * 3600
-DIALOGUE_RESET_INTERVAL_SECONDS = 30 * 60
 
 
 class AgentCore:
@@ -44,6 +46,11 @@ class AgentCore:
         self.scheduler: PeriodicScheduler | None = None
         self._session_requests = 0
         self.watchdog: Watchdog | None = None
+        # ADR-011: Sliding window for dialogue history (5 pairs = 10 messages)
+        self._dialogue_window: list[dict] = []
+        # ADR-011 fix: Buffer for dialogue compression (every 5 pairs в†’ 1 fact)
+        self._dialogue_buffer: list[dict] = []
+        self._llm_compressor = None  # Will be initialized in run()
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -63,6 +70,11 @@ class AgentCore:
         )
 
         self.plugin_registry.discover_plugins(self.config.plugins_dir)
+        # Register internal tool for lazy memory retrieval
+        from core.internal_tools import RecallMemoryTool
+
+        recall_tool = RecallMemoryTool(self.memory)
+        self.plugin_registry.register(recall_tool)
         logger.info(
             "Plugins loaded",
             count=len(self.plugin_registry),
@@ -118,7 +130,6 @@ class AgentCore:
 
         try:
             logger.info("Request received", text=user_text[:50])
-
             cmd = user_text.strip().lower()
 
             if cmd == "status":
@@ -126,8 +137,8 @@ class AgentCore:
                 icons = self.watchdog.get_status_icons() if self.watchdog else ""
                 metrics = self.get_metrics()
                 msg = (
-                    f"Память: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}. "
-                    f"Запросов: {metrics['requests_count']}, Ошибок: {metrics['errors_count']}. "
+                    f"РџР°РјСЏС‚СЊ: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}. "
+                    f"Р—Р°РїСЂРѕСЃРѕРІ: {metrics['requests_count']}, РћС€РёР±РѕРє: {metrics['errors_count']}. "
                     f"Watchdog: {icons}"
                 )
                 return {
@@ -141,17 +152,20 @@ class AgentCore:
             if cmd == "help":
                 return {
                     "status": "success",
-                    "message": "Available commands: status, help, exit, забыть <тема>, забыть всё. "
+                    "message": "Available commands: status, help, exit, Р·Р°Р±С‹С‚СЊ , Р·Р°Р±С‹С‚СЊ РІСЃС‘. "
                     "Any other text is processed by AI with access to plugins. "
                     "Ctrl+C cancels the current request.",
                 }
 
-            # ---- ОБРАБОТКА "ЗАБЫТЬ ВСЁ" ----
-            if "забудь всё" in cmd or "забыть всё" in cmd:
-                if "да" in cmd:
+            # ---- РћР‘Р РђР‘РћРўРљРђ "Р—РђР‘Р«РўР¬ Р’РЎРЃ" ----
+            if "Р·Р°Р±СѓРґСЊ РІСЃС‘" in cmd or "Р·Р°Р±С‹С‚СЊ РІСЃС‘" in cmd:
+                if "РґР°" in cmd:
                     result = await self.memory.forget_all(confirm=True)
                     if result:
-                        # Пересоздаём ReActLoop для полного сброса контекста
+                        # ADR-011: Clear sliding window on full reset
+                        self._dialogue_window.clear()
+                        self._dialogue_buffer.clear()
+                        # РџРµСЂРµСЃРѕР·РґР°С‘Рј ReActLoop РґР»СЏ РїРѕР»РЅРѕРіРѕ СЃР±СЂРѕСЃР° РєРѕРЅС‚РµРєСЃС‚Р°
                         self.react_loop = ReActLoop(
                             config=self.config,
                             llm_client=self.llm_client,
@@ -159,44 +173,50 @@ class AgentCore:
                         )
                         return {
                             "status": "success",
-                            "message": "Память полностью очищена (ротация выполнена).",
+                            "message": "РџР°РјСЏС‚СЊ РїРѕР»РЅРѕСЃС‚СЊСЋ РѕС‡РёС‰РµРЅР° (СЂРѕС‚Р°С†РёСЏ РІС‹РїРѕР»РЅРµРЅР°).",
                         }
-                    return {"status": "error", "message": "Не удалось выполнить ротацию памяти."}
+                    return {
+                        "status": "error",
+                        "message": "РќРµ СѓРґР°Р»РѕСЃСЊ РІС‹РїРѕР»РЅРёС‚СЊ СЂРѕС‚Р°С†РёСЋ РїР°РјСЏС‚Рё.",
+                    }
                 else:
                     return {
                         "status": "error",
-                        "message": "Для подтверждения команды 'забудь всё' требуется двойное подтверждение. "
-                        "Введите 'забудь всё да' для подтверждения.",
+                        "message": "Р”Р»СЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ РєРѕРјР°РЅРґС‹ 'Р·Р°Р±СѓРґСЊ РІСЃС‘' С‚СЂРµР±СѓРµС‚СЃСЏ РґРІРѕР№РЅРѕРµ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ. "
+                        "Р’РІРµРґРёС‚Рµ 'Р·Р°Р±СѓРґСЊ РІСЃС‘ РґР°' РґР»СЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ.",
                     }
 
-            # ---- ЗАБЫТЬ КОНКРЕТНУЮ ТЕМУ ----
-            if cmd.startswith("забудь") or cmd.startswith("забыть"):
+            # ---- Р—РђР‘Р«РўР¬ РљРћРќРљР Р•РўРќРЈР® РўР•РњРЈ ----
+            if cmd.startswith("Р·Р°Р±СѓРґСЊ") or cmd.startswith("Р·Р°Р±С‹С‚СЊ"):
                 parts = cmd.split(maxsplit=1)
                 if len(parts) < 2 or not parts[1].strip():
-                    return {"status": "error", "message": "Укажите тему для забывания."}
+                    return {
+                        "status": "error",
+                        "message": "РЈРєР°Р¶РёС‚Рµ С‚РµРјСѓ РґР»СЏ Р·Р°Р±С‹РІР°РЅРёСЏ.",
+                    }
                 topic = parts[1].strip()
                 result = await self.memory.forget(topic)
                 if result:
-                    return {"status": "success", "message": f"Тема '{topic}' забыта."}
-                return {"status": "error", "message": f"Тема '{topic}' не найдена."}
+                    return {"status": "success", "message": f"РўРµРјР° '{topic}' Р·Р°Р±С‹С‚Р°."}
+                return {"status": "error", "message": f"РўРµРјР° '{topic}' РЅРµ РЅР°Р№РґРµРЅР°."}
 
-            # ---- АВТОМАТИЧЕСКИЙ ПОИСК ----
+            # ---- РђР’РўРћРњРђРўРР§Р•РЎРљРР™ РџРћРРЎРљ ----
             search_keywords = [
-                "поищи",
-                "найди",
-                "погода",
-                "новости",
-                "цена",
-                "курс",
-                "сколько стоит",
-                "узнай",
-                "расскажи про",
-                "что такое",
-                "как работает",
-                "когда",
-                "где",
-                "кто такой",
-                "что происходит",
+                "РїРѕРёС‰Рё",
+                "РЅР°Р№РґРё",
+                "РїРѕРіРѕРґР°",
+                "РЅРѕРІРѕСЃС‚Рё",
+                "С†РµРЅР°",
+                "РєСѓСЂСЃ",
+                "СЃРєРѕР»СЊРєРѕ СЃС‚РѕРёС‚",
+                "СѓР·РЅР°Р№",
+                "СЂР°СЃСЃРєР°Р¶Рё РїСЂРѕ",
+                "С‡С‚Рѕ С‚Р°РєРѕРµ",
+                "РєР°Рє СЂР°Р±РѕС‚Р°РµС‚",
+                "РєРѕРіРґР°",
+                "РіРґРµ",
+                "РєС‚Рѕ С‚Р°РєРѕР№",
+                "С‡С‚Рѕ РїСЂРѕРёСЃС…РѕРґРёС‚",
             ]
             text_lower = user_text.lower()
             if any(kw in text_lower for kw in search_keywords):
@@ -211,44 +231,50 @@ class AgentCore:
                         if result.get("status") == "success":
                             results = result.get("results", [])
                             if results:
-                                answer = f"Результаты поиска по запросу '{user_text}':\n\n"
+                                answer = f"Р РµР·СѓР»СЊС‚Р°С‚С‹ РїРѕРёСЃРєР° РїРѕ Р·Р°РїСЂРѕСЃСѓ '{user_text}':\n"
                                 for i, r in enumerate(results[:5], 1):
-                                    title = r.get("title", "Без названия")
+                                    title = r.get("title", "Р‘РµР· РЅР°Р·РІР°РЅРёСЏ")
                                     snippet = r.get("snippet", "")
                                     url = r.get("url", "")
                                     answer += f"{i}. **{title}**\n"
                                     if snippet:
                                         answer += f"   {snippet}\n"
                                     if url:
-                                        answer += f"   Источник: {url}\n"
+                                        answer += f"   РСЃС‚РѕС‡РЅРёРє: {url}\n"
                                     answer += "\n"
                                 return {"status": "success", "message": answer, "iterations": 0}
                             else:
                                 return {
                                     "status": "success",
-                                    "message": f"По запросу '{user_text}' ничего не найдено.",
+                                    "message": f"РџРѕ Р·Р°РїСЂРѕСЃСѓ '{user_text}' РЅРёС‡РµРіРѕ РЅРµ РЅР°Р№РґРµРЅРѕ.",
                                 }
                         else:
-                            error_msg = result.get("message", "Неизвестная ошибка при поиске")
-                            return {"status": "error", "message": f"Ошибка поиска: {error_msg}"}
+                            error_msg = result.get(
+                                "message", "РќРµРёР·РІРµСЃС‚РЅР°СЏ РѕС€РёР±РєР° РїСЂРё РїРѕРёСЃРєРµ"
+                            )
+                            return {
+                                "status": "error",
+                                "message": f"РћС€РёР±РєР° РїРѕРёСЃРєР°: {error_msg}",
+                            }
                     except Exception as e:
                         logger.error("Web search failed", error=str(e))
                         return {
                             "status": "error",
-                            "message": f"Ошибка при выполнении поиска: {str(e)}",
+                            "message": f"РћС€РёР±РєР° РїСЂРё РІС‹РїРѕР»РЅРµРЅРёРё РїРѕРёСЃРєР°: {str(e)}",
                         }
                 else:
                     logger.warning("web_search plugin not found, falling back to ReAct")
 
-            # ---- ЕСЛИ НЕ КОМАНДА, ЗАПУСКАЕМ ReAct ----
+            # ---- Р•РЎР›Р РќР• РљРћРњРђРќР”Рђ, Р—РђРџРЈРЎРљРђР•Рњ ReAct ----
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
             structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
-            memory_context = await self.memory.build_context(user_text)
 
+            # ADR-011: Pass sliding window instead of memory_context
+            dialogue_history = list(self._dialogue_window)
             result = await self.react_loop.run(
-                user_text, memory_context=memory_context, prompt_type="default"
+                user_text, dialogue_history=dialogue_history, prompt_type="default"
             )
 
             duration_ms = (time.time() - start) * 1000
@@ -305,27 +331,87 @@ class AgentCore:
             return {"status": "error", "message": str(e)}
 
     async def _store_dialogue(self, user_text: str, result: dict[str, Any]) -> None:
-        """Store dialogue turn in gradient memory."""
+        """Store dialogue turn in sliding window AND buffer for compression (ADR-011 fix)."""
         status = result.get("status")
         answer = str(result.get("answer", "") or "").strip()
+
         if status not in ("success", "interrupted"):
             return
         if not answer:
             return
-        timestamp = time.time()
 
-        # Жёсткий ключ вместо генерации по времени
-        dialogue_key = "dialogue:last"
+        # 1. Add to sliding window (5 pairs = 10 messages) for LLM context
+        self._dialogue_window.append({"role": "user", "content": user_text})
+        self._dialogue_window.append({"role": "assistant", "content": answer})
 
-        await self.memory.remember(
-            dialogue_key,
-            {
-                "user": str(user_text),
-                "assistant": answer,
-                "timestamp": timestamp,
-            },
-            complex_query=len(user_text) > 100,
-        )
+        # Remove oldest if > 5 pairs
+        while len(self._dialogue_window) > 10:
+            self._dialogue_window.pop(0)
+
+        # 2. Add to buffer for compression
+        self._dialogue_buffer.append({"role": "user", "content": user_text})
+        self._dialogue_buffer.append({"role": "assistant", "content": answer})
+
+        # 3. If buffer reached 5 pairs (10 messages), compress and store
+        if len(self._dialogue_buffer) >= 10:
+            await self._compress_and_store_dialogue()
+
+    async def _compress_and_store_dialogue(self, force: bool = False) -> None:
+        """Compress dialogue buffer into a single fact and store in memory."""
+        if not self._dialogue_buffer:
+            return
+
+        # Р•СЃР»Рё РЅРµ РїСЂРёРЅСѓРґРёС‚РµР»СЊРЅРѕ, Р¶РґРµРј РЅР°РєРѕРїР»РµРЅРёСЏ 10 СЃРѕРѕР±С‰РµРЅРёР№ (5 РїР°СЂ)
+        if not force and len(self._dialogue_buffer) < 10:
+            return
+
+        # Р‘РµСЂРµРј chunk_size СЃРѕРѕР±С‰РµРЅРёР№ (10 РґР»СЏ С€С‚Р°С‚РЅРѕР№ СЂР°Р±РѕС‚С‹, РёР»Рё РІСЃРµ РѕСЃС‚Р°С‚РєРё РїСЂРё force)
+        chunk_size = 10 if not force else len(self._dialogue_buffer)
+        messages = self._dialogue_buffer[:chunk_size]
+        self._dialogue_buffer = self._dialogue_buffer[chunk_size:]
+
+        # Build text for compression
+        text_parts = []
+        for msg in messages:
+            role = "РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ" if msg["role"] == "user" else "РђСЃСЃРёСЃС‚РµРЅС‚"
+            text_parts.append(f"{role}: {msg['content']}")
+        text_for_compression = "\n".join(text_parts)
+
+        # Compress via LLM
+        try:
+            from memory.llm_compressor import LLMCompressor
+
+            if self._llm_compressor is None:
+                self._llm_compressor = LLMCompressor(self.llm_client)
+
+            summary = await self._llm_compressor.compress(text_for_compression)
+
+            # Store as fact in HOT memory
+            key = f"dialogue_summary:{int(time.time())}"
+            await self.memory.remember(
+                key,
+                {
+                    "summary": summary,
+                    "pairs_count": chunk_size // 2,
+                    "compressed_at": int(time.time()),
+                    "raw_preview": (
+                        text_for_compression[:200] + "..."
+                        if len(text_for_compression) > 200
+                        else text_for_compression
+                    ),
+                },
+                complex_query=True,
+            )
+            logger.info(
+                "Dialogue buffer compressed and stored",
+                pairs=chunk_size // 2,
+                summary_len=len(summary),
+                key=key,
+            )
+        except Exception as e:
+            logger.error("Failed to compress dialogue buffer", error=str(e))
+            # Р’РѕР·РІСЂР°С‰Р°РµРј СЃРѕРѕР±С‰РµРЅРёСЏ РІ Р±СѓС„РµСЂ РїСЂРё РѕС€РёР±РєРµ, С‡С‚РѕР±С‹ РЅРµ РїРѕС‚РµСЂСЏС‚СЊ РёС…
+            self._dialogue_buffer = messages + self._dialogue_buffer
 
     async def _cli_loop(self) -> None:
         """Async CLI loop - reads stdin without blocking asyncio."""
@@ -337,7 +423,6 @@ class AgentCore:
                 raw = await loop.run_in_executor(None, input, "\n> ")
                 if not raw.strip():
                     continue
-
                 if raw.strip().lower() == "exit":
                     self.running = False
                     break
@@ -393,12 +478,7 @@ class AgentCore:
             COMPRESSION_INTERVAL_SECONDS,
             lambda: self.memory.compress_cycle(llm_compressor.compress),
         )
-        # Регистрация задачи сброса диалога
-        self.scheduler.register(
-            "dialogue_reset",
-            DIALOGUE_RESET_INTERVAL_SECONDS,
-            lambda: self.memory.forget("dialogue:last"),
-        )
+
         await self.scheduler.start()
         logger.info("LLM-powered memory compression enabled (internal scheduler)")
 
@@ -429,16 +509,22 @@ class AgentCore:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
 
+        # РџСЂРёРЅСѓРґРёС‚РµР»СЊРЅРѕ СЃР¶РёРјР°РµРј РѕСЃС‚Р°С‚РєРё Р±СѓС„РµСЂР° РїРµСЂРµРґ РІС‹С…РѕРґРѕРј (РґР°Р¶Рµ РµСЃР»Рё С‚Р°Рј < 10 СЃРѕРѕР±С‰РµРЅРёР№)
+        if self._dialogue_buffer:
+            logger.info(
+                "Compressing remaining dialogue buffer on shutdown",
+                messages=len(self._dialogue_buffer),
+            )
+            await self._compress_and_store_dialogue(force=True)
+
         if self.watchdog:
             await self.watchdog.stop()
         if self.scheduler:
             await self.scheduler.stop()
         if self.llm_client:
             await self.llm_client.close()
-
         metrics = self.get_metrics()
         logger.info("Final metrics", **metrics)
-
         self.running = False
         logger.info("Agent shut down cleanly")
 
@@ -446,7 +532,6 @@ class AgentCore:
         """Get current agent metrics."""
         uptime = time.time() - self._start_time
         stats = self.memory.get_stats()
-
         base_metrics = {
             "uptime_seconds": round(uptime, 2),
             "requests_count": self._requests_count,
@@ -458,7 +543,6 @@ class AgentCore:
             "memory_cold": stats["cold"],
             "session_requests": self._session_requests,
         }
-
         if self.watchdog:
             watchdog_status = self.watchdog.get_status()
             base_metrics["watchdog_llm"] = "OK" if watchdog_status["llm"]["available"] else "FAIL"
@@ -469,7 +553,6 @@ class AgentCore:
                 "OK" if watchdog_status["memory"]["available"] else "FAIL"
             )
             base_metrics["watchdog_disk"] = "OK" if watchdog_status["disk"]["available"] else "FAIL"
-
         base_metrics.update(self.metrics.snapshot())
         return base_metrics
 
@@ -492,12 +575,9 @@ async def main():
     """Entry point."""
     config = Config.load()
     config.validate()
-
     agent = AgentCore(config)
     await agent.initialize()
-
     setup_signal_handlers(agent)
-
     try:
         await agent.run()
     except (asyncio.CancelledError, KeyboardInterrupt):

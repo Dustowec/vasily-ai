@@ -1,5 +1,4 @@
 """Configuration for Vasily AI agent.
-
 Loading priority (highest to lowest):
 1. Environment variables (VASILY_<FIELD> in uppercase)
 2. JSON config file (path from VASILY_CONFIG env, default: vasily_config.json)
@@ -58,21 +57,23 @@ class Config:
         default_factory=lambda: ["password", "token", "authorization", "cookie"]
     )
 
-    # LLM
+    # LLM (ADR-011: Optimized for 4B Reasoning model, strict context limits)
     llm_url: str = "http://localhost:11434"
     llm_model: str = "vasily-qwen"
-    llm_timeout: float = 30.0
+    llm_timeout: float = 120.0  # ADR-011: было 30.0
     llm_auto_start: bool = False
     llm_auto_start_timeout: float = 30.0
     llm_max_retries: int = 2
-    llm_num_ctx: int = 32768
-    llm_safety_margin: int = 1000
+    llm_num_ctx: int = 8192  # ADR-011: было 32768
+    llm_safety_margin: int = 4096  # ADR-011: было 1000
     llm_retry_delay_base: float = 1.0
+    repeat_penalty: float = 1.1  # ADR-011: новый параметр
+    max_thinking_tokens: int = 2000  # ADR-011: новый параметр
 
     # Agent behavior
     max_concurrent_requests: int = 5
-    request_timeout: float = 60.0
-    max_react_iterations: int = 6
+    request_timeout: float = 180.0  # ADR-011: было 60.0
+    max_react_iterations: int = 7  # ADR-011: было 6
     max_tool_calls_per_tool: int = 3
     log_preview_length: int = 100
 
@@ -115,7 +116,6 @@ class Config:
 
         data["log_dir"] = Path(data.get("log_dir", "logs"))
         data["data_dir"] = Path(data.get("data_dir", "data"))
-
         return cls(**data)
 
     @staticmethod
