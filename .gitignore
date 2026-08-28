@@ -91,3 +91,7 @@ SUMMARY1.txt
 ПОДСКАЗКИ!!!.txt
 git_history.txt
 logs/watchdog.log
+workspace/reading/*
+workspace/wrote/*
+!workspace/reading/.gitkeep
+!workspace/wrote/.gitkeep
