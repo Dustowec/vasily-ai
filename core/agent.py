@@ -1,5 +1,6 @@
 ﻿"""AgentCore - orchestration layer with ReAct-powered routing.
-ADR-011: Sliding Window, Lazy Retrieval, Dialogue Buffer Compression.
+ADR-011: Sliding Window (5 pairs FIFO) instead of dialogue:last.
+UTF-8 Hardening: Fixed double-encoding in dialogue compression.
 """
 
 import asyncio
@@ -22,7 +23,6 @@ from integrations.ollama_client import LLMUnavailableError, OllamaClient
 from memory.manager import GradientMemory
 
 logger = get_logger("core", "AgentCore")
-
 
 # ADR-005: internal periodic task intervals (seconds)
 COMPRESSION_INTERVAL_SECONDS = 6 * 3600
@@ -48,7 +48,7 @@ class AgentCore:
         self.watchdog: Watchdog | None = None
         # ADR-011: Sliding window for dialogue history (5 pairs = 10 messages)
         self._dialogue_window: list[dict] = []
-        # ADR-011 fix: Buffer for dialogue compression (every 5 pairs в†’ 1 fact)
+        # ADR-011 fix: Buffer for dialogue compression (every 5 pairs → 1 fact)
         self._dialogue_buffer: list[dict] = []
         self._llm_compressor = None  # Will be initialized in run()
 
@@ -137,8 +137,8 @@ class AgentCore:
                 icons = self.watchdog.get_status_icons() if self.watchdog else ""
                 metrics = self.get_metrics()
                 msg = (
-                    f"РџР°РјСЏС‚СЊ: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}. "
-                    f"Р—Р°РїСЂРѕСЃРѕРІ: {metrics['requests_count']}, РћС€РёР±РѕРє: {metrics['errors_count']}. "
+                    f"Память: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}. "
+                    f"Запросов: {metrics['requests_count']}, Ошибок: {metrics['errors_count']}. "
                     f"Watchdog: {icons}"
                 )
                 return {
@@ -152,20 +152,20 @@ class AgentCore:
             if cmd == "help":
                 return {
                     "status": "success",
-                    "message": "Available commands: status, help, exit, Р·Р°Р±С‹С‚СЊ , Р·Р°Р±С‹С‚СЊ РІСЃС‘. "
+                    "message": "Available commands: status, help, exit, забыть , забыть всё. "
                     "Any other text is processed by AI with access to plugins. "
                     "Ctrl+C cancels the current request.",
                 }
 
-            # ---- РћР‘Р РђР‘РћРўРљРђ "Р—РђР‘Р«РўР¬ Р’РЎРЃ" ----
-            if "Р·Р°Р±СѓРґСЊ РІСЃС‘" in cmd or "Р·Р°Р±С‹С‚СЊ РІСЃС‘" in cmd:
-                if "РґР°" in cmd:
+            # ---- ОБРАБОТКА "ЗАБЫТЬ ВСЁ" ----
+            if "забудь всё" in cmd or "забыть всё" in cmd:
+                if "да" in cmd:
                     result = await self.memory.forget_all(confirm=True)
                     if result:
                         # ADR-011: Clear sliding window on full reset
                         self._dialogue_window.clear()
                         self._dialogue_buffer.clear()
-                        # РџРµСЂРµСЃРѕР·РґР°С‘Рј ReActLoop РґР»СЏ РїРѕР»РЅРѕРіРѕ СЃР±СЂРѕСЃР° РєРѕРЅС‚РµРєСЃС‚Р°
+                        # Пересоздаём ReActLoop для полного сброса контекста
                         self.react_loop = ReActLoop(
                             config=self.config,
                             llm_client=self.llm_client,
@@ -173,50 +173,44 @@ class AgentCore:
                         )
                         return {
                             "status": "success",
-                            "message": "РџР°РјСЏС‚СЊ РїРѕР»РЅРѕСЃС‚СЊСЋ РѕС‡РёС‰РµРЅР° (СЂРѕС‚Р°С†РёСЏ РІС‹РїРѕР»РЅРµРЅР°).",
+                            "message": "Память полностью очищена (ротация выполнена).",
                         }
-                    return {
-                        "status": "error",
-                        "message": "РќРµ СѓРґР°Р»РѕСЃСЊ РІС‹РїРѕР»РЅРёС‚СЊ СЂРѕС‚Р°С†РёСЋ РїР°РјСЏС‚Рё.",
-                    }
+                    return {"status": "error", "message": "Не удалось выполнить ротацию памяти."}
                 else:
                     return {
                         "status": "error",
-                        "message": "Р”Р»СЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ РєРѕРјР°РЅРґС‹ 'Р·Р°Р±СѓРґСЊ РІСЃС‘' С‚СЂРµР±СѓРµС‚СЃСЏ РґРІРѕР№РЅРѕРµ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ. "
-                        "Р’РІРµРґРёС‚Рµ 'Р·Р°Р±СѓРґСЊ РІСЃС‘ РґР°' РґР»СЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ.",
+                        "message": "Для подтверждения команды 'забудь всё' требуется двойное подтверждение. "
+                        "Введите 'забудь всё да' для подтверждения.",
                     }
 
-            # ---- Р—РђР‘Р«РўР¬ РљРћРќРљР Р•РўРќРЈР® РўР•РњРЈ ----
-            if cmd.startswith("Р·Р°Р±СѓРґСЊ") or cmd.startswith("Р·Р°Р±С‹С‚СЊ"):
+            # ---- ЗАБЫТЬ КОНКРЕТНУЮ ТЕМУ ----
+            if cmd.startswith("забудь") or cmd.startswith("забыть"):
                 parts = cmd.split(maxsplit=1)
                 if len(parts) < 2 or not parts[1].strip():
-                    return {
-                        "status": "error",
-                        "message": "РЈРєР°Р¶РёС‚Рµ С‚РµРјСѓ РґР»СЏ Р·Р°Р±С‹РІР°РЅРёСЏ.",
-                    }
+                    return {"status": "error", "message": "Укажите тему для забывания."}
                 topic = parts[1].strip()
                 result = await self.memory.forget(topic)
                 if result:
-                    return {"status": "success", "message": f"РўРµРјР° '{topic}' Р·Р°Р±С‹С‚Р°."}
-                return {"status": "error", "message": f"РўРµРјР° '{topic}' РЅРµ РЅР°Р№РґРµРЅР°."}
+                    return {"status": "success", "message": f"Тема '{topic}' забыта."}
+                return {"status": "error", "message": f"Тема '{topic}' не найдена."}
 
-            # ---- РђР’РўРћРњРђРўРР§Р•РЎРљРР™ РџРћРРЎРљ ----
+            # ---- АВТОМАТИЧЕСКИЙ ПОИСК ----
             search_keywords = [
-                "РїРѕРёС‰Рё",
-                "РЅР°Р№РґРё",
-                "РїРѕРіРѕРґР°",
-                "РЅРѕРІРѕСЃС‚Рё",
-                "С†РµРЅР°",
-                "РєСѓСЂСЃ",
-                "СЃРєРѕР»СЊРєРѕ СЃС‚РѕРёС‚",
-                "СѓР·РЅР°Р№",
-                "СЂР°СЃСЃРєР°Р¶Рё РїСЂРѕ",
-                "С‡С‚Рѕ С‚Р°РєРѕРµ",
-                "РєР°Рє СЂР°Р±РѕС‚Р°РµС‚",
-                "РєРѕРіРґР°",
-                "РіРґРµ",
-                "РєС‚Рѕ С‚Р°РєРѕР№",
-                "С‡С‚Рѕ РїСЂРѕРёСЃС…РѕРґРёС‚",
+                "поищи",
+                "найди",
+                "погода",
+                "новости",
+                "цена",
+                "курс",
+                "сколько стоит",
+                "узнай",
+                "расскажи про",
+                "что такое",
+                "как работает",
+                "когда",
+                "где",
+                "кто такой",
+                "что происходит",
             ]
             text_lower = user_text.lower()
             if any(kw in text_lower for kw in search_keywords):
@@ -231,41 +225,36 @@ class AgentCore:
                         if result.get("status") == "success":
                             results = result.get("results", [])
                             if results:
-                                answer = f"Р РµР·СѓР»СЊС‚Р°С‚С‹ РїРѕРёСЃРєР° РїРѕ Р·Р°РїСЂРѕСЃСѓ '{user_text}':\n"
+                                answer = f"Результаты поиска по запросу '{user_text}':\n"
                                 for i, r in enumerate(results[:5], 1):
-                                    title = r.get("title", "Р‘РµР· РЅР°Р·РІР°РЅРёСЏ")
+                                    title = r.get("title", "Без названия")
                                     snippet = r.get("snippet", "")
                                     url = r.get("url", "")
                                     answer += f"{i}. **{title}**\n"
                                     if snippet:
                                         answer += f"   {snippet}\n"
                                     if url:
-                                        answer += f"   РСЃС‚РѕС‡РЅРёРє: {url}\n"
+                                        answer += f"   Источник: {url}\n"
                                     answer += "\n"
                                 return {"status": "success", "message": answer, "iterations": 0}
                             else:
                                 return {
                                     "status": "success",
-                                    "message": f"РџРѕ Р·Р°РїСЂРѕСЃСѓ '{user_text}' РЅРёС‡РµРіРѕ РЅРµ РЅР°Р№РґРµРЅРѕ.",
+                                    "message": f"По запросу '{user_text}' ничего не найдено.",
                                 }
                         else:
-                            error_msg = result.get(
-                                "message", "РќРµРёР·РІРµСЃС‚РЅР°СЏ РѕС€РёР±РєР° РїСЂРё РїРѕРёСЃРєРµ"
-                            )
-                            return {
-                                "status": "error",
-                                "message": f"РћС€РёР±РєР° РїРѕРёСЃРєР°: {error_msg}",
-                            }
+                            error_msg = result.get("message", "Неизвестная ошибка при поиске")
+                            return {"status": "error", "message": f"Ошибка поиска: {error_msg}"}
                     except Exception as e:
                         logger.error("Web search failed", error=str(e))
                         return {
                             "status": "error",
-                            "message": f"РћС€РёР±РєР° РїСЂРё РІС‹РїРѕР»РЅРµРЅРёРё РїРѕРёСЃРєР°: {str(e)}",
+                            "message": f"Ошибка при выполнении поиска: {str(e)}",
                         }
                 else:
                     logger.warning("web_search plugin not found, falling back to ReAct")
 
-            # ---- Р•РЎР›Р РќР• РљРћРњРђРќР”Рђ, Р—РђРџРЈРЎРљРђР•Рњ ReAct ----
+            # ---- ЕСЛИ НЕ КОМАНДА, ЗАПУСКАЕМ ReAct ----
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
@@ -357,24 +346,45 @@ class AgentCore:
             await self._compress_and_store_dialogue()
 
     async def _compress_and_store_dialogue(self, force: bool = False) -> None:
-        """Compress dialogue buffer into a single fact and store in memory."""
+        """Compress dialogue buffer into a single fact and store in memory.
+        FIX: Hardened UTF-8 encoding to prevent double-encoding garbage (РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ).
+        """
         if not self._dialogue_buffer:
             return
 
-        # Р•СЃР»Рё РЅРµ РїСЂРёРЅСѓРґРёС‚РµР»СЊРЅРѕ, Р¶РґРµРј РЅР°РєРѕРїР»РµРЅРёСЏ 10 СЃРѕРѕР±С‰РµРЅРёР№ (5 РїР°СЂ)
+        # Если не принудительно, ждем накопления 10 сообщений (5 пар)
         if not force and len(self._dialogue_buffer) < 10:
             return
 
-        # Р‘РµСЂРµРј chunk_size СЃРѕРѕР±С‰РµРЅРёР№ (10 РґР»СЏ С€С‚Р°С‚РЅРѕР№ СЂР°Р±РѕС‚С‹, РёР»Рё РІСЃРµ РѕСЃС‚Р°С‚РєРё РїСЂРё force)
+        # Берем chunk_size сообщений (10 для штатной работы, или все остатки при force)
         chunk_size = 10 if not force else len(self._dialogue_buffer)
         messages = self._dialogue_buffer[:chunk_size]
         self._dialogue_buffer = self._dialogue_buffer[chunk_size:]
 
-        # Build text for compression
+        # Build text for compression with HARDENED UTF-8 HANDLING
         text_parts = []
         for msg in messages:
-            role = "РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ" if msg["role"] == "user" else "РђСЃСЃРёСЃС‚РµРЅС‚"
-            text_parts.append(f"{role}: {msg['content']}")
+            role = "Пользователь" if msg["role"] == "user" else "Ассистент"
+            content = msg.get("content", "")
+
+            # *** FIX START ***
+            # Гарантируем корректную UTF-8 строку
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            elif isinstance(content, str):
+                # Проверяем, не повреждена ли строка (признак двойного кодирования)
+                # Если строка содержит символы, похожие на "РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ",
+                # пробуем восстановить через Latin-1 -> UTF-8
+                if any(ord(c) > 127 for c in content):
+                    try:
+                        # Пытаемся восстановить, если это UTF-8, ошибочно прочитанный как Latin-1
+                        content = content.encode("latin1").decode("utf-8")
+                    except (UnicodeError, LookupError):
+                        pass  # Оставляем как есть, если не получается
+            # *** FIX END ***
+
+            text_parts.append(f"{role}: {content}")
+
         text_for_compression = "\n".join(text_parts)
 
         # Compress via LLM
@@ -410,7 +420,7 @@ class AgentCore:
             )
         except Exception as e:
             logger.error("Failed to compress dialogue buffer", error=str(e))
-            # Р’РѕР·РІСЂР°С‰Р°РµРј СЃРѕРѕР±С‰РµРЅРёСЏ РІ Р±СѓС„РµСЂ РїСЂРё РѕС€РёР±РєРµ, С‡С‚РѕР±С‹ РЅРµ РїРѕС‚РµСЂСЏС‚СЊ РёС…
+            # Возвращаем сообщения в буфер при ошибке, чтобы не потерять их
             self._dialogue_buffer = messages + self._dialogue_buffer
 
     async def _cli_loop(self) -> None:
@@ -509,7 +519,7 @@ class AgentCore:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
 
-        # РџСЂРёРЅСѓРґРёС‚РµР»СЊРЅРѕ СЃР¶РёРјР°РµРј РѕСЃС‚Р°С‚РєРё Р±СѓС„РµСЂР° РїРµСЂРµРґ РІС‹С…РѕРґРѕРј (РґР°Р¶Рµ РµСЃР»Рё С‚Р°Рј < 10 СЃРѕРѕР±С‰РµРЅРёР№)
+        # Принудительно сжимаем остатки буфера перед выходом (даже если там < 10 сообщений)
         if self._dialogue_buffer:
             logger.info(
                 "Compressing remaining dialogue buffer on shutdown",
