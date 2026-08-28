@@ -507,10 +507,10 @@ class GradientMemory:
         """
         if not query:
             return {"found": False, "facts": []}
-        
+
         query_words = set(query.lower().split())
         results = []
-        
+
         # Search in HOT
         for key, entry in self._hot.items():
             value = entry.get("value")
@@ -519,30 +519,34 @@ class GradientMemory:
                 text_to_search = value.lower()
             elif isinstance(value, (dict, list)):
                 text_to_search = json.dumps(value, ensure_ascii=False).lower()
-            
+
             if any(word in text_to_search for word in query_words):
-                results.append({
-                    "key": key,
-                    "zone": "hot",
-                    "score": entry.get("score", 0),
-                    "value": value,
-                })
-        
+                results.append(
+                    {
+                        "key": key,
+                        "zone": "hot",
+                        "score": entry.get("score", 0),
+                        "value": value,
+                    }
+                )
+
         # Search in COLD
         for key, entry in self._cold.items():
             summary = entry.get("summary", "")
             if any(word in summary.lower() for word in query_words):
-                results.append({
-                    "key": key,
-                    "zone": "cold",
-                    "score": entry.get("score", 0),
-                    "summary": summary,
-                })
-        
+                results.append(
+                    {
+                        "key": key,
+                        "zone": "cold",
+                        "score": entry.get("score", 0),
+                        "summary": summary,
+                    }
+                )
+
         # Sort by score descending and take top 5
         results.sort(key=lambda x: x["score"], reverse=True)
         top_results = results[:5]
-        
+
         return {
             "found": len(top_results) > 0,
             "facts": top_results,
