@@ -14,7 +14,7 @@ from core.base_tool import BaseTool
 from core.plugin_types import make_error
 
 # Разрешённые директории (относительно корня проекта)
-ALLOWED_DIRS = ["data", "reports"]
+ALLOWED_DIRS = ["workspace/reading"]
 
 # Поддерживаемые расширения и их парсеры
 PARSERS = {
@@ -33,7 +33,7 @@ class LocalReaderTool(BaseTool):
     """Read local files from allowed directories."""
 
     name = "local_reader"
-    description = "Read contents of files from data/ and reports/ directories"
+    description = "Read contents of files from workspace/reading directory"
     version = "1.1.0"
 
     async def _execute(self, path: str = "", **kwargs) -> dict[str, Any]:
@@ -180,7 +180,7 @@ class LocalReaderTool(BaseTool):
         return {
             "path": {
                 "type": "string",
-                "description": f"Path to file in {ALLOWED_DIRS} directories",
+                "description": "Path to file in workspace/reading directory",
                 "required": True,
             },
         }

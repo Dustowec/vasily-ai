@@ -20,19 +20,11 @@ def tool():
 
 
 @pytest.fixture
-def data_dir(tmp_path):
-    """Create data/ directory with test files."""
-    data = tmp_path / "data"
-    data.mkdir()
-    return data
-
-
-@pytest.fixture
-def reports_dir(tmp_path):
-    """Create reports/ directory with test files."""
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    return reports
+def workspace_dir(tmp_path):
+    """Create workspace/reading/ directory with test files."""
+    workspace = tmp_path / "workspace" / "reading"
+    workspace.mkdir(parents=True)
+    return workspace
 
 
 # ==================== TEST _EXECUTE ====================
@@ -89,13 +81,13 @@ async def test_execute_unsupported_format(tool, data_dir, monkeypatch):
 # ==================== TEST TEXT PARSER ====================
 
 
-async def test_read_txt(tool, data_dir, monkeypatch):
+async def test_read_txt(tool, workspace_dir, monkeypatch):
     """Read a .txt file."""
-    monkeypatch.chdir(data_dir.parent)
-    txt_file = data_dir / "test.txt"
+    monkeypatch.chdir(workspace_dir.parent.parent)  # workspace/ -> project root
+    txt_file = workspace_dir / "test.txt"
     txt_file.write_text("Hello, Vasily!")
 
-    result = await tool._execute(path="data/test.txt")
+    result = await tool._execute(path="workspace/reading/test.txt")
     assert result["status"] == "success"
     assert result["parser"] == "text"
     assert result["content"] == "Hello, Vasily!"
@@ -178,11 +170,10 @@ async def test_read_pdf_missing_dependency(tool, data_dir, monkeypatch):
 # ==================== TEST PATH TRAVERSAL ====================
 
 
-def test_is_path_allowed_valid(tool, data_dir, monkeypatch):
-    """Valid paths in data/ or reports/ should be allowed."""
-    monkeypatch.chdir(data_dir.parent)
-    assert tool._is_path_allowed("data/test.txt") is True
-    assert tool._is_path_allowed("reports/test.txt") is True
+def test_is_path_allowed_valid(tool, workspace_dir, monkeypatch):
+    """Valid paths in workspace/reading/ should be allowed."""
+    monkeypatch.chdir(workspace_dir.parent.parent)
+    assert tool._is_path_allowed("workspace/reading/test.txt") is True
 
 
 def test_is_path_allowed_invalid(tool, tmp_path, monkeypatch):
@@ -191,17 +182,3 @@ def test_is_path_allowed_invalid(tool, tmp_path, monkeypatch):
     assert tool._is_path_allowed("data/../etc/passwd") is False
     assert tool._is_path_allowed("reports/../secret") is False
     assert tool._is_path_allowed("something.txt") is False
-
-
-# ==================== TEST REPORTS DIRECTORY ====================
-
-
-async def test_read_from_reports(tool, reports_dir, monkeypatch):
-    """Read a file from reports/ directory."""
-    monkeypatch.chdir(reports_dir.parent)
-    report_file = reports_dir / "report.txt"
-    report_file.write_text("Monthly report")
-
-    result = await tool._execute(path="reports/report.txt")
-    assert result["status"] == "success"
-    assert result["content"] == "Monthly report"
