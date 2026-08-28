@@ -12,6 +12,7 @@ import structlog
 
 from core.config import Config
 from core.crash_reporter import install_async_exception_handler, install_crash_handler
+from core.internal_tools import ListFilesTool, RecallMemoryTool, RememberFactTool
 from core.logging_config import get_logger, setup_logging
 from core.metrics import MetricsCollector
 from core.plugin_registry import PluginRegistry
@@ -70,11 +71,19 @@ class AgentCore:
         )
 
         self.plugin_registry.discover_plugins(self.config.plugins_dir)
-        # Register internal tool for lazy memory retrieval
-        from core.internal_tools import RecallMemoryTool
 
+        # Register internal tool for lazy memory retrieval
         recall_tool = RecallMemoryTool(self.memory)
         self.plugin_registry.register(recall_tool)
+
+        # Register internal tool for explicit fact saving
+        remember_tool = RememberFactTool(self.memory)
+        self.plugin_registry.register(remember_tool)
+
+        # Register internal tool for listing files
+        list_files_tool = ListFilesTool()
+        self.plugin_registry.register(list_files_tool)
+
         logger.info(
             "Plugins loaded",
             count=len(self.plugin_registry),
@@ -194,7 +203,7 @@ class AgentCore:
                     return {"status": "success", "message": f"Тема '{topic}' забыта."}
                 return {"status": "error", "message": f"Тема '{topic}' не найдена."}
 
-            # ---- АВТОМАТИЧЕСКИЙ ПОИСК ----
+            # ---- АВТОМАТИЧЕСКИЙ ПОИСК (исправлен) ----
             search_keywords = [
                 "поищи",
                 "найди",
@@ -212,8 +221,26 @@ class AgentCore:
                 "кто такой",
                 "что происходит",
             ]
+            # Признаки локальных файлов — при их наличии web_search НЕ вызываем
+            local_file_keywords = [
+                "прочитай",
+                "открой",
+                "файл",
+                "книга",
+                ".pdf",
+                ".txt",
+                ".docx",
+                "workspace",
+                "reading",
+                "папк",
+                "директор",
+                "посмотри в",
+            ]
             text_lower = user_text.lower()
-            if any(kw in text_lower for kw in search_keywords):
+            is_search = any(kw in text_lower for kw in search_keywords)
+            is_local = any(kw in text_lower for kw in local_file_keywords)
+
+            if is_search and not is_local:
                 web_search_tool = self.plugin_registry.get("web_search")
                 if web_search_tool:
                     logger.info(

@@ -147,23 +147,18 @@ def get_agent_status(agent, loop):
         except Exception:
             pass
 
-    # Проверяем web_search (тестовый пинг)
+    # Проверяем web_search (только наличие в реестре, без реального запроса "ping")
     if agent and hasattr(agent, "plugin_registry"):
         try:
             web_search = agent.plugin_registry.get("web_search")
-            if web_search:
-                try:
-                    result = loop.run_until_complete(web_search.execute(query="ping", limit=1))
-                    if result.get("status") == "success":
-                        status["web_search"]["available"] = True
-                    else:
-                        status["web_search"]["available"] = False
-                        status["web_search"]["error"] = result.get("message", "Неизвестная ошибка")
-                except Exception as e:
-                    status["web_search"]["available"] = False
-                    status["web_search"]["error"] = str(e)
-        except Exception:
-            pass
+            if web_search is not None:
+                status["web_search"]["available"] = True
+            else:
+                status["web_search"]["available"] = False
+                status["web_search"]["error"] = "Plugin not registered"
+        except Exception as e:
+            status["web_search"]["available"] = False
+            status["web_search"]["error"] = str(e)
 
     # Проверяем диск
     try:

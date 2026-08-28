@@ -310,53 +310,45 @@ class GradientMemory:
                 if entry.get("protected", False):
                     logger.debug("Compression skipped: protected", key=key)
                     continue
+
                 existing_summary = entry.get("summary")
                 if existing_summary and not existing_summary.startswith("Compressed:"):
-                    cold_entry = {
-                        "value": None,
-                        "score": -5.0,
-                        "is_cold": True,
-                        "protected": False,
-                        "shield": False,
-                        "summary": existing_summary,
-                        "created_at": entry.get("created_at", datetime.now().isoformat()),
-                        "updated_at": datetime.now().isoformat(),
-                    }
+                    summary = existing_summary
                 else:
                     try:
-                        summary = await compressor(entry.get("value", ""))
-                        if summary and not summary.startswith("Compressed:"):
-                            cold_entry = {
-                                "value": None,
-                                "score": -5.0,
-                                "is_cold": True,
-                                "protected": False,
-                                "shield": False,
-                                "summary": summary,
-                                "created_at": entry.get("created_at", datetime.now().isoformat()),
-                                "updated_at": datetime.now().isoformat(),
-                            }
+                        value = entry.get("value")
+                        summary_from_llm = await compressor(value)
+                        if summary_from_llm and not summary_from_llm.startswith("Compressed:"):
+                            summary = summary_from_llm
                         else:
-                            value = entry.get("value", {})
-                            if isinstance(value, dict):
-                                user = value.get("user", "")
-                                assistant = value.get("assistant", "")
-                                summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
+                            # Fallback: извлекаем из value в зависимости от формата
+                            if value is None:
+                                summary = ""
+                            elif isinstance(value, dict):
+                                if "summary" in value:
+                                    summary = value["summary"]
+                                elif "user" in value and "assistant" in value:
+                                    user = value.get("user", "")
+                                    assistant = value.get("assistant", "")
+                                    summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
+                                else:
+                                    summary = str(value)[:300]
                             else:
                                 summary = str(value)[:300]
-                            cold_entry = {
-                                "value": None,
-                                "score": -5.0,
-                                "is_cold": True,
-                                "protected": False,
-                                "shield": False,
-                                "summary": summary,
-                                "created_at": entry.get("created_at", datetime.now().isoformat()),
-                                "updated_at": datetime.now().isoformat(),
-                            }
                     except Exception as e:
                         logger.error("Compression failed", key=key, error=str(e))
                         continue
+
+                cold_entry = {
+                    "value": None,
+                    "score": -5.0,
+                    "is_cold": True,
+                    "protected": False,
+                    "shield": False,
+                    "summary": summary or "Факты из диалога не извлечены.",
+                    "created_at": entry.get("created_at", datetime.now().isoformat()),
+                    "updated_at": datetime.now().isoformat(),
+                }
                 del self._hot[key]
                 await self._save_zone("hot", self._hot)
                 self._cold[key] = cold_entry
@@ -426,6 +418,10 @@ class GradientMemory:
 
             # 1. TGS -> HOT
             for key, entry in list(self._tgs.items()):
+                # Защита пользовательских фактов
+                if key.startswith("user_fact:"):
+                    logger.debug("Forget all: skipping user_fact", key=key)
+                    continue
                 current_score = entry.get("score", 50.0)
                 new_score = max(current_score - 20.0, 0.0)
                 entry["score"] = new_score
@@ -442,6 +438,10 @@ class GradientMemory:
 
             # 2. HOT -> COLD
             for key, entry in list(self._hot.items()):
+                # Защита пользовательских фактов
+                if key.startswith("user_fact:"):
+                    logger.debug("Forget all: skipping user_fact", key=key)
+                    continue
                 current_score = entry.get("score", 25.0)
                 new_score = current_score - 50.0
                 entry["score"] = new_score
@@ -449,9 +449,14 @@ class GradientMemory:
                 entry["updated_at"] = datetime.now().isoformat()
                 value = entry.get("value", {})
                 if isinstance(value, dict):
-                    user = value.get("user", "")
-                    assistant = value.get("assistant", "")
-                    summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
+                    if "summary" in value:
+                        summary = value["summary"]
+                    elif "user" in value and "assistant" in value:
+                        user = value.get("user", "")
+                        assistant = value.get("assistant", "")
+                        summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
+                    else:
+                        summary = str(value)[:300]
                 else:
                     summary = str(value)[:300]
                 cold_entry = {
@@ -476,6 +481,10 @@ class GradientMemory:
             # 3. COLD -> DELETE (только для записей, бывших в COLD до вызова)
             for key in original_cold_keys:
                 if key not in self._cold:
+                    continue
+                # Защита пользовательских фактов
+                if key.startswith("user_fact:"):
+                    logger.debug("Forget all: skipping user_fact in COLD", key=key)
                     continue
                 entry = self._cold[key]
                 current_score = entry.get("score", -5.0)
@@ -504,6 +513,7 @@ class GradientMemory:
         """Search for facts in HOT and COLD zones by keywords.
         TGS is excluded to avoid duplication with system prompt.
         Returns structured result: {"found": bool, "facts": list[dict]}
+        ADR-011: Lazy Retrieval tool backend.
         """
         if not query:
             return {"found": False, "facts": []}
@@ -514,11 +524,29 @@ class GradientMemory:
         # Search in HOT
         for key, entry in self._hot.items():
             value = entry.get("value")
+            summary = entry.get("summary", "")
             text_to_search = ""
+
+            # Собираем текст из всех возможных источников
             if isinstance(value, str):
                 text_to_search = value.lower()
-            elif isinstance(value, (dict, list)):
+            elif isinstance(value, dict):
+                if "summary" in value:
+                    text_to_search = value["summary"].lower()
+                elif "user" in value and "assistant" in value:
+                    text_to_search = (
+                        value.get("user", "") + " " + value.get("assistant", "")
+                    ).lower()
+                else:
+                    text_to_search = json.dumps(value, ensure_ascii=False).lower()
+            elif isinstance(value, list):
                 text_to_search = json.dumps(value, ensure_ascii=False).lower()
+            elif value is not None:
+                text_to_search = str(value).lower()
+
+            # Добавляем summary (если есть)
+            if summary:
+                text_to_search += " " + summary.lower()
 
             if any(word in text_to_search for word in query_words):
                 results.append(
@@ -527,6 +555,7 @@ class GradientMemory:
                         "zone": "hot",
                         "score": entry.get("score", 0),
                         "value": value,
+                        "summary": summary,
                     }
                 )
 
