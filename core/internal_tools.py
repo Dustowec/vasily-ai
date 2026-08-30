@@ -48,7 +48,7 @@ class RecallMemoryTool(BaseTool):
                 return f"{query} {expanded}"
         except Exception:
             pass
-        
+
         return query
 
     async def _execute(self, query: str = "", limit: int = 3, **kwargs) -> dict[str, Any]:
@@ -138,19 +138,21 @@ class RememberFactTool(BaseTool):
         # Мы делаем быстрый поиск и проверяем, не является ли найденный факт дубликатом по длине.
         search_query = clean_fact[:50]
         check = await self.memory.recall_memory(search_query)
-        
+
         if check.get("found") and check.get("facts"):
             existing = check["facts"][0]
             existing_text = str(existing.get("value") or existing.get("summary", ""))
-            
+
             # Если длины текстов сопоставимы (разница не более чем в 2.5 раза), считаем это дубликатом
             if len(existing_text) > 10 and len(clean_fact) > 10:
-                ratio = min(len(existing_text), len(clean_fact)) / max(len(existing_text), len(clean_fact))
+                ratio = min(len(existing_text), len(clean_fact)) / max(
+                    len(existing_text), len(clean_fact)
+                )
                 if ratio > 0.4:  # Тексты примерно одного порядка длины
                     return {
                         "status": "already_exists",
                         "message": f"ВНИМАНИЕ: Этот факт уже сохранён в памяти (ключ: {existing['key']}). НЕ вызывай этот инструмент повторно. Просто ответь пользователю, что ты это уже знаешь, и не создавай дубликат.",
-                        "existing_fact": existing_text
+                        "existing_fact": existing_text,
                     }
         # ==========================================
 

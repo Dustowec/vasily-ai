@@ -353,11 +353,11 @@ def install_crash_handler(log_dir: Path, max_log_lines: int = MAX_LOG_LINES) -> 
     def exception_handler(exc_type, exc_value, exc_traceback):
         try:
             json_path, md_path = reporter.generate_report(exc_value)
-            print(f"\n{'='*60}", file=sys.stderr)
+            print(f"\n{'=' * 60}", file=sys.stderr)
             print("FATAL ERROR - Crash report generated:", file=sys.stderr)
             print(f"  JSON: {json_path}", file=sys.stderr)
             print(f"  Markdown: {md_path}", file=sys.stderr)
-            print(f"{'='*60}\n", file=sys.stderr)
+            print(f"{'=' * 60}\n", file=sys.stderr)
         except Exception as e:
             print(f"Failed to generate crash report: {e}", file=sys.stderr)
 

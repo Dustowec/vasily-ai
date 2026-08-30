@@ -1,6 +1,7 @@
 """LLM-powered memory compressor for Gradient Cascade Memory."""
+
 from typing import Any
-import re
+
 from core.logging_config import get_logger
 from integrations.ollama_client import OllamaClient
 
@@ -37,13 +38,9 @@ class LLMCompressor:
             _, summary = OllamaClient.extract_thinking_and_answer(raw_summary)
 
             if summary:
-                logger.info(
-                    "Memory compressed", 
-                    original_len=len(text), 
-                    summary_len=len(summary)
-                )
+                logger.info("Memory compressed", original_len=len(text), summary_len=len(summary))
                 return summary
-            
+
             return text[:300]
         except Exception as e:
             logger.error("Compression failed", error=str(e))

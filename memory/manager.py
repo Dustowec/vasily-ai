@@ -1,4 +1,4 @@
-﻿"""Gradient Cascade Memory — новая архитектура памяти Vasily AI."""
+"""Gradient Cascade Memory — новая архитектура памяти Vasily AI."""
 
 import asyncio
 import json

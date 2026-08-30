@@ -101,8 +101,7 @@ class GoldenPromptsLibrary:
                     "2. **Cite Sources**: Always provide URLs when presenting search results.\n"
                     "3. **Summarize**: Don't just dump raw data. Synthesize the findings into a clear answer.\n"
                     "4. **No Hallucinations**: If the search fails or returns nothing, state that clearly. "
-                    "Do not make up facts.\n"
-                    + ERROR_HANDLING_RULES
+                    "Do not make up facts.\n" + ERROR_HANDLING_RULES
                 ),
             },
             "art": {

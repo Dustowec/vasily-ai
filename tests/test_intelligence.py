@@ -87,9 +87,7 @@ def count_real_identical_calls(steps) -> int:
         preview = step.get("result_preview", "")
         if preview.startswith(BLOCKED_MARKERS):
             continue
-        signature = (
-            f"{step['tool']}:" f"{json.dumps(step['args'], sort_keys=True, ensure_ascii=False)}"
-        )
+        signature = f"{step['tool']}:{json.dumps(step['args'], sort_keys=True, ensure_ascii=False)}"
         signatures[signature] += 1
     return max(signatures.values()) if signatures else 0
 
@@ -144,7 +142,7 @@ async def run_scenario(react_loop, scenario, index):
             limit = scenario["max_iterations"]
             ok = result["iterations"] <= limit
             result["notes"].append(
-                f"iterations<={limit}: {result['iterations']} " f"{'OK' if ok else 'FAIL'}"
+                f"iterations<={limit}: {result['iterations']} {'OK' if ok else 'FAIL'}"
             )
             result["passed"] = result["passed"] and ok
 

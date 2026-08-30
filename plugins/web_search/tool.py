@@ -83,8 +83,8 @@ class WebSearchTool(BaseTool):
             "results_count": limit,
             "results": [
                 {
-                    "title": f"Result {i+1} for '{query}'",
-                    "url": f"https://example.com/{i+1}",
+                    "title": f"Result {i + 1} for '{query}'",
+                    "url": f"https://example.com/{i + 1}",
                     "snippet": f"Mock snippet about {query}",
                 }
                 for i in range(limit)

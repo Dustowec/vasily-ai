@@ -1,4 +1,4 @@
-﻿"""AgentCore - orchestration layer with ReAct-powered routing.
+"""AgentCore - orchestration layer with ReAct-powered routing.
 ADR-011: Sliding Window (5 pairs FIFO) instead of dialogue:last.
 UTF-8 Hardening: Fixed double-encoding in dialogue compression.
 """
@@ -195,13 +195,35 @@ class AgentCore:
                 return {"status": "error", "message": f"Тема '{topic}' не найдена."}
 
             search_keywords = [
-                "поищи", "найди", "погода", "новости", "цена", "курс", "сколько стоит",
-                "узнай", "расскажи про", "что такое", "как работает", "когда", "где",
-                "кто такой", "что происходит",
+                "поищи",
+                "найди",
+                "погода",
+                "новости",
+                "цена",
+                "курс",
+                "сколько стоит",
+                "узнай",
+                "расскажи про",
+                "что такое",
+                "как работает",
+                "когда",
+                "где",
+                "кто такой",
+                "что происходит",
             ]
             local_file_keywords = [
-                "прочитай", "открой", "файл", "книга", ".pdf", ".txt", ".docx",
-                "workspace", "reading", "папк", "директор", "посмотри в",
+                "прочитай",
+                "открой",
+                "файл",
+                "книга",
+                ".pdf",
+                ".txt",
+                ".docx",
+                "workspace",
+                "reading",
+                "папк",
+                "директор",
+                "посмотри в",
             ]
             text_lower = user_text.lower()
             is_search = any(kw in text_lower for kw in search_keywords)
@@ -210,7 +232,10 @@ class AgentCore:
             if is_search and not is_local:
                 web_search_tool = self.plugin_registry.get("web_search")
                 if web_search_tool:
-                    logger.info("Auto-detected search query, calling web_search directly", text=user_text[:50])
+                    logger.info(
+                        "Auto-detected search query, calling web_search directly",
+                        text=user_text[:50],
+                    )
                     try:
                         result = await web_search_tool.execute(query=user_text, limit=5)
                         if result.get("status") == "success":
@@ -229,13 +254,19 @@ class AgentCore:
                                     answer += "\n"
                                 return {"status": "success", "message": answer, "iterations": 0}
                             else:
-                                return {"status": "success", "message": f"По запросу '{user_text}' ничего не найдено."}
+                                return {
+                                    "status": "success",
+                                    "message": f"По запросу '{user_text}' ничего не найдено.",
+                                }
                         else:
                             error_msg = result.get("message", "Неизвестная ошибка при поиске")
                             return {"status": "error", "message": f"Ошибка поиска: {error_msg}"}
                     except Exception as e:
                         logger.error("Web search failed", error=str(e))
-                        return {"status": "error", "message": f"Ошибка при выполнении поиска: {str(e)}"}
+                        return {
+                            "status": "error",
+                            "message": f"Ошибка при выполнении поиска: {str(e)}",
+                        }
                 else:
                     logger.warning("web_search plugin not found, falling back to ReAct")
 
@@ -414,7 +445,9 @@ class AgentCore:
                         print(f"[Iterations: {response['iterations']}]")
                     if "memory_stats" in response:
                         stats = response["memory_stats"]
-                        print(f"[Memory: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}]")
+                        print(
+                            f"[Memory: TGS={stats['tgs']}, Hot={stats['hot']}, Cold={stats['cold']}]"
+                        )
                     if "watchdog_icons" in response:
                         print(f"[Watchdog: {response['watchdog_icons']}]")
                 elif response.get("status") == "interrupted":
@@ -511,8 +544,12 @@ class AgentCore:
         if self.watchdog:
             watchdog_status = self.watchdog.get_status()
             base_metrics["watchdog_llm"] = "OK" if watchdog_status["llm"]["available"] else "FAIL"
-            base_metrics["watchdog_plugins"] = "OK" if watchdog_status["plugins"]["available"] else "FAIL"
-            base_metrics["watchdog_memory"] = "OK" if watchdog_status["memory"]["available"] else "FAIL"
+            base_metrics["watchdog_plugins"] = (
+                "OK" if watchdog_status["plugins"]["available"] else "FAIL"
+            )
+            base_metrics["watchdog_memory"] = (
+                "OK" if watchdog_status["memory"]["available"] else "FAIL"
+            )
             base_metrics["watchdog_disk"] = "OK" if watchdog_status["disk"]["available"] else "FAIL"
         base_metrics.update(self.metrics.snapshot())
         return base_metrics

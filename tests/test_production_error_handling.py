@@ -106,8 +106,7 @@ class FakeLLM503:
             }
         return {
             "message": {
-                "content": "The search service is temporarily unavailable. "
-                "Please try again later."
+                "content": "The search service is temporarily unavailable. Please try again later."
             }
         }
 

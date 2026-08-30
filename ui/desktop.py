@@ -1,24 +1,31 @@
-import sys
 import asyncio
-from pathlib import Path
+import sys
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, 
-    QHBoxLayout, QTextEdit, QLineEdit, QPushButton, QLabel
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt
 from qasync import QEventLoop, asyncSlot
+
+from core.agent import AgentCore
 
 # Импортируем ваше готовое асинхронное ядро
 from core.config import Config
-from core.agent import AgentCore
+
 
 class VasilyGui(QMainWindow):
     def __init__(self):
         super().__init__()
         self.agent = None
         self.init_ui()
-        
+
         # Запускаем асинхронную инициализацию Василия прямо при старте окна
         asyncio.create_task(self.init_agent())
 
@@ -40,17 +47,19 @@ class VasilyGui(QMainWindow):
         # Окно истории чата (только для чтения)
         self.chat_area = QTextEdit()
         self.chat_area.setReadOnly(True)
-        self.chat_area.setStyleSheet("""
-            background-color: #1e1e1e; 
-            color: #ffffff; 
+        self.chat_area.setStyleSheet(
+            """
+            background-color: #1e1e1e;
+            color: #ffffff;
             font-family: 'Consolas', 'Courier New', monospace;
             font-size: 13px;
-        """)
+        """
+        )
         main_layout.addWidget(self.chat_area)
 
         # Нижняя панель: ввод текста и кнопка отправки
         input_layout = QHBoxLayout()
-        
+
         self.input_field = QLineEdit()
         self.input_field.setPlaceholderText("Введите запрос агенту или 'status'...")
         self.input_field.setEnabled(False)  # Блокируем, пока агент не инициализировался
@@ -70,10 +79,10 @@ class VasilyGui(QMainWindow):
         try:
             config = Config.load()
             config.validate()
-            
+
             self.agent = AgentCore(config)
             await self.agent.initialize()
-            
+
             # Агент готов — оживляем интерфейс
             self.status_label.setText("🟢 Василий готов к работе")
             self.status_label.setStyleSheet("font-weight: bold; color: #4caf50;")
@@ -103,14 +112,14 @@ class VasilyGui(QMainWindow):
         try:
             # Передаем запрос в ваше родное асинхронное ядро handle_request!
             response = await self.agent.handle_request({"text": text})
-            
+
             if response.get("status") == "success":
                 answer = response.get("message", "Нет ответа")
             else:
                 answer = f"[Ошибка] {response.get('message', 'Неизвестный сбой ядра')}"
-            
+
             self.append_chat("Василий", answer)
-            
+
         except Exception as e:
             self.append_chat("Система", f"Произошла критическая ошибка: {e}")
         finally:
@@ -123,15 +132,16 @@ class VasilyGui(QMainWindow):
     def append_chat(self, author: str, message: str):
         """Удобное добавление текста в окно чата."""
         color = "#e1f5fe" if author == "Вы" else "#f1f8e9"
-        if author == "Система": color = "#ffcc80"
-        
+        if author == "Система":
+            color = "#ffcc80"
+
         formatted_text = f"<b style='color: {color};'>[{author}]:</b> {message}<br>"
         self.chat_area.append(formatted_text)
 
 
 def main():
     app = QApplication(sys.argv)
-    
+
     # Магия скрещивания: создаем асинхронный цикл для Qt через qasync
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
@@ -142,6 +152,7 @@ def main():
     # Запускаем бесконечный цикл приложения
     with loop:
         loop.run_forever()
+
 
 if __name__ == "__main__":
     main()

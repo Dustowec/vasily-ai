@@ -211,9 +211,7 @@ class ReActLoop:
                     args = {}
 
                 # T3-017.5: deduplication of identical calls
-                signature = (
-                    f"{tool_name}:" f"{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
-                )
+                signature = f"{tool_name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
                 identical_count = call_signatures.get(signature, 0)
                 call_signatures[signature] = identical_count + 1
 
