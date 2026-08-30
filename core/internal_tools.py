@@ -24,14 +24,36 @@ class RecallMemoryTool(BaseTool):
         "Immediately provide a final answer stating that you do not have this information in memory, "
         "or ask the user to provide the details."
     )
-    version = "1.0.0"
+    version = "1.2.0"
 
-    def __init__(self, memory_manager=None):
+    def __init__(self, memory_manager=None, llm_client=None):
         self.memory = memory_manager
+        self.llm_client = llm_client
+
+    async def _expand_query(self, query: str) -> str:
+        """Использует LLM для расширения запроса синонимами (0 МБ VRAM overhead)."""
+        if self.llm_client is None:
+            return query
+
+        prompt = (
+            "Ты — система улучшения поисковых запросов для базы знаний. "
+            "Пользователь ищет факт в памяти. Твоя задача: вернуть исходный запрос и 3-5 ключевых слов-синонимов или связанных понятий на русском языке, разделенных пробелом. "
+            "Никаких объяснений, никаких кавычек, только слова через пробел. "
+            f"Запрос: '{query}'"
+        )
+        try:
+            response = await self.llm_client.generate(prompt, temperature=0.1)
+            expanded = response.get("response", "").strip()
+            if expanded and len(expanded) < 150:
+                return f"{query} {expanded}"
+        except Exception:
+            pass
+        
+        return query
 
     async def _execute(self, query: str = "", limit: int = 3, **kwargs) -> dict[str, Any]:
-        """Search for facts in memory by keywords."""
-        if not self.memory:
+        """Поиск фактов в памяти с предварительным расширением запроса через LLM."""
+        if self.memory is None:
             return make_error(
                 "backend_unavailable",
                 "Memory manager not initialized",
@@ -45,30 +67,30 @@ class RecallMemoryTool(BaseTool):
                 "error": "Query is required. Please provide keywords to search for.",
             }
 
-        # Validate and clamp limit
         try:
             limit = int(limit)
         except (TypeError, ValueError):
             limit = 3
         limit = min(max(limit, 1), 10)
 
-        result = await self.memory.recall_memory(query)
+        expanded_query = await self._expand_query(query)
+        result = await self.memory.recall_memory(expanded_query)
 
-        # Limit results and preserve the same structure
         if result.get("found") and result.get("facts"):
             result["facts"] = result["facts"][:limit]
             result["total_found"] = len(result["facts"])
+            result["expanded_query_used"] = expanded_query
         else:
             result["total_found"] = 0
+            result["expanded_query_used"] = expanded_query
 
         return result
 
     def _get_parameters(self) -> dict[str, Any]:
-        """Get parameter schema."""
         return {
             "query": {
                 "type": "string",
-                "description": "Keywords to search for in memory (e.g., 'user name', 'project idea', 'previous conversation about architecture')",
+                "description": "Keywords to search for in memory (e.g., 'имя главного героя', 'предпочтения пользователя')",
                 "required": True,
             },
             "limit": {
@@ -89,14 +111,14 @@ class RememberFactTool(BaseTool):
         "Examples: 'Запомни: моего кота зовут Барсик', 'Save this: I prefer Python'. "
         "CRITICAL: Do NOT use for writing files. Use write_file for that."
     )
-    version = "1.0.0"
+    version = "1.1.0"  # Обновлено: добавлена реальная защита от дубликатов
 
     def __init__(self, memory_manager=None):
         self.memory = memory_manager
 
     async def _execute(self, fact: str = "", **kwargs) -> dict[str, Any]:
-        """Save fact to HOT memory immediately."""
-        if not self.memory:
+        """Save fact to HOT memory immediately with duplicate protection."""
+        if self.memory is None:
             return make_error(
                 "backend_unavailable",
                 "Memory manager not initialized",
@@ -109,16 +131,36 @@ class RememberFactTool(BaseTool):
                 "message": "Fact is required. Please provide what you want me to remember.",
             }
 
-        # Generate unique key with timestamp
+        clean_fact = fact.strip()
+
+        # === АРХИТЕКТУРНАЯ ЗАЩИТА ОТ ДУБЛИКАТОВ ===
+        # Поскольку recall_memory теперь использует LLM expansion, он находит семантически похожие факты.
+        # Мы делаем быстрый поиск и проверяем, не является ли найденный факт дубликатом по длине.
+        search_query = clean_fact[:50]
+        check = await self.memory.recall_memory(search_query)
+        
+        if check.get("found") and check.get("facts"):
+            existing = check["facts"][0]
+            existing_text = str(existing.get("value") or existing.get("summary", ""))
+            
+            # Если длины текстов сопоставимы (разница не более чем в 2.5 раза), считаем это дубликатом
+            if len(existing_text) > 10 and len(clean_fact) > 10:
+                ratio = min(len(existing_text), len(clean_fact)) / max(len(existing_text), len(clean_fact))
+                if ratio > 0.4:  # Тексты примерно одного порядка длины
+                    return {
+                        "status": "already_exists",
+                        "message": f"ВНИМАНИЕ: Этот факт уже сохранён в памяти (ключ: {existing['key']}). НЕ вызывай этот инструмент повторно. Просто ответь пользователю, что ты это уже знаешь, и не создавай дубликат.",
+                        "existing_fact": existing_text
+                    }
+        # ==========================================
+
+        # Если дубликата нет, сохраняем как обычно
         key = f"user_fact:{int(time.time())}"
+        await self.memory.remember(key, clean_fact, complex_query=len(clean_fact) > 100)
 
-        # Save to memory with high score
-        await self.memory.remember(key, fact.strip(), complex_query=len(fact) > 100)
-
-        return {"status": "success", "message": f"Факт сохранён: {fact[:100]}", "key": key}
+        return {"status": "success", "message": f"Факт сохранён: {clean_fact[:100]}", "key": key}
 
     def _get_parameters(self) -> dict[str, Any]:
-        """Get parameter schema."""
         return {
             "fact": {
                 "type": "string",
@@ -152,7 +194,6 @@ class ListFilesTool(BaseTool):
         if not target_dir.is_absolute():
             target_dir = self.base_dir / target_dir
 
-        # Безопасность: не даём вылезти за пределы workspace/reading
         try:
             target_dir.resolve().relative_to(self.base_dir.resolve())
         except ValueError:
@@ -187,7 +228,6 @@ class ListFilesTool(BaseTool):
                     }
                 )
 
-        # Сортируем по имени
         files.sort(key=lambda x: x["name"])
 
         return {
@@ -198,7 +238,6 @@ class ListFilesTool(BaseTool):
         }
 
     def _get_parameters(self) -> dict[str, Any]:
-        """Get parameter schema."""
         return {
             "path": {
                 "type": "string",

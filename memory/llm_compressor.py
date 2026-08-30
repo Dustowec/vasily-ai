@@ -1,8 +1,8 @@
 """LLM-powered memory compressor for Gradient Cascade Memory."""
-
 from typing import Any
-
+import re
 from core.logging_config import get_logger
+from integrations.ollama_client import OllamaClient
 
 logger = get_logger("core", "LLMCompressor")
 
@@ -22,18 +22,28 @@ class LLMCompressor:
         if len(text) < 100:
             return text
 
+        # Явный запрет на размышления в промпте
         prompt = (
-            "Summarize the following text in 2-3 sentences, "
-            "preserving key facts and context:\n\n"
-            f"{text[:2000]}"
+            "Сделай краткое резюме следующего текста в 2-3 предложениях, сохранив ключевые факты и контекст. "
+            "ВАЖНО: Верни ТОЛЬКО итоговый текст резюме. НЕ используй теги <thinking>, НЕ пиши ход своих размышлений. "
+            "Начинай ответ сразу с сути.\n"
+            f"Текст для сжатия:\n{text[:2000]}"
         )
-
         try:
             response = await self.llm.generate(prompt)
-            summary = response.get("response", "").strip()
+            raw_summary = response.get("response", "").strip()
+
+            # Дополнительная защита: вырезаем <thinking>, если модель всё же его добавила
+            _, summary = OllamaClient.extract_thinking_and_answer(raw_summary)
+
             if summary:
-                logger.info("Memory compressed", original_len=len(text), summary_len=len(summary))
+                logger.info(
+                    "Memory compressed", 
+                    original_len=len(text), 
+                    summary_len=len(summary)
+                )
                 return summary
+            
             return text[:300]
         except Exception as e:
             logger.error("Compression failed", error=str(e))
