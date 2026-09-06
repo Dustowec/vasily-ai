@@ -110,29 +110,6 @@ async def test_failing_compressor_keeps_entry(memory_paths):
     assert "k1" not in manager._cold
 
 
-async def test_compress_cycle_runs_through_scheduler(memory_paths):
-    """ADR-005: compression is driven by PeriodicScheduler."""
-    from core.scheduler import PeriodicScheduler
-    from memory.manager import GradientMemory
-
-    manager = GradientMemory(data_dir=str(memory_paths))
-    await manager.remember("k", "data")
-    manager._hot["k"]["score"] = 3.0
-
-    compressor = FakeCompressor()
-    scheduler = PeriodicScheduler()
-    scheduler.register("compress", 0.05, lambda: manager.compress_cycle(compressor))
-    await scheduler.start()
-
-    for _ in range(50):
-        if compressor.calls:
-            break
-        await asyncio.sleep(0.05)
-
-    await scheduler.stop()
-    assert compressor.calls == ["data"]
-
-
 async def test_build_context_includes_hot_and_cold(memory_paths):
     """build_context should include both hot and cold entries."""
     from memory.manager import GradientMemory

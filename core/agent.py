@@ -3,6 +3,9 @@ ADR-011: Sliding Window (5 pairs FIFO) instead of dialogue:last.
 UTF-8 Hardening: Fixed double-encoding in dialogue compression.
 Stage 5b: num_predict passthrough, deep-copied dialogue history,
 search results stored to dialogue, session_close on shutdown.
+Stage 8: PeriodicScheduler removed. Compression is now lazy: after
+every request a cheap scan checks for cooled HOT entries, and if any
+exist, compression runs as a BACKGROUND task (never blocks the reply).
 """
 
 import asyncio
@@ -20,15 +23,12 @@ from core.logging_config import get_logger, setup_logging
 from core.metrics import MetricsCollector
 from core.plugin_registry import PluginRegistry
 from core.react_loop import ReActLoop
-from core.scheduler import PeriodicScheduler
 from core.service_launcher import ensure_ollama_running
 from core.watchdog import Watchdog
 from integrations.ollama_client import LLMUnavailableError, OllamaClient
 from memory.manager import GradientMemory
 
 logger = get_logger("core", "AgentCore")
-
-COMPRESSION_INTERVAL_SECONDS = 6 * 3600
 
 
 class AgentCore:
@@ -46,12 +46,12 @@ class AgentCore:
         self.llm_client: OllamaClient | None = None
         self.react_loop: ReActLoop | None = None
         self._active_request_task: asyncio.Task | None = None
-        self.scheduler: PeriodicScheduler | None = None
         self._session_requests = 0
         self.watchdog: Watchdog | None = None
         self._dialogue_window: list[dict] = []
         self._dialogue_buffer: list[dict] = []
         self._llm_compressor = None
+        self._compression_task: asyncio.Task | None = None
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -309,6 +309,8 @@ class AgentCore:
 
             await self._store_dialogue(user_text, result)
             await self.memory.decay(self._session_requests)
+            # Stage 8: lazy compression trigger (replaces PeriodicScheduler)
+            self._maybe_compress_memory()
 
             status = result.get("status")
             self.metrics.record_request(
@@ -348,6 +350,40 @@ class AgentCore:
             self._errors_count += 1
             logger.error("Request failed", error=str(e))
             return {"status": "error", "message": str(e)}
+
+    def _maybe_compress_memory(self) -> None:
+        """Kick off background HOT→COLD compression when cooled entries exist.
+
+        Stage 8: replaces the former PeriodicScheduler (blind 6-hour timer).
+        The check itself is a cheap sync dict scan on every request; the
+        expensive LLM summarization runs as a BACKGROUND task, so the user's
+        request latency is never affected by compression.
+        """
+        if self._compression_task and not self._compression_task.done():
+            return  # a compression run is already in flight
+        try:
+            if not self.memory.has_compression_candidates():
+                return
+        except Exception as e:
+            logger.error("Compression candidate check failed", error=str(e))
+            return
+        self._compression_task = asyncio.create_task(self._run_compression())
+        logger.info("Background memory compression started")
+
+    async def _run_compression(self) -> None:
+        """Background HOT→COLD compression worker (LLM calls live here)."""
+        try:
+            from memory.llm_compressor import LLMCompressor
+
+            if self._llm_compressor is None:
+                self._llm_compressor = LLMCompressor(self.llm_client)
+            compressed = await self.memory.compress_cycle(self._llm_compressor.compress)
+            if compressed:
+                logger.info("Background memory compression done", compressed=compressed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Background memory compression failed", error=str(e))
 
     async def _store_dialogue(self, user_text: str, result: dict[str, Any]) -> None:
         """Store dialogue turn in sliding window AND buffer for compression (ADR-011 fix)."""
@@ -485,20 +521,7 @@ class AgentCore:
         """Main agent loop with interactive CLI."""
         self.running = True
         logger.info("Agent started", plugins=len(self.plugin_registry))
-
-        from memory.llm_compressor import LLMCompressor
-
-        llm_compressor = LLMCompressor(self.llm_client)
-
-        self.scheduler = PeriodicScheduler()
-        self.scheduler.register(
-            "memory_compression",
-            COMPRESSION_INTERVAL_SECONDS,
-            lambda: self.memory.compress_cycle(llm_compressor.compress),
-        )
-
-        await self.scheduler.start()
-        logger.info("LLM-powered memory compression enabled (internal scheduler)")
+        logger.info("Lazy memory compression enabled (per-request check, background run)")
 
         if self.config.watchdog_enabled:
             self.watchdog = Watchdog(
@@ -527,9 +550,9 @@ class AgentCore:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
 
-        # Stage 5b: session-close decay was never called anywhere; it belongs
-        # here (end of session). NOTE: if UI also calls session_close(),
-        # tell the reviewer — entries would cool down twice.
+        # Stage 5b: session-close decay belongs here (end of session).
+        # NOTE: if the UI also calls session_close(), tell the reviewer —
+        # entries would cool down twice.
         try:
             await self.memory.session_close()
         except Exception as e:
@@ -542,10 +565,17 @@ class AgentCore:
             )
             await self._compress_and_store_dialogue(force=True)
 
+        # Stage 8: let an in-flight background compression finish while
+        # the LLM client is still open.
+        if self._compression_task and not self._compression_task.done():
+            logger.info("Waiting for background memory compression to finish")
+            try:
+                await self._compression_task
+            except Exception as e:
+                logger.error("Background compression failed on shutdown", error=str(e))
+
         if self.watchdog:
             await self.watchdog.stop()
-        if self.scheduler:
-            await self.scheduler.stop()
         if self.llm_client:
             await self.llm_client.close()
         metrics = self.get_metrics()

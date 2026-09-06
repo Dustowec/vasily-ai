@@ -624,6 +624,20 @@ class GradientMemory:
         finally:
             self._release_write()
 
+    def has_compression_candidates(self) -> bool:
+        """Cheap sync scan: are there HOT entries ready for HOT→COLD compression?
+
+        Sync and lock-free on purpose: it contains no awaits, so it is atomic
+        inside the event loop (see locking model in the class docstring).
+        Used by AgentCore's lazy compression trigger.
+        """
+        return any(
+            COMPRESSION_RANGE_HIGH <= entry.get("score", 0) <= COMPRESSION_RANGE_LOW
+            and not entry.get("protected", False)
+            and not entry.get("compressing", False)
+            for entry in self._hot.values()
+        )
+
     async def recall_memory(self, query: str) -> dict:
         """Search for facts in HOT and COLD zones by keywords.
         TGS is excluded to avoid duplication with system prompt.
