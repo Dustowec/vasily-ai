@@ -11,6 +11,10 @@ from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from core.logging_config import get_logger
+
+logger = get_logger("core", "Config")
+
 DEFAULT_CONFIG_FILE = "vasily_config.json"
 
 
@@ -19,8 +23,8 @@ class Config:
     """Agent configuration with env + file + default resolution."""
 
     # Paths
-    log_dir: str = "logs"
-    data_dir: str = "data"
+    log_dir: Path = Path("logs")
+    data_dir: Path = Path("data")
     plugins_dir: str = "plugins"
 
     # Logging
@@ -66,6 +70,9 @@ class Config:
     llm_max_retries: int = 2
     llm_num_ctx: int = 8192  # ADR-011: было 32768
     llm_safety_margin: int = 4096  # ADR-011: было 1000
+    # Hard cap on LLM response length. Must fit into llm_safety_margin.
+    # Covers max_thinking_tokens (2000) + room for the actual answer.
+    llm_num_predict: int = 3072
     llm_retry_delay_base: float = 1.0
     repeat_penalty: float = 1.1  # ADR-011: новый параметр
     max_thinking_tokens: int = 2000  # ADR-011: новый параметр
@@ -76,6 +83,13 @@ class Config:
     max_react_iterations: int = 7  # ADR-011: было 6
     max_tool_calls_per_tool: int = 3
     log_preview_length: int = 100
+
+    # Tool execution guards (guard against runaway plugins / context flooding)
+    plugin_timeout: float = 60.0
+    max_tool_content_chars: int = 4000
+
+    # Memory tools
+    enable_query_expansion: bool = True
 
     # External backends (plugins)
     searxng_url: str = "http://localhost:8080/search"
@@ -104,15 +118,34 @@ class Config:
                 with open(path, encoding="utf-8") as f:
                     file_data = json.load(f)
                 if isinstance(file_data, dict):
+                    known = {f.name for f in fields(cls)}
+                    unknown = set(file_data) - known
+                    if unknown:
+                        logger.warning(
+                            "Unknown keys in config file (typo? key ignored)",
+                            keys=sorted(unknown),
+                            config_file=str(path),
+                        )
                     data.update(file_data)
-            except (OSError, json.JSONDecodeError):
-                pass
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(
+                    "Failed to read config file, using defaults + env only",
+                    config_file=str(path),
+                    error=str(e),
+                )
 
         for f in fields(cls):
             env_key = f"VASILY_{f.name.upper()}"
             env_val = os.environ.get(env_key)
             if env_val is not None:
-                data[f.name] = cls._cast(env_val, f.type)
+                try:
+                    data[f.name] = cls._cast(env_val, f.type)
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        "Invalid env value ignored, using default",
+                        env_key=env_key,
+                        error=str(e),
+                    )
 
         data["log_dir"] = Path(data.get("log_dir", "logs"))
         data["data_dir"] = Path(data.get("data_dir", "data"))
@@ -128,6 +161,14 @@ class Config:
             return int(value)
         if name == "float":
             return float(value)
+        if name.startswith("list"):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as err:
+                raise ValueError(f"not a valid JSON list: {value[:50]!r}") from err
+            if not isinstance(parsed, list):
+                raise ValueError(f"not a JSON list: {value[:50]!r}")
+            return parsed
         return value
 
     def validate(self) -> None:
@@ -142,6 +183,15 @@ class Config:
             raise ValueError("llm_num_ctx must be positive")
         if self.llm_safety_margin < 0:
             raise ValueError("llm_safety_margin must be >= 0")
+        if self.llm_num_predict <= 0:
+            raise ValueError("llm_num_predict must be positive")
+        if self.llm_num_predict > self.llm_safety_margin:
+            raise ValueError(
+                "llm_num_predict must be <= llm_safety_margin: "
+                "the response must fit into the reserved context margin"
+            )
+        if self.max_thinking_tokens <= 0:
+            raise ValueError("max_thinking_tokens must be positive")
         if self.llm_retry_delay_base < 0:
             raise ValueError("llm_retry_delay_base must be >= 0")
         if self.crash_report_lines <= 0:
@@ -154,3 +204,7 @@ class Config:
             raise ValueError("max_tool_calls_per_tool must be positive")
         if self.log_preview_length <= 0:
             raise ValueError("log_preview_length must be positive")
+        if self.plugin_timeout <= 0:
+            raise ValueError("plugin_timeout must be positive")
+        if self.max_tool_content_chars <= 0:
+            raise ValueError("max_tool_content_chars must be positive")

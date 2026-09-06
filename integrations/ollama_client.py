@@ -6,6 +6,8 @@ Requirements (T3-015):
 - Logging: structlog with request_id (ADR-004)
 - Resilience: 2 retries, then crash report and LLMUnavailableError
 - Context window: num_ctx configurable, auto-injected into options
+- num_predict: hard cap on response length, must fit into safety_margin
+- Token drift: compares real prompt_eval_count with TokenManager estimate
 - P2-1: retry delay base configurable via Config
 """
 
@@ -21,13 +23,21 @@ from core.logging_config import get_logger
 
 logger = get_logger("llm", "OllamaClient")
 
+# Defaults kept IN SYNC with core/config.py defaults (ADR-011).
+# If a caller does not pass explicit values, these must not contradict Config.
 DEFAULT_URL = "http://localhost:11434"
 DEFAULT_MODEL = "vasily-qwen"
 DEFAULT_TEMPERATURE = 0.1
-DEFAULT_TIMEOUT = 30.0
-DEFAULT_NUM_CTX = 32768
+DEFAULT_TIMEOUT = 120.0
+DEFAULT_NUM_CTX = 8192
+DEFAULT_NUM_PREDICT = 3072
 DEFAULT_RETRY_DELAY_BASE = 1.0
 MAX_RETRIES = 2
+
+# Warn when Ollama's real prompt token count differs from our estimate
+# by more than this fraction. NOTE: tools schemas are not counted by the
+# estimate, so with many/large tools a systematic positive drift is expected.
+TOKEN_DRIFT_WARNING_THRESHOLD = 0.15
 
 
 class LLMUnavailableError(Exception):
@@ -47,8 +57,10 @@ class OllamaClient:
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = MAX_RETRIES,
         num_ctx: int = DEFAULT_NUM_CTX,
+        num_predict: int = DEFAULT_NUM_PREDICT,
         retry_delay_base: float = DEFAULT_RETRY_DELAY_BASE,
         log_dir: str = "logs",
+        token_manager: Any | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -56,7 +68,10 @@ class OllamaClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
         self.num_ctx = num_ctx
+        self.num_predict = num_predict
         self.retry_delay_base = retry_delay_base
+        # Optional: used for token estimate calibration (set by ReActLoop)
+        self.token_manager = token_manager
         self._session: aiohttp.ClientSession | None = None
         self._crash_reporter = CrashReporter(Path(log_dir))
 
@@ -65,6 +80,7 @@ class OllamaClient:
         return {
             "temperature": self.temperature,
             "num_ctx": self.num_ctx,
+            "num_predict": self.num_predict,
             **kwargs,
         }
 
@@ -94,7 +110,7 @@ class OllamaClient:
 
     async def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
@@ -107,7 +123,9 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
-        return await self._request_with_retries("/api/chat", payload)
+        result = await self._request_with_retries("/api/chat", payload)
+        self._check_token_drift(messages, result)
+        return result
 
     async def generate(self, prompt: str, **kwargs) -> dict[str, Any]:
         """Simple text generation."""
@@ -118,6 +136,32 @@ class OllamaClient:
             "options": self._build_options(**kwargs),
         }
         return await self._request_with_retries("/api/generate", payload)
+
+    def _check_token_drift(self, messages: list[dict[str, Any]], result: dict[str, Any]) -> None:
+        """Compare Ollama's real prompt token count with TokenManager estimate.
+
+        Calibration feedback loop for T3-018: after a week of logs you will
+        know if the 2.5/4.0 chars-per-token coefficients are accurate.
+        """
+        if self.token_manager is None:
+            return
+        actual = result.get("prompt_eval_count")
+        if not actual:
+            return
+        try:
+            estimated = self.token_manager.count_messages_tokens(messages)
+        except Exception:
+            return
+        if not estimated:
+            return
+        drift = (actual - estimated) / actual
+        if abs(drift) > TOKEN_DRIFT_WARNING_THRESHOLD:
+            logger.warning(
+                "Token estimate drift detected",
+                estimated=estimated,
+                actual=actual,
+                drift=f"{drift:+.0%}",
+            )
 
     @staticmethod
     def extract_thinking_and_answer(content: str) -> tuple[str, str]:
@@ -135,6 +179,14 @@ class OllamaClient:
             # Удаляем блок из оригинального контента, чтобы получить чистый ответ
             answer = content[: match.start()] + content[match.end() :]
             return thinking, answer.strip()
+
+        # Незакрытый <think> (генерация оборвалась на размышлении):
+        # всё после открывающего тега — размышление, ответа нет.
+        open_match = re.search(r"<think>", content, re.IGNORECASE)
+        if open_match:
+            thinking = content[open_match.end() :].strip()
+            answer = content[: open_match.start()].strip()
+            return thinking, answer
 
         return "", content.strip()
 
@@ -171,6 +223,8 @@ class OllamaClient:
                     )
                     last_error = f"HTTP {response.status}: {error_text[:200]}"
             except TimeoutError:
+                # Python 3.10: asyncio.TimeoutError and builtin TimeoutError
+                # are DIFFERENT classes; 3.11+ they are the same. Catch both.
                 logger.warning(
                     "LLM request timeout",
                     endpoint=endpoint,

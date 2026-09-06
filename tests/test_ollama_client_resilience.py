@@ -77,7 +77,8 @@ def test_build_options_defaults_and_override(tmp_path):
     client = OllamaClient(log_dir=str(tmp_path))
     options = client._build_options()
     assert options["temperature"] == 0.1
-    assert options["num_ctx"] == 32768
+    assert options["num_ctx"] == 8192
+    assert options["num_predict"] == 3072
 
     overridden = client._build_options(num_ctx=1024, temperature=0.5)
     assert overridden["num_ctx"] == 1024
