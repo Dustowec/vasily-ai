@@ -2,7 +2,8 @@
 Mandatory requirements implemented:
 - R1: Plugin errors caught and returned to LLM history, cycle continues.
 - R2: Tool call limit (config.max_tool_calls_per_tool), force stop on exceed.
-- R3: KeyboardInterrupt/CancelledError handled, returns partial progress.
+- R3: KeyboardInterrupt/CancelledError handled, returns partial progress
+      (both for LLM calls AND plugin execution — stage 4).
 - R4: Step logging across core/llm/interaction journals with request_id.
 - Token management: pair-safe trimming, script-aware tokens (T3-018).
 - Golden Prompts: curated system prompts per task type (T3-020).
@@ -12,7 +13,15 @@ session timeout, graceful LLM-unavailable result.
 - T3-017.5: deduplication of identical calls with hard limit.
 - P2-1: limits and preview length taken from Config.
 - P3-3: strict TypedDict for ReActResult, ReActStep, TokenUsage.
-- ADR-011: Parsing  tags, Sliding Window support.
+- ADR-011: Parsing thinking tags, Sliding Window support.
+Stage 4:
+- per-plugin timeout (config.plugin_timeout) via asyncio.wait_for;
+- R3 extended to plugin execution (partial progress on interrupt);
+- tool results capped at config.max_tool_content_chars with an
+  informative truncation marker;
+- token_usage recomputed on success (was stale, pre-LLM-call);
+- LLM-provided args filtered against plugin schemas;
+- token manager shared with OllamaClient (drift calibration, 5a).
 """
 
 import asyncio
@@ -49,9 +58,18 @@ class ReActLoop:
         self.max_tool_calls = config.max_tool_calls_per_tool
         self.preview_length = config.log_preview_length
         self.tools = self._build_tools()
+        # Stage 4: declared parameter names per tool, for args filtering
+        self._tool_param_names: dict[str, set[str]] = {
+            schema["name"]: set(schema.get("parameters", {}).keys())
+            for schema in self.plugin_registry.get_tools_schema()
+        }
         self.token_manager = TokenManager(config.llm_num_ctx, config.llm_safety_margin)
+        # Stage 4: share the token manager with the LLM client so it can
+        # compare Ollama's real prompt_eval_count with our estimates
+        # (drift calibration added in stage 5a).
+        if hasattr(self.llm, "token_manager"):
+            self.llm.token_manager = self.token_manager
         self.prompts_library = GoldenPromptsLibrary()
-        self._history = []
 
     def _build_tools(self) -> list[dict[str, Any]]:
         """Convert plugin schemas to Ollama tool format."""
@@ -175,12 +193,12 @@ class ReActLoop:
             content = message.get("content", "")
 
             # ADR-011: Extract thinking block.
-            # We keep full content (with ) in history for LLM context,
-            # but use clean_answer for the final result returned to user/memory.
+            # We keep full content (with thinking tags) in history for LLM
+            # context, but use clean_answer for the final result returned
+            # to user/memory.
             _, clean_answer = OllamaClient.extract_thinking_and_answer(content)
 
             # P1-4: keep tool_calls in history so the model tracks its actions
-            # ADR-011: Keep full content (with ) in history
             assistant_message = {"role": "assistant", "content": content}
             if tool_calls:
                 assistant_message["tool_calls"] = tool_calls
@@ -193,7 +211,9 @@ class ReActLoop:
                     answer=clean_answer,  # ADR-011: Return clean answer
                     iterations=iteration + 1,
                     steps=steps,
-                    token_usage=usage,
+                    # Stage 4: recompute — messages grew since `usage`
+                    # was taken (assistant reply was not yet included).
+                    token_usage=self.token_manager.get_usage_report(messages),
                 )
 
             for tool_call in tool_calls:
@@ -210,8 +230,22 @@ class ReActLoop:
                 if not isinstance(args, dict):
                     args = {}
 
+                # Stage 4: filter args not declared in the plugin schema —
+                # protects against the LLM passing arbitrary kwargs.
+                # Log-only: the tool simply runs with the valid subset.
+                allowed = self._tool_param_names.get(tool_name)
+                if allowed is not None:
+                    unknown = set(args) - allowed
+                    if unknown:
+                        interaction_logger.warning(
+                            "Unknown args filtered",
+                            tool=tool_name,
+                            unknown=sorted(str(k) for k in unknown),
+                        )
+                        args = {k: v for k, v in args.items() if k in allowed}
+
                 # T3-017.5: deduplication of identical calls
-                signature = f"{tool_name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+                signature = f"{tool_name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
                 identical_count = call_signatures.get(signature, 0)
                 call_signatures[signature] = identical_count + 1
 
@@ -243,6 +277,15 @@ class ReActLoop:
                                 ),
                             }
                         )
+                        # R4 consistency: blocked calls are logged as steps too
+                        steps.append(
+                            ReActStep(
+                                iteration=iteration + 1,
+                                tool=tool_name,
+                                args=args,
+                                result_preview="limit exceeded",
+                            )
+                        )
                         continue
 
                     tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
@@ -253,12 +296,16 @@ class ReActLoop:
                     )
 
                     # R1: catch plugin errors, feed back to LLM
+                    # Stage 4: per-plugin timeout + R3 interrupt handling
                     try:
                         plugin = self.plugin_registry.get(tool_name)
                         if plugin is None:
                             raise ValueError(f"Plugin not found: {tool_name}")
 
-                        result = await plugin.execute(**args)
+                        result = await asyncio.wait_for(
+                            plugin.execute(**args),
+                            timeout=self.config.plugin_timeout,
+                        )
 
                         # P1-3: block mock data outside dev_mode
                         if (
@@ -279,12 +326,49 @@ class ReActLoop:
                             )
                             interaction_logger.warning("Mock result blocked", tool=tool_name)
                         else:
-                            tool_content = json.dumps(result, ensure_ascii=False)
+                            tool_content = json.dumps(result, ensure_ascii=False, default=str)
+                            # Stage 4: cap huge results — with a small num_ctx
+                            # a single fat tool result can flood the context.
+                            if len(tool_content) > self.config.max_tool_content_chars:
+                                total_len = len(tool_content)
+                                tool_content = tool_content[
+                                    : self.config.max_tool_content_chars
+                                ] + (
+                                    f"... [TRUNCATED: {total_len} chars total. "
+                                    "Repeat with more specific arguments for "
+                                    "the relevant part.]"
+                                )
                             interaction_logger.info(
                                 "Plugin returned result",
                                 tool=tool_name,
                                 result_preview=tool_content[: self.preview_length],
                             )
+                    except TimeoutError:
+                        interaction_logger.warning("Plugin timed out", tool=tool_name)
+                        tool_content = json.dumps(
+                            {
+                                "error": (
+                                    f"Tool '{tool_name}' timed out after "
+                                    f"{self.config.plugin_timeout}s"
+                                )
+                            },
+                            ensure_ascii=False,
+                        )
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        # R3 (stage 4): interruption during plugin execution
+                        # returns the partial progress collected so far.
+                        core_logger.warning(
+                            "ReAct interrupted during plugin execution",
+                            iteration=iteration + 1,
+                            tool=tool_name,
+                        )
+                        return ReActResult(
+                            status="interrupted",
+                            answer=self._last_assistant_content(messages),
+                            iterations=iteration + 1,
+                            steps=steps,
+                            token_usage=self.token_manager.get_usage_report(messages),
+                        )
                     except Exception as e:
                         interaction_logger.error("Plugin failed", tool=tool_name, error=str(e))
                         tool_content = json.dumps({"error": str(e)}, ensure_ascii=False)
