@@ -1,4 +1,11 @@
-"""TokenManager pair-safe trimming tests (Coverage Hardening, file 3 of 3)."""
+"""TokenManager pair-safe trimming tests (Coverage Hardening, file 3 of 3).
+Updated for stage 1.1 semantics:
+- oldest groups are dropped FIRST (recency fix), the last group survives;
+- truncation keeps head+tail with an informative marker, so a truncated
+  payload is not exactly 200 chars anymore;
+- each message is truncated at most once, so loops always terminate
+  (regression guard below).
+"""
 
 import threading
 
@@ -24,7 +31,8 @@ def test_no_trim_under_limit():
     assert result == messages
 
 
-def test_trim_removes_middle_groups_keeping_first_and_last():
+def test_trim_drops_oldest_groups_keeping_last():
+    """Recency fix: oldest turns are dropped first, fresh context survives."""
     tm = TokenManager(max_tokens=200, safety_margin=0)
     filler = "x" * 400
     messages = [
@@ -39,9 +47,9 @@ def test_trim_removes_middle_groups_keeping_first_and_last():
     result = tm.trim_messages(messages)
     contents = [m["content"] for m in result]
     assert "system prompt" in contents
-    assert "first request" in contents
-    assert "last request" in contents
-    assert "middle request" not in contents
+    assert "first request" not in contents  # oldest — dropped first
+    assert "middle request" in contents  # fresh context survives
+    assert "last request" in contents  # current request always survives
 
 
 def test_system_message_always_preserved():
@@ -95,8 +103,9 @@ def test_single_turn_truncates_tool_payload():
     ]
     result = tm.trim_messages(messages)
     tool_msg = next(m for m in result if m["role"] == "tool")
-    assert len(tool_msg["content"]) <= 200
-    assert tool_msg["content"].endswith("...")
+    # Head+tail truncation: dramatically shorter, with an informative marker
+    assert len(tool_msg["content"]) < 4000
+    assert "[truncated, was" in tool_msg["content"]
     idx = result.index(tool_msg)
     assert result[idx - 1].get("tool_calls")
 
@@ -104,9 +113,13 @@ def test_single_turn_truncates_tool_payload():
 def test_truncation_terminates_when_budget_still_exceeded():
     """Regression guard: the truncation loop must always terminate.
 
-    Buggy version truncated to [:200] + '...' (203 chars) and never reached
-    the len <= 200 stop condition, looping forever. A daemon thread makes
-    the regression fail fast instead of hanging the test run.
+    Historical bug #1: truncation to [:200] + '...' (203 chars) never
+    reached the len <= 200 stop condition and looped forever.
+    Historical bug #2 (stage 1.0): head+tail truncation of an already
+    truncated payload did not shrink it further, hanging the loop again.
+    Fixed by one-cut-per-message guarantee (tracked by id()). When even
+    truncated content cannot fit the tiny budget, the manager logs an
+    error and returns the best-effort result.
     """
     tm = TokenManager(max_tokens=50, safety_margin=0)
     messages = [
@@ -126,7 +139,10 @@ def test_truncation_terminates_when_budget_still_exceeded():
 
     assert not thread.is_alive(), "trim_messages hung in truncation loop"
     tool_msg = next(m for m in holder["result"] if m["role"] == "tool")
-    assert len(tool_msg["content"]) <= 200
+    assert "[truncated, was" in tool_msg["content"]  # cut was applied
+    # The short user message stays intact (below USER_TRUNCATE_MIN_LEN)
+    user_msg = next(m for m in holder["result"] if m["role"] == "user")
+    assert user_msg["content"] == "fetch the document"
 
 
 def test_safety_margin_reduces_budget():
@@ -142,9 +158,10 @@ def test_safety_margin_reduces_budget():
     ]
     result = tm.trim_messages(messages)
     contents = [m["content"] for m in result]
-    assert "one" in contents
-    assert "three" in contents
+    assert "one" not in contents  # oldest pair dropped first
     assert "two" not in contents
+    assert "three" in contents  # the most recent pair survives
+    assert "end" in contents
 
 
 def test_estimate_tokens_cyrillic_heavier_than_latin():
