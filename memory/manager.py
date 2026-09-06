@@ -1,8 +1,24 @@
-"""Gradient Cascade Memory — новая архитектура памяти Vasily AI."""
+"""Gradient Cascade Memory — новая архитектура памяти Vasily AI.
+Stage 2 fixes (stability):
+- recall() now uses the WRITE lock (it mutates zones and saves to disk;
+  running it under the read semaphore was a race condition);
+- compress_cycle() is three-phase: LLM calls happen WITHOUT holding the
+  write lock, so remember/recall keep working during compression;
+- stale "compressing" flags are stripped on load (crash self-healing);
+- _check_promote_to_tgs_unlocked() also saves the source zone (no more
+  duplicated entries between files until the next save);
+- recall_memory() takes the read lock and tokenizes the query with
+  re.findall (punctuation no longer breaks the search); same for
+  build_context();
+- remember() reinforcement is capped at 100.0 (was unbounded);
+- decay() increments _session_requests (it is the per-request tick);
+- dead constants removed; semantics of protected/shield documented.
+"""
 
 import asyncio
 import json
 import os
+import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +29,6 @@ from core.logging_config import get_logger
 logger = get_logger("core", "GradientMemory")
 
 TGS_THRESHOLD = 50.0
-HOT_MIN = 0.1
 COLD_MIN = -49.9
 DELETE_THRESHOLD = -50.0
 REGULAR_HEAT = 5.0
@@ -24,22 +39,41 @@ COMPRESSION_RANGE_HIGH = -4.0
 PROTECTED_HEAT_REQUIRED = 8.0
 DEFAULT_SIMPLE_SCORE = 25.0
 DEFAULT_COMPLEX_SCORE = 40.0
+SCORE_CEILING = 100.0
 LOCK_TIMEOUT = 2.0
+TEMP_SUFFIX = ".tmp"
+# Default zone file paths. Kept module-level so tests can monkeypatch
+# them; see _zone_path() for resolution rules.
 TGS_FILE = "data/tgs_memory.json"
 HOT_FILE = "data/tg_hot_memory.json"
 COLD_FILE = "data/tg_cold_memory.json"
-TEMP_SUFFIX = ".tmp"
+
+# Semantics of entry flags (stage 2: documented, behavior unchanged —
+# ADR-012 will redesign the cooling model):
+#   protected  — immune to periodic decay() (e.g. resurrected from COLD)
+#   shield     — immune to session_close() decay (e.g. TGS entries)
+#   compressing— transient marker set by compress_cycle phase 1; stripped
+#                on load, so a crash mid-compression cannot wedge an entry
 
 
 class GradientMemory:
-    """Градиентно-сессионная память с динамическим охлаждением."""
+    """Градиентно-сессионная память с динамическим охлаждением.
+
+    Locking model:
+    - Write operations (remember/forget/decay/session_close/compress_cycle/
+      recall-with-promotion) use the single write lock and are serialized.
+    - Read-only operations (recall_memory/build_context) take the read
+      semaphore. They contain NO awaits inside — in a single-threaded event
+      loop that makes them atomic. DO NOT add awaits to these methods
+      without revisiting the locking model.
+    """
 
     def __init__(self, data_dir: str = "data"):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.tgs_file = self.data_dir / "tgs_memory.json"
-        self.hot_file = self.data_dir / "tg_hot_memory.json"
-        self.cold_file = self.data_dir / "tg_cold_memory.json"
+        self.tgs_file = self._zone_path(TGS_FILE, "tgs_memory.json")
+        self.hot_file = self._zone_path(HOT_FILE, "tg_hot_memory.json")
+        self.cold_file = self._zone_path(COLD_FILE, "tg_cold_memory.json")
         self._read_lock = asyncio.Semaphore(5)
         self._write_lock = asyncio.Lock()
         self._session_requests = 0
@@ -48,6 +82,18 @@ class GradientMemory:
         self._hot: dict[str, dict] = {}
         self._cold: dict[str, dict] = {}
         self._load_all()
+
+    def _zone_path(self, configured: str, fallback_filename: str) -> Path:
+        """Resolve a zone file path.
+
+        An ABSOLUTE configured path (as produced by test monkeypatching)
+        is used as-is; a relative default is resolved against data_dir,
+        so a custom VASILY_DATA_DIR keeps working in production.
+        """
+        p = Path(configured)
+        if p.is_absolute():
+            return p
+        return self.data_dir / fallback_filename
 
     async def _acquire_read(self):
         try:
@@ -79,6 +125,12 @@ class GradientMemory:
         for key in list(self._cold.keys()):
             if key in self._tgs:
                 del self._cold[key]
+        # Self-healing: strip stale transient markers left by a crash
+        # in the middle of compress_cycle (otherwise such entries would
+        # be skipped by every future compression attempt).
+        for zone in (self._hot, self._cold, self._tgs):
+            for entry in zone.values():
+                entry.pop("compressing", None)
         logger.info(
             "GradientMemory loaded", tgs=len(self._tgs), hot=len(self._hot), cold=len(self._cold)
         )
@@ -134,7 +186,7 @@ class GradientMemory:
             }
             existing = self._find_entry_unlocked(key)
             if existing:
-                entry["score"] = existing.get("score", 0) + REINFORCE_HEAT
+                entry["score"] = min(existing.get("score", 0) + REINFORCE_HEAT, SCORE_CEILING)
                 entry["summary"] = existing.get("summary")
                 entry["created_at"] = existing.get("created_at", datetime.now().isoformat())
                 entry["is_cold"] = False
@@ -167,7 +219,12 @@ class GradientMemory:
             self._release_write()
 
     async def recall(self, key: str) -> Any | None:
-        await self._acquire_read()
+        """Recall a fact by exact key. Heats the entry; resurrects from COLD.
+
+        Uses the WRITE lock: resurrection mutates zones and saves to disk,
+        which is unsafe under the shared read semaphore (stage 2 fix).
+        """
+        await self._acquire_write()
         try:
             entry = self._find_entry_unlocked(key)
             if not entry:
@@ -184,7 +241,7 @@ class GradientMemory:
                 await self._save_zone("hot", self._hot)
                 logger.info("Recall: moved from COLD to HOT", key=key, score=entry["score"])
                 return entry.get("value")
-            entry["score"] = min(entry.get("score", 0) + REGULAR_HEAT, 100.0)
+            entry["score"] = min(entry.get("score", 0) + REGULAR_HEAT, SCORE_CEILING)
             entry["updated_at"] = datetime.now().isoformat()
             zone = self._get_zone_unlocked(key)
             if zone:
@@ -193,7 +250,7 @@ class GradientMemory:
                 await self._check_promote_to_tgs_unlocked(key)
             return entry.get("value")
         finally:
-            self._release_read()
+            self._release_write()
 
     def _find_entry_unlocked(self, key: str) -> dict | None:
         if key in self._tgs:
@@ -214,6 +271,13 @@ class GradientMemory:
         return None
 
     async def _check_promote_to_tgs_unlocked(self, key: str) -> None:
+        """Promote a hot entry to TGS when its score crosses the threshold.
+
+        Must be called under the WRITE lock. Saves BOTH the TGS zone and
+        the source zone: previously the source was left stale on disk,
+        so the entry temporarily existed in two files (loader deduplicated
+        it, but the files disagreed until the next source-zone save).
+        """
         entry = self._find_entry_unlocked(key)
         if not entry:
             return
@@ -223,76 +287,81 @@ class GradientMemory:
                 return
             if key in self._hot:
                 del self._hot[key]
+                source_zone = "hot"
             elif key in self._cold:
                 del self._cold[key]
+                source_zone = "cold"
             else:
                 return
             entry["shield"] = True
             self._tgs[key] = entry
             await self._save_zone("tgs", self._tgs)
+            await self._save_zone(source_zone, getattr(self, f"_{source_zone}"))
             logger.info("Promoted to TGS", key=key, score=score)
 
     async def decay(self, count_requests: int) -> None:
+        """Periodic cooling. Called once per user request by AgentCore
+        (count_requests = session request count, used to slow down decay
+        in long sessions). Also ticks the session request counter.
+        """
         await self._acquire_write()
         try:
+            self._session_requests = min(self._session_requests + 1, 1000)
             decay_actual = max(0.01, 0.1 - (count_requests * 0.0003))
-            changed = False
+            hot_changed = False
             for key, entry in list(self._hot.items()):
                 if entry.get("protected", False):
                     continue
                 new_score = entry.get("score", 0) - decay_actual
                 entry["score"] = max(new_score, DELETE_THRESHOLD)
                 entry["updated_at"] = datetime.now().isoformat()
-                changed = True
+                hot_changed = True
                 if entry["score"] <= DELETE_THRESHOLD:
                     del self._hot[key]
                     logger.info("Decay: deleted from HOT", key=key)
-                    changed = True
-            if changed:
+            if hot_changed:
                 await self._save_zone("hot", self._hot)
-            changed = False
+            cold_changed = False
             for key, entry in list(self._cold.items()):
                 new_score = entry.get("score", 0) - (decay_actual * 0.5)
                 entry["score"] = max(new_score, DELETE_THRESHOLD)
                 entry["updated_at"] = datetime.now().isoformat()
-                changed = True
+                cold_changed = True
                 if entry["score"] <= DELETE_THRESHOLD:
                     del self._cold[key]
                     logger.info("Decay: deleted from COLD", key=key)
-                    changed = True
-            if changed:
+            if cold_changed:
                 await self._save_zone("cold", self._cold)
         finally:
             self._release_write()
 
     async def session_close(self) -> None:
+        """End-of-session cooling: all non-shielded entries cool down a bit."""
         await self._acquire_write()
         try:
-            changed = False
+            hot_changed = False
             for key, entry in list(self._hot.items()):
                 if entry.get("shield", False):
                     continue
                 new_score = entry.get("score", 0) - DECAY_PER_SESSION_CLOSE
                 entry["score"] = max(new_score, DELETE_THRESHOLD)
                 entry["updated_at"] = datetime.now().isoformat()
-                changed = True
+                hot_changed = True
                 if entry["score"] <= DELETE_THRESHOLD:
                     del self._hot[key]
                     logger.info("Session close: deleted from HOT", key=key)
-                    changed = True
-            if changed:
+            if hot_changed:
                 await self._save_zone("hot", self._hot)
-            changed = False
+            cold_changed = False
             for key, entry in list(self._cold.items()):
                 new_score = entry.get("score", 0) - DECAY_PER_SESSION_CLOSE
                 entry["score"] = max(new_score, DELETE_THRESHOLD)
                 entry["updated_at"] = datetime.now().isoformat()
-                changed = True
+                cold_changed = True
                 if entry["score"] <= DELETE_THRESHOLD:
                     del self._cold[key]
                     logger.info("Session close: deleted from COLD", key=key)
-                    changed = True
-            if changed:
+            if cold_changed:
                 await self._save_zone("cold", self._cold)
             self._session_count += 1
             logger.info("Session close applied", session=self._session_count)
@@ -300,45 +369,76 @@ class GradientMemory:
             self._release_write()
 
     async def compress_cycle(self, compressor: Callable[[Any], Awaitable[str]]) -> int:
+        """Compress cooled HOT entries into COLD.
+
+        Three-phase design (stage 2 fix): the LLM call happens WITHOUT
+        holding the write lock, so remember/recall keep working while
+        compression runs. Phase 1 marks candidates with a transient
+        "compressing" flag; phase 3 re-checks each candidate (it may have
+        been heated, forgotten or replaced during the LLM call).
+        """
+        # Phase 1: pick and mark candidates (fast, under write lock)
         await self._acquire_write()
         try:
-            compressed = 0
+            candidates: list[tuple[str, dict]] = []
             for key, entry in list(self._hot.items()):
                 score = entry.get("score", 0)
                 if not (COMPRESSION_RANGE_HIGH <= score <= COMPRESSION_RANGE_LOW):
                     continue
-                if entry.get("protected", False):
-                    logger.debug("Compression skipped: protected", key=key)
+                if entry.get("protected", False) or entry.get("compressing", False):
                     continue
+                entry["compressing"] = True
+                candidates.append((key, dict(entry)))
+            if candidates:
+                await self._save_zone("hot", self._hot)
+        finally:
+            self._release_write()
 
-                existing_summary = entry.get("summary")
-                if existing_summary and not existing_summary.startswith("Compressed:"):
-                    summary = existing_summary
+        if not candidates:
+            return 0
+
+        # Phase 2: summarize candidates (slow, NO lock held)
+        summaries: dict[str, str | None] = {}
+        for key, entry in candidates:
+            existing_summary = entry.get("summary")
+            if existing_summary and not existing_summary.startswith("Compressed:"):
+                summaries[key] = existing_summary
+                continue
+            try:
+                value = entry.get("value")
+                summary_from_llm = await compressor(value)
+                if summary_from_llm and not summary_from_llm.startswith("Compressed:"):
+                    summaries[key] = summary_from_llm
                 else:
-                    try:
-                        value = entry.get("value")
-                        summary_from_llm = await compressor(value)
-                        if summary_from_llm and not summary_from_llm.startswith("Compressed:"):
-                            summary = summary_from_llm
-                        else:
-                            # Fallback: извлекаем из value в зависимости от формата
-                            if value is None:
-                                summary = ""
-                            elif isinstance(value, dict):
-                                if "summary" in value:
-                                    summary = value["summary"]
-                                elif "user" in value and "assistant" in value:
-                                    user = value.get("user", "")
-                                    assistant = value.get("assistant", "")
-                                    summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
-                                else:
-                                    summary = str(value)[:300]
-                            else:
-                                summary = str(value)[:300]
-                    except Exception as e:
-                        logger.error("Compression failed", key=key, error=str(e))
-                        continue
+                    summaries[key] = self._extract_fallback_summary(value)
+            except Exception as e:
+                logger.error("Compression failed", key=key, error=str(e))
+                summaries[key] = None
 
+        # Phase 3: apply results (under write lock), re-checking each entry
+        await self._acquire_write()
+        try:
+            compressed = 0
+            dirty_hot = False
+            dirty_cold = False
+            for key, summary in summaries.items():
+                live = self._hot.get(key)
+                # The entry must still be the one we marked in phase 1:
+                # if the flag is gone, it was replaced by a new remember().
+                if live is None or not live.get("compressing", False):
+                    continue
+                live.pop("compressing", None)
+                score = live.get("score", 0)
+                # The entry may have been heated during the LLM call —
+                # in that case it deserves to stay in HOT.
+                if not (COMPRESSION_RANGE_HIGH <= score <= COMPRESSION_RANGE_LOW) or live.get(
+                    "protected", False
+                ):
+                    dirty_hot = True
+                    continue
+                if summary is None:
+                    dirty_hot = True
+                    continue
                 cold_entry = {
                     "value": None,
                     "score": -5.0,
@@ -346,22 +446,43 @@ class GradientMemory:
                     "protected": False,
                     "shield": False,
                     "summary": summary or "Факты из диалога не извлечены.",
-                    "created_at": entry.get("created_at", datetime.now().isoformat()),
+                    "created_at": live.get("created_at", datetime.now().isoformat()),
                     "updated_at": datetime.now().isoformat(),
                 }
                 del self._hot[key]
-                await self._save_zone("hot", self._hot)
                 self._cold[key] = cold_entry
-                await self._save_zone("cold", self._cold)
+                dirty_hot = True
+                dirty_cold = True
                 compressed += 1
                 logger.info(
                     "Compressed to COLD",
                     key=key,
                     summary_len=len(str(cold_entry.get("summary", ""))),
                 )
+            if dirty_hot:
+                await self._save_zone("hot", self._hot)
+            if dirty_cold:
+                await self._save_zone("cold", self._cold)
             return compressed
         finally:
             self._release_write()
+
+    @staticmethod
+    def _extract_fallback_summary(value: Any) -> str:
+        """Extract a summary from value without LLM (fallback)."""
+        if value is None:
+            return ""
+        if isinstance(value, dict):
+            if "summary" in value:
+                return value["summary"]
+            if "user" in value and "assistant" in value:
+                user = value.get("user", "")
+                assistant = value.get("assistant", "")
+                return (
+                    f"Пользователь спрашивал: {user[:150]}. "
+                    f"Ответ ассистента: {assistant[:150]}."
+                )
+        return str(value)[:300]
 
     async def forget(self, key: str) -> bool:
         await self._acquire_write()
@@ -404,11 +525,16 @@ class GradientMemory:
             self._release_write()
 
     async def forget_all(self, confirm: bool = False) -> bool:
-        """Забыть всё: полная ротация памяти по вашей логике.
-        TGS -> HOT (score - 20, shield = False)
-        HOT -> COLD (score - 50, is_cold = True, создать summary)
-        COLD -> DELETE (score - 50, если score <= -50, удалить)
-        Третий шаг применяется ТОЛЬКО к записям, которые были в COLD ДО вызова.
+        """Full memory rotation.
+
+        TGS -> HOT (score -20, shield off)
+        HOT -> COLD (score -50, is_cold, fast non-LLM summary)
+        COLD -> DELETE (score -50, delete when score <= threshold;
+                applied only to entries that were in COLD BEFORE the call)
+        Note: HOT -> COLD here intentionally uses fast truncated summaries,
+        NOT the LLM compressor — rotation must stay quick even on huge
+        buffers. LLM-based compression happens in compress_cycle.
+        user_fact: entries are exempt from rotation.
         """
         if not confirm:
             return False
@@ -447,18 +573,7 @@ class GradientMemory:
                 entry["score"] = new_score
                 entry["is_cold"] = True
                 entry["updated_at"] = datetime.now().isoformat()
-                value = entry.get("value", {})
-                if isinstance(value, dict):
-                    if "summary" in value:
-                        summary = value["summary"]
-                    elif "user" in value and "assistant" in value:
-                        user = value.get("user", "")
-                        assistant = value.get("assistant", "")
-                        summary = f"Пользователь спрашивал: {user[:150]}. Ответ ассистента: {assistant[:150]}."
-                    else:
-                        summary = str(value)[:300]
-                else:
-                    summary = str(value)[:300]
+                summary = self._extract_fallback_summary(entry.get("value"))
                 cold_entry = {
                     "value": None,
                     "score": new_score,
@@ -514,72 +629,80 @@ class GradientMemory:
         TGS is excluded to avoid duplication with system prompt.
         Returns structured result: {"found": bool, "facts": list[dict]}
         ADR-011: Lazy Retrieval tool backend.
+
+        Stage 2: takes the read lock; the query is tokenized with
+        re.findall(r"\\w+"), so punctuation no longer breaks matching
+        ("пользователя?" now finds "пользователя").
         """
         if not query:
             return {"found": False, "facts": []}
 
-        query_words = set(query.lower().split())
-        results = []
+        await self._acquire_read()
+        try:
+            query_words = set(re.findall(r"\w+", query.lower()))
+            results = []
 
-        # Search in HOT
-        for key, entry in self._hot.items():
-            value = entry.get("value")
-            summary = entry.get("summary", "")
-            text_to_search = ""
+            # Search in HOT
+            for key, entry in self._hot.items():
+                value = entry.get("value")
+                summary = entry.get("summary", "")
+                text_to_search = ""
 
-            # Собираем текст из всех возможных источников
-            if isinstance(value, str):
-                text_to_search = value.lower()
-            elif isinstance(value, dict):
-                if "summary" in value:
-                    text_to_search = value["summary"].lower()
-                elif "user" in value and "assistant" in value:
-                    text_to_search = (
-                        value.get("user", "") + " " + value.get("assistant", "")
-                    ).lower()
-                else:
+                # Собираем текст из всех возможных источников
+                if isinstance(value, str):
+                    text_to_search = value.lower()
+                elif isinstance(value, dict):
+                    if "summary" in value:
+                        text_to_search = value["summary"].lower()
+                    elif "user" in value and "assistant" in value:
+                        text_to_search = (
+                            value.get("user", "") + " " + value.get("assistant", "")
+                        ).lower()
+                    else:
+                        text_to_search = json.dumps(value, ensure_ascii=False).lower()
+                elif isinstance(value, list):
                     text_to_search = json.dumps(value, ensure_ascii=False).lower()
-            elif isinstance(value, list):
-                text_to_search = json.dumps(value, ensure_ascii=False).lower()
-            elif value is not None:
-                text_to_search = str(value).lower()
+                elif value is not None:
+                    text_to_search = str(value).lower()
 
-            # Добавляем summary (если есть)
-            if summary:
-                text_to_search += " " + summary.lower()
+                # Добавляем summary (если есть)
+                if summary:
+                    text_to_search += " " + summary.lower()
 
-            if any(word in text_to_search for word in query_words):
-                results.append(
-                    {
-                        "key": key,
-                        "zone": "hot",
-                        "score": entry.get("score", 0),
-                        "value": value,
-                        "summary": summary,
-                    }
-                )
+                if any(word in text_to_search for word in query_words):
+                    results.append(
+                        {
+                            "key": key,
+                            "zone": "hot",
+                            "score": entry.get("score", 0),
+                            "value": value,
+                            "summary": summary,
+                        }
+                    )
 
-        # Search in COLD
-        for key, entry in self._cold.items():
-            summary = entry.get("summary", "")
-            if any(word in summary.lower() for word in query_words):
-                results.append(
-                    {
-                        "key": key,
-                        "zone": "cold",
-                        "score": entry.get("score", 0),
-                        "summary": summary,
-                    }
-                )
+            # Search in COLD
+            for key, entry in self._cold.items():
+                summary = entry.get("summary", "")
+                if any(word in summary.lower() for word in query_words):
+                    results.append(
+                        {
+                            "key": key,
+                            "zone": "cold",
+                            "score": entry.get("score", 0),
+                            "summary": summary,
+                        }
+                    )
 
-        # Sort by score descending and take top 5
-        results.sort(key=lambda x: x["score"], reverse=True)
-        top_results = results[:5]
+            # Sort by score descending and take top 5
+            results.sort(key=lambda x: x["score"], reverse=True)
+            top_results = results[:5]
 
-        return {
-            "found": len(top_results) > 0,
-            "facts": top_results,
-        }
+            return {
+                "found": len(top_results) > 0,
+                "facts": top_results,
+            }
+        finally:
+            self._release_read()
 
     async def build_context(self, query: str, max_tokens: int = 3000) -> str:
         await self._acquire_read()
@@ -597,7 +720,7 @@ class GradientMemory:
             )[:10]
             for key, entry in hot_items:
                 parts.append(f"[HOT: {key}] {self._format_value(entry)}")
-            query_words = set(query.lower().split())
+            query_words = set(re.findall(r"\w+", query.lower()))
             cold_items = []
             for key, entry in self._cold.items():
                 summary = entry.get("summary", "")
