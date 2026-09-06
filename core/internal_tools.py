@@ -2,15 +2,22 @@
 
 These tools are registered by AgentCore and available to the ReAct loop
 as built-in plugins. They are not loaded from the plugins/ directory.
+Stage 3: LLM-based semantic dedup (ДУБЛЬ/ДОПОЛНЕНИЕ/ПРОТИВОРЕЧИЕ),
+uuid fact keys, hardened query expansion, total_found fix.
 """
 
-import time
+import asyncio
+import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from core.base_tool import BaseTool
+from core.logging_config import get_logger
 from core.plugin_types import make_error
+
+logger = get_logger("core", "InternalTools")
 
 
 class RecallMemoryTool(BaseTool):
@@ -24,30 +31,37 @@ class RecallMemoryTool(BaseTool):
         "Immediately provide a final answer stating that you do not have this information in memory, "
         "or ask the user to provide the details."
     )
-    version = "1.2.0"
+    version = "1.3.0"
 
     def __init__(self, memory_manager=None, llm_client=None):
         self.memory = memory_manager
         self.llm_client = llm_client
 
     async def _expand_query(self, query: str) -> str:
-        """Использует LLM для расширения запроса синонимами (0 МБ VRAM overhead)."""
+        """Расширяет запрос синонимами через LLM (0 МБ VRAM overhead)."""
         if self.llm_client is None:
             return query
 
         prompt = (
-            "Ты — система улучшения поисковых запросов для базы знаний. "
-            "Пользователь ищет факт в памяти. Твоя задача: вернуть исходный запрос и 3-5 ключевых слов-синонимов или связанных понятий на русском языке, разделенных пробелом. "
-            "Никаких объяснений, никаких кавычек, только слова через пробел. "
+            "Ты — генератор синонимов для поискового запроса. "
+            "Верни ТОЛЬКО 3-5 ключевых слов-синонимов или связанных понятий "
+            "на русском языке через пробел. Без исходного запроса, без объяснений, "
+            "без кавычек и запятых.\n"
             f"Запрос: '{query}'"
         )
         try:
-            response = await self.llm_client.generate(prompt, temperature=0.1)
-            expanded = response.get("response", "").strip()
-            if expanded and len(expanded) < 150:
-                return f"{query} {expanded}"
-        except Exception:
-            pass
+            response = await asyncio.wait_for(
+                self.llm_client.generate(prompt, temperature=0.1), timeout=5.0
+            )
+            expanded = response.get("response", "")
+            query_words = set(re.findall(r"\w+", query.lower()))
+            words = [w for w in re.findall(r"\w+", expanded.lower()) if w not in query_words][:6]
+            if words:
+                return f"{query} {' '.join(words)}"
+        except TimeoutError:
+            logger.warning("Query expansion timed out, using raw query")
+        except Exception as e:
+            logger.warning("Query expansion failed, using raw query", error=str(e))
 
         return query
 
@@ -77,8 +91,9 @@ class RecallMemoryTool(BaseTool):
         result = await self.memory.recall_memory(expanded_query)
 
         if result.get("found") and result.get("facts"):
-            result["facts"] = result["facts"][:limit]
+            # Fix: report the REAL total before slicing to limit.
             result["total_found"] = len(result["facts"])
+            result["facts"] = result["facts"][:limit]
             result["expanded_query_used"] = expanded_query
         else:
             result["total_found"] = 0
@@ -111,13 +126,14 @@ class RememberFactTool(BaseTool):
         "Examples: 'Запомни: моего кота зовут Барсик', 'Save this: I prefer Python'. "
         "CRITICAL: Do NOT use for writing files. Use write_file for that."
     )
-    version = "1.1.0"  # Обновлено: добавлена реальная защита от дубликатов
+    version = "2.0.0"
 
-    def __init__(self, memory_manager=None):
+    def __init__(self, memory_manager=None, llm_client=None):
         self.memory = memory_manager
+        self.llm_client = llm_client
 
     async def _execute(self, fact: str = "", **kwargs) -> dict[str, Any]:
-        """Save fact to HOT memory immediately with duplicate protection."""
+        """Save fact to HOT memory with LLM-based semantic dedup."""
         if self.memory is None:
             return make_error(
                 "backend_unavailable",
@@ -131,36 +147,114 @@ class RememberFactTool(BaseTool):
                 "message": "Fact is required. Please provide what you want me to remember.",
             }
 
-        clean_fact = fact.strip()
+        clean_fact = fact.strip()[:2000]
 
-        # === АРХИТЕКТУРНАЯ ЗАЩИТА ОТ ДУБЛИКАТОВ ===
-        # Поскольку recall_memory теперь использует LLM expansion, он находит семантически похожие факты.
-        # Мы делаем быстрый поиск и проверяем, не является ли найденный факт дубликатом по длине.
-        search_query = clean_fact[:50]
-        check = await self.memory.recall_memory(search_query)
-
+        # === СЕМАНТИЧЕСКАЯ ПРОВЕРКА НА ДУБЛИКАТ (LLM-вердикт) ===
+        # Консервативный fallback: если LLM недоступен, факт сохраняется
+        # как новый (потерять факт юзера хуже, чем сохранить дубликат).
+        check = await self.memory.recall_memory(clean_fact[:50])
         if check.get("found") and check.get("facts"):
-            existing = check["facts"][0]
-            existing_text = str(existing.get("value") or existing.get("summary", ""))
-
-            # Если длины текстов сопоставимы (разница не более чем в 2.5 раза), считаем это дубликатом
-            if len(existing_text) > 10 and len(clean_fact) > 10:
-                ratio = min(len(existing_text), len(clean_fact)) / max(
-                    len(existing_text), len(clean_fact)
-                )
-                if ratio > 0.4:  # Тексты примерно одного порядка длины
+            for existing in check["facts"][:2]:
+                existing_text = str(existing.get("value") or existing.get("summary", ""))
+                if len(existing_text) < 5:
+                    continue
+                verdict = await self._similarity_verdict(clean_fact, existing_text)
+                if verdict == "ДУБЛЬ":
                     return {
                         "status": "already_exists",
-                        "message": f"ВНИМАНИЕ: Этот факт уже сохранён в памяти (ключ: {existing['key']}). НЕ вызывай этот инструмент повторно. Просто ответь пользователю, что ты это уже знаешь, и не создавай дубликат.",
+                        "message": (
+                            f"Этот факт уже сохранён в памяти (ключ: {existing['key']}). "
+                            "Не создавай дубликат. Просто ответь пользователю, "
+                            "что ты это уже знаешь."
+                        ),
                         "existing_fact": existing_text,
                     }
-        # ==========================================
+                if verdict == "ПРОТИВОРЕЧИЕ":
+                    # Новая информация заменяет устаревшую: перезапись по тому же ключу
+                    await self.memory.remember(existing["key"], clean_fact, complex_query=False)
+                    return {
+                        "status": "updated",
+                        "message": f"Факт обновлён (было устаревшее): {clean_fact[:100]}",
+                        "key": existing["key"],
+                    }
+                if verdict == "ДОПОЛНЕНИЕ":
+                    merged = await self._merge_facts(clean_fact, existing_text)
+                    await self.memory.remember(existing["key"], merged, complex_query=False)
+                    return {
+                        "status": "merged",
+                        "message": f"Факт дополнен: {merged[:150]}",
+                        "key": existing["key"],
+                    }
+        # =========================================================
 
-        # Если дубликата нет, сохраняем как обычно
-        key = f"user_fact:{int(time.time())}"
+        # Дубликата нет — сохраняем как новый факт (uuid защищает от
+        # коллизий при двух фактах в одну секунду).
+        key = f"user_fact:{uuid.uuid4().hex[:8]}"
         await self.memory.remember(key, clean_fact, complex_query=len(clean_fact) > 100)
 
-        return {"status": "success", "message": f"Факт сохранён: {clean_fact[:100]}", "key": key}
+        return {
+            "status": "success",
+            "message": f"Факт сохранён: {clean_fact[:100]}",
+            "key": key,
+        }
+
+    async def _similarity_verdict(self, new_fact: str, existing_fact: str) -> str:
+        """Returns 'ДУБЛЬ' | 'ДОПОЛНЕНИЕ' | 'ПРОТИВОРЕЧИЕ' | 'НЕТ'.
+
+        Conservative fallback: if LLM is unavailable, treat as NEW fact
+        (storing a duplicate is better than losing a user's fact).
+        """
+        if self.llm_client is None:
+            return "НЕТ"
+        prompt = (
+            "Сравни два утверждения.\n"
+            f"A: {new_fact}\n"
+            f"B: {existing_fact}\n"
+            "Верни ровно одно слово-вердикт:\n"
+            "ДУБЛЬ — A и B утверждают одно и то же\n"
+            "ДОПОЛНЕНИЕ — A добавляет новое к B, противоречий нет\n"
+            "ПРОТИВОРЕЧИЕ — A противоречит B или заменяет устаревшую информацию\n"
+            "НЕТ — это разные факты\n"
+            "Ответ — одним словом, без объяснений."
+        )
+        try:
+            response = await asyncio.wait_for(
+                self.llm_client.generate(prompt, temperature=0.0), timeout=10.0
+            )
+            answer = response.get("response", "").upper()
+            for word in ("ДУБЛЬ", "ДОПОЛНЕНИЕ", "ПРОТИВОРЕЧИЕ"):
+                if word in answer:
+                    return word
+            return "НЕТ"
+        except TimeoutError:
+            logger.warning("Similarity verdict timed out, treating fact as new")
+            return "НЕТ"
+        except Exception as e:
+            logger.warning("Similarity verdict failed, treating fact as new", error=str(e))
+            return "НЕТ"
+
+    async def _merge_facts(self, new_fact: str, existing_fact: str) -> str:
+        """Merge supplement into existing fact via LLM, fallback to concat."""
+        if self.llm_client is None:
+            return f"{existing_fact}. {new_fact}"
+        prompt = (
+            "Объедини факт B с новой информацией из A в один краткий факт. "
+            "Если есть противоречие — верна информация из A. "
+            "Верни только итоговый факт без пояснений.\n"
+            f"A: {new_fact}\nB: {existing_fact}"
+        )
+        try:
+            response = await asyncio.wait_for(
+                self.llm_client.generate(prompt, temperature=0.1), timeout=15.0
+            )
+            merged = response.get("response", "").strip()
+            if merged and len(merged) < 500:
+                return merged
+        except TimeoutError:
+            logger.warning("Fact merge timed out, using concatenation")
+        except Exception as e:
+            logger.warning("Fact merge failed, using concatenation", error=str(e))
+        return f"{existing_fact}. {new_fact}"
 
     def _get_parameters(self) -> dict[str, Any]:
         return {
@@ -182,7 +276,7 @@ class ListFilesTool(BaseTool):
         "Returns a list of files with their sizes and modification times. "
         "Example: list_files()"
     )
-    version = "1.0.0"
+    version = "1.1.0"
 
     def __init__(self, base_dir=None):
         if base_dir is None:
@@ -220,15 +314,22 @@ class ListFilesTool(BaseTool):
             )
 
         files = []
-        for item in target_dir.iterdir():
-            if item.is_file():
-                files.append(
-                    {
-                        "name": item.name,
-                        "size_bytes": item.stat().st_size,
-                        "modified": datetime.fromtimestamp(item.stat().st_mtime).isoformat(),
-                    }
-                )
+        try:
+            for item in target_dir.iterdir():
+                if item.is_file():
+                    files.append(
+                        {
+                            "name": item.name,
+                            "size_bytes": item.stat().st_size,
+                            "modified": datetime.fromtimestamp(item.stat().st_mtime).isoformat(),
+                        }
+                    )
+        except PermissionError:
+            return make_error(
+                "invalid_url",
+                f"Permission denied for directory '{target_dir}'.",
+                "The directory exists but cannot be read.",
+            )
 
         files.sort(key=lambda x: x["name"])
 

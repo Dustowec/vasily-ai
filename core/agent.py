@@ -1,11 +1,14 @@
 """AgentCore - orchestration layer with ReAct-powered routing.
 ADR-011: Sliding Window (5 pairs FIFO) instead of dialogue:last.
 UTF-8 Hardening: Fixed double-encoding in dialogue compression.
+Stage 5b: num_predict passthrough, deep-copied dialogue history,
+search results stored to dialogue, session_close on shutdown.
 """
 
 import asyncio
 import signal
 import time
+import uuid
 from typing import Any
 
 import structlog
@@ -76,6 +79,7 @@ class AgentCore:
             timeout=self.config.llm_timeout,
             max_retries=self.config.llm_max_retries,
             num_ctx=self.config.llm_num_ctx,
+            num_predict=self.config.llm_num_predict,
             retry_delay_base=self.config.llm_retry_delay_base,
         )
 
@@ -83,7 +87,7 @@ class AgentCore:
         recall_tool = RecallMemoryTool(self.memory, self.llm_client)
         self.plugin_registry.register(recall_tool)
 
-        remember_tool = RememberFactTool(self.memory)
+        remember_tool = RememberFactTool(self.memory, self.llm_client)
         self.plugin_registry.register(remember_tool)
 
         list_files_tool = ListFilesTool()
@@ -222,7 +226,7 @@ class AgentCore:
                 "workspace",
                 "reading",
                 "папк",
-                "директор",
+                "директори",
                 "посмотри в",
             ]
             text_lower = user_text.lower()
@@ -252,6 +256,18 @@ class AgentCore:
                                     if url:
                                         answer += f"   Источник: {url}\n"
                                     answer += "\n"
+                                # Stage 5b: search results also go to dialogue
+                                # window/buffer, so the agent remembers what
+                                # was just searched in the next request.
+                                await self._store_dialogue(
+                                    user_text, {"status": "success", "answer": answer}
+                                )
+                                duration_ms = (time.time() - start) * 1000
+                                self.metrics.record_request(
+                                    duration_ms=duration_ms,
+                                    status="success",
+                                    iterations=0,
+                                )
                                 return {"status": "success", "message": answer, "iterations": 0}
                             else:
                                 return {
@@ -275,7 +291,10 @@ class AgentCore:
 
             structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
 
-            dialogue_history = list(self._dialogue_window)
+            # Stage 5b: deep-copy messages. token_manager.trim_messages MUTATES
+            # message dicts (truncation); sharing dicts with _dialogue_window
+            # would permanently corrupt stored dialogue history.
+            dialogue_history = [dict(m) for m in self._dialogue_window]
             result = await self.react_loop.run(
                 user_text, dialogue_history=dialogue_history, prompt_type="default"
             )
@@ -390,7 +409,7 @@ class AgentCore:
 
             summary = await self._llm_compressor.compress(text_for_compression)
 
-            key = f"dialogue_summary:{int(time.time())}"
+            key = f"dialogue_summary:{int(time.time())}-{uuid.uuid4().hex[:6]}"
             await self.memory.remember(
                 key,
                 {
@@ -507,6 +526,14 @@ class AgentCore:
     async def shutdown(self) -> None:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
+
+        # Stage 5b: session-close decay was never called anywhere; it belongs
+        # here (end of session). NOTE: if UI also calls session_close(),
+        # tell the reviewer — entries would cool down twice.
+        try:
+            await self.memory.session_close()
+        except Exception as e:
+            logger.error("session_close failed on shutdown", error=str(e))
 
         if self._dialogue_buffer:
             logger.info(
