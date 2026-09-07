@@ -4,6 +4,8 @@ These tools are registered by AgentCore and available to the ReAct loop
 as built-in plugins. They are not loaded from the plugins/ directory.
 Stage 3: LLM-based semantic dedup (ДУБЛЬ/ДОПОЛНЕНИЕ/ПРОТИВОРЕЧИЕ),
 uuid fact keys, hardened query expansion, total_found fix.
+Stage 3.1: thinking stripped from LLM verdict/merge, whole-word dedup
+query, whole-word verdict matching.
 """
 
 import asyncio
@@ -16,6 +18,7 @@ from typing import Any
 from core.base_tool import BaseTool
 from core.logging_config import get_logger
 from core.plugin_types import make_error
+from integrations.ollama_client import OllamaClient
 
 logger = get_logger("core", "InternalTools")
 
@@ -126,7 +129,7 @@ class RememberFactTool(BaseTool):
         "Examples: 'Запомни: моего кота зовут Барсик', 'Save this: I prefer Python'. "
         "CRITICAL: Do NOT use for writing files. Use write_file for that."
     )
-    version = "2.0.0"
+    version = "2.1.0"
 
     def __init__(self, memory_manager=None, llm_client=None):
         self.memory = memory_manager
@@ -149,10 +152,16 @@ class RememberFactTool(BaseTool):
 
         clean_fact = fact.strip()[:2000]
 
+        # Stage 3.1: whole-word query instead of clean_fact[:50] —
+        # keywords beyond the first 50 chars are no longer invisible
+        # to the dedup pre-filter.
+        words = re.findall(r"\w+", clean_fact.lower())
+        search_query = " ".join(words)[:150]
+
         # === СЕМАНТИЧЕСКАЯ ПРОВЕРКА НА ДУБЛИКАТ (LLM-вердикт) ===
         # Консервативный fallback: если LLM недоступен, факт сохраняется
         # как новый (потерять факт юзера хуже, чем сохранить дубликат).
-        check = await self.memory.recall_memory(clean_fact[:50])
+        check = await self.memory.recall_memory(search_query)
         if check.get("found") and check.get("facts"):
             for existing in check["facts"][:2]:
                 existing_text = str(existing.get("value") or existing.get("summary", ""))
@@ -203,6 +212,12 @@ class RememberFactTool(BaseTool):
 
         Conservative fallback: if LLM is unavailable, treat as NEW fact
         (storing a duplicate is better than losing a user's fact).
+
+        Stage 3.1: the thinking block is stripped BEFORE verdict matching.
+        A reasoning model may mention "ДУБЛЬ" inside its thinking while
+        actually answering "ДОПОЛНЕНИЕ" — matching on raw output would
+        misfire. Verdicts are matched as whole words, so "не ДУБЛЬ"
+        cannot accidentally match either.
         """
         if self.llm_client is None:
             return "НЕТ"
@@ -215,15 +230,18 @@ class RememberFactTool(BaseTool):
             "ДОПОЛНЕНИЕ — A добавляет новое к B, противоречий нет\n"
             "ПРОТИВОРЕЧИЕ — A противоречит B или заменяет устаревшую информацию\n"
             "НЕТ — это разные факты\n"
-            "Ответ — одним словом, без объяснений."
+            "Ответ — ровно одно слово, без объяснений и без размышлений."
         )
         try:
             response = await asyncio.wait_for(
                 self.llm_client.generate(prompt, temperature=0.0), timeout=10.0
             )
-            answer = response.get("response", "").upper()
-            for word in ("ДУБЛЬ", "ДОПОЛНЕНИЕ", "ПРОТИВОРЕЧИЕ"):
-                if word in answer:
+            raw = response.get("response", "")
+            # Strip thinking block: reasoning must never leak into the verdict
+            _, clean = OllamaClient.extract_thinking_and_answer(raw)
+            answer_words = set(re.findall(r"\w+", clean.upper()))
+            for word in ("ПРОТИВОРЕЧИЕ", "ДОПОЛНЕНИЕ", "ДУБЛЬ"):
+                if word in answer_words:
                     return word
             return "НЕТ"
         except TimeoutError:
@@ -234,20 +252,27 @@ class RememberFactTool(BaseTool):
             return "НЕТ"
 
     async def _merge_facts(self, new_fact: str, existing_fact: str) -> str:
-        """Merge supplement into existing fact via LLM, fallback to concat."""
+        """Merge supplement into existing fact via LLM, fallback to concat.
+
+        Stage 3.1: thinking block is stripped from the merge result —
+        otherwise the model's internal monologue would be stored in
+        memory as part of a user fact.
+        """
         if self.llm_client is None:
             return f"{existing_fact}. {new_fact}"
         prompt = (
             "Объедини факт B с новой информацией из A в один краткий факт. "
             "Если есть противоречие — верна информация из A. "
-            "Верни только итоговый факт без пояснений.\n"
+            "Верни только итоговый факт без пояснений и без размышлений.\n"
             f"A: {new_fact}\nB: {existing_fact}"
         )
         try:
             response = await asyncio.wait_for(
                 self.llm_client.generate(prompt, temperature=0.1), timeout=15.0
             )
-            merged = response.get("response", "").strip()
+            raw = response.get("response", "")
+            _, merged = OllamaClient.extract_thinking_and_answer(raw)
+            merged = merged.strip()
             if merged and len(merged) < 500:
                 return merged
         except TimeoutError:
