@@ -374,18 +374,17 @@ class GradientMemory:
                     # §6: remember = изменение
                     entry["no_compress"] = True
                     entry["changed_since_revival"] = True
+                    self._try_unprotect(entry, key)
 
                 if zone == "tgs":
                     self._tgs[key] = entry
                     await self._save_zone("tgs", self._tgs)
-                    self._try_unprotect(entry, key)
                     logger.info("Remember: reinforced in TGS", key=key, score=entry["score"])
                     return
 
                 # zone == "hot"
                 self._hot[key] = entry
                 await self._save_zone("hot", self._hot)
-                self._try_unprotect(entry, key)
                 await self._maybe_promote_to_tgs(key)  # §4/§7: лестница
                 return
 
@@ -421,6 +420,7 @@ class GradientMemory:
                     heated += 1
                     continue
                 self._apply_heat(entry, HEAT_RECALL, key)
+                self._try_unprotect(entry, key)  # §6: снятие флага — при нагреве
                 touched.add(zone)
                 heated += 1
                 if zone == "hot":
@@ -470,9 +470,11 @@ class GradientMemory:
     async def cold_start_penalty(self) -> None:
         """§3: при старте −2.0 всем, кроме TGS. После −2 записи
         расходятся по классам (§3/§5): no_compress <= 0.5 -> миграция;
-        unprotected <= 5.0 -> очередь дистилляции."""
+        unprotected <= 5.0 -> очередь дистилляции. Мигрант этого вызова
+        свой −2 уже получил в HOT — повторно в COLD-проходе не остывает."""
         await self._acquire_write()
         try:
+            cold_before = set(self._cold.keys())  # фиксируем COLD до миграций
             hot_changed = False
             for key, entry in list(self._hot.items()):
                 entry["score"] = round(entry.get("score", 0) + COLD_START_PENALTY, 1)
@@ -489,7 +491,9 @@ class GradientMemory:
                 await self._save_zone("hot", self._hot)
 
             cold_changed = False
-            for entry in self._cold.values():
+            for key, entry in self._cold.items():
+                if key not in cold_before:
+                    continue  # переселенец этого вызова: −2 уже учтён выше
                 entry["score"] = round(entry.get("score", 0) + COLD_START_PENALTY, 1)
                 entry["updated_at"] = datetime.now().isoformat()
                 cold_changed = True
@@ -503,7 +507,9 @@ class GradientMemory:
     async def _migrate_to_cold(self, key: str, entry: dict) -> None:
         """§5: миграция as-is (value ЦЕЛИКОМ, без LLM) + миграционный
         штраф −0.7 на финише; прижим к -0.1 гарантирует пул COLD.
-        Вызывать под write-локом."""
+        Вызывать под write-локом. Скор записи к моменту вызова должен
+        УЖЕ включать понижение текущего такта (§5: ловушка считается
+        от результата вычета)."""
         entry["score"] = min(round(entry.get("score", 0) + MIGRATION_FEE, 1), -0.1)
         entry["is_cold"] = True
         del self._hot[key]
@@ -518,7 +524,8 @@ class GradientMemory:
         """Тик. §4.1: 1 запрос = 1 тик; таблица коэффициентов; активный
         режим (10 тиков без recall_memory). §5: событийная очередь
         (впервые <= 5.0) и ловушка <= 0.5 применяются к результату
-        вычета НЕМЕДЛЕННО, до сохранения. no_compress decay НЕ блокирует."""
+        вычета НЕМЕДЛЕННО, до сохранения. no_compress decay НЕ блокирует.
+        Мигрант этого тика COLD-decay того же тика не получает."""
         await self._acquire_write()
         try:
             self._total_ticks += 1
@@ -538,12 +545,16 @@ class GradientMemory:
             # ---- HOT ----
             hot_rate = DECAY_HOT_ACTIVE if active else DECAY_HOT_BASE
             hot_changed = False
+            migrated_this_tick: set[str] = set()
             for key, entry in list(self._hot.items()):
                 new_score = round(entry.get("score", 0) + hot_rate, 1)
                 if entry.get("no_compress", False):
-                    # §5: ловушка <= 0.5 -> миграция as-is (+штраф внутри)
+                    # §5: ловушка <= 0.5 -> миграция as-is (+штраф внутри),
+                    # от РЕЗУЛЬТАТА вычета, а не от старого скора
                     if new_score <= MIGRATION_TRAP:
+                        entry["score"] = new_score
                         await self._migrate_to_cold(key, entry)
+                        migrated_this_tick.add(key)
                         hot_changed = True
                         continue
                 else:
@@ -566,6 +577,8 @@ class GradientMemory:
             cold_rate = DECAY_COLD_ACTIVE if active else DECAY_COLD_BASE
             cold_changed = False
             for key, entry in list(self._cold.items()):
+                if key in migrated_this_tick:
+                    continue  # мигрант этого тика: своё понижение уже учтено (§5)
                 new_score = round(entry.get("score", 0) + cold_rate, 1)
                 cold_changed = True
                 if new_score <= DELETE_BELOW:
@@ -822,6 +835,7 @@ class GradientMemory:
                 return entry.get("value")
 
             self._apply_heat(entry, HEAT_RECALL, key)
+            self._try_unprotect(entry, key)  # §6: снятие флага — при операции нагрева
             if zone == "tgs":
                 await self._save_zone("tgs", self._tgs)
             else:
@@ -899,7 +913,7 @@ class GradientMemory:
 
     async def session_close(self) -> None:
         """DEPRECATED (§3): заменена cold_start_penalty(). Заглушка,
-        пока agent.py/UI зовут её. Удалить в 6.3."""
+        пока UI зовут её. Удалить отдельно."""
         logger.debug("session_close is deprecated (ADR-013 §3), no-op")
 
     # ================= служебное =================
