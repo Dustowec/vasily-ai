@@ -2,6 +2,9 @@
 
 Covers: initialize, handle_request, shutdown, get_metrics,
         command handling, error handling.
+ADR-013 (6.3): cold_start_penalty at startup, forget_all answers
+with counts (rotated / amnestied / next_free_tick), session_close
+decay removed from shutdown.
 """
 
 import asyncio
@@ -52,11 +55,24 @@ def agent(config):
             with patch("core.agent.ensure_ollama_running", AsyncMock(return_value=True)):
                 with patch("core.agent.GradientMemory") as MockMemory:
                     mock_memory = MagicMock()
-                    mock_memory.build_context = AsyncMock(return_value="test context")
+                    # ADR-013 §3: стартовое охлаждение — новый async-вызов
+                    mock_memory.cold_start_penalty = AsyncMock()
                     mock_memory.remember = AsyncMock()
+                    mock_memory.remember_dialogue_summary = AsyncMock()
                     mock_memory.forget = AsyncMock(return_value=True)
-                    mock_memory.forget_all = AsyncMock(return_value=True)
+                    # ADR-013 §8: forget_all возвращает словарь со статистикой
+                    mock_memory.forget_all = AsyncMock(
+                        return_value={
+                            "rotated": 3,
+                            "amnestied": 1,
+                            "next_free_tick": 12,
+                            "confirmed": True,
+                        }
+                    )
                     mock_memory.decay = AsyncMock()
+                    mock_memory.has_compression_candidates = MagicMock(return_value=False)
+                    # build_context удалён из manager (ADR-013 §9) — мока больше нет
+                    mock_memory.session_close = AsyncMock()  # не должен зваться (§3)
                     mock_memory.get_stats = MagicMock(
                         return_value={"tgs": 0, "hot": 0, "cold": 0, "total": 0}
                     )
@@ -77,6 +93,13 @@ async def test_initialize_success(agent):
     assert agent.llm_client is not None
     assert agent.react_loop is not None
     assert agent.plugin_registry is not None
+
+
+async def test_initialize_applies_cold_start_penalty_once(agent):
+    """ADR-013 §3: cold_start_penalty вызывается ровно один раз при старте."""
+    with patch.object(agent, "health_check", AsyncMock(return_value={"overall": "OK"})):
+        await agent.initialize()
+    agent.memory.cold_start_penalty.assert_awaited_once()
 
 
 # ==================== TEST HANDLE_REQUEST ====================
@@ -116,11 +139,14 @@ async def test_handle_request_forget_all(agent):
 
 
 async def test_handle_request_forget_all_confirm(agent):
-    """handle_request should handle 'забудь всё да'."""
+    """ADR-013 §8: 'забудь всё да' отвечает с числами (N / M / тик X)."""
     await agent.initialize()
     response = await agent.handle_request({"text": "забудь всё да"})
     assert response["status"] == "success"
     assert "очищена" in response["message"]
+    assert "удалено 3" in response["message"]
+    assert "сохранено 1" in response["message"]
+    assert "после тика 12" in response["message"]
 
 
 async def test_handle_request_empty_topic(agent):
@@ -191,6 +217,17 @@ async def test_shutdown(agent):
     await agent.shutdown()
     agent.llm_client.close.assert_called_once()
     assert agent.running is False
+
+
+async def test_shutdown_does_not_cool_memory(agent):
+    """ADR-013 §3: остывание перенесено на старт; при выключении
+    session_close НЕ вызывается (защита от двойного остывания)."""
+    await agent.initialize()
+    agent.llm_client = AsyncMock()
+    agent.llm_client.close = AsyncMock()
+
+    await agent.shutdown()
+    agent.memory.session_close.assert_not_awaited()
 
 
 # ==================== TEST CANCEL_ACTIVE_REQUEST ====================

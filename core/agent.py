@@ -2,10 +2,13 @@
 ADR-011: Sliding Window (5 pairs FIFO) instead of dialogue:last.
 UTF-8 Hardening: Fixed double-encoding in dialogue compression.
 Stage 5b: num_predict passthrough, deep-copied dialogue history,
-search results stored to dialogue, session_close on shutdown.
+search results stored to dialogue.
 Stage 8: PeriodicScheduler removed. Compression is now lazy: after
 every request a cheap scan checks for cooled HOT entries, and if any
 exist, compression runs as a BACKGROUND task (never blocks the reply).
+ADR-013 (6.3): cold_start_penalty() at startup (replaces the old
+session_close decay); forget_all answers with counts (rotated /
+amnestied / next free tick); session_close call removed.
 """
 
 import asyncio
@@ -69,6 +72,10 @@ class AgentCore:
             log_level=self.config.log_level,
             llm_url=self.config.llm_url,
         )
+
+        # ADR-013 §3: стартовое охлаждение (−2.0 всей памяти, кроме TGS).
+        # Заменяет собой старый session_close-decay при выключении.
+        await self.memory.cold_start_penalty()
 
         self.plugin_registry.discover_plugins(self.config.plugins_dir)
 
@@ -167,8 +174,9 @@ class AgentCore:
 
             if "забудь всё" in cmd or "забыть всё" in cmd:
                 if "да" in cmd:
+                    # ADR-013 §8: ротация с амнистией свежих user_fact
                     result = await self.memory.forget_all(confirm=True)
-                    if result:
+                    if result.get("confirmed"):
                         self._dialogue_window.clear()
                         self._dialogue_buffer.clear()
                         self.react_loop = ReActLoop(
@@ -176,10 +184,13 @@ class AgentCore:
                             llm_client=self.llm_client,
                             plugin_registry=self.plugin_registry,
                         )
-                        return {
-                            "status": "success",
-                            "message": "Память полностью очищена (ротация выполнена).",
-                        }
+                        # §8: ответ с числами (очищено N / сохранено M / тик X)
+                        msg = (
+                            f"Память очищена: удалено {result['rotated']} записей, "
+                            f"сохранено {result['amnestied']} свежих фактов. "
+                            f"Повторить можно после тика {result['next_free_tick']}."
+                        )
+                        return {"status": "success", "message": msg}
                     return {"status": "error", "message": "Не удалось выполнить ротацию памяти."}
                 else:
                     return {
@@ -357,7 +368,8 @@ class AgentCore:
         Stage 8: replaces the former PeriodicScheduler (blind 6-hour timer).
         The check itself is a cheap sync dict scan on every request; the
         expensive LLM summarization runs as a BACKGROUND task, so the user's
-        request latency is never affected by compression.
+        request latency is never affected by compression. ADR-013 §5: the
+        event-driven distill queue is drained by the same background worker.
         """
         if self._compression_task and not self._compression_task.done():
             return  # a compression run is already in flight
@@ -446,7 +458,7 @@ class AgentCore:
             summary = await self._llm_compressor.compress(text_for_compression)
 
             key = f"dialogue_summary:{int(time.time())}-{uuid.uuid4().hex[:6]}"
-            await self.memory.remember(
+            await self.memory.remember_dialogue_summary(
                 key,
                 {
                     "summary": summary,
@@ -458,7 +470,6 @@ class AgentCore:
                         else text_for_compression
                     ),
                 },
-                complex_query=True,
             )
             logger.info(
                 "Dialogue buffer compressed and stored",
@@ -550,13 +561,8 @@ class AgentCore:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
 
-        # Stage 5b: session-close decay belongs here (end of session).
-        # NOTE: if the UI also calls session_close(), tell the reviewer —
-        # entries would cool down twice.
-        try:
-            await self.memory.session_close()
-        except Exception as e:
-            logger.error("session_close failed on shutdown", error=str(e))
+        # ADR-013 §3: сессионный decay при завершении отменён — остывание
+        # теперь применяется при СТАРТЕ (cold_start_penalty в initialize()).
 
         if self._dialogue_buffer:
             logger.info(
