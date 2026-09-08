@@ -297,7 +297,8 @@ class GradientMemory:
 
     def _try_unprotect(self, entry: dict, key: str) -> None:
         """§6: снятие no_compress — score >= 8 И изменён.
-        Единственный способ снятия флага."""
+        Единственный способ снятия флага. Вызов при операции нагрева —
+        это ПРОВЕРКА, само снятие требует обоих условий."""
         if (
             entry.get("no_compress")
             and entry.get("changed_since_revival")
@@ -310,8 +311,7 @@ class GradientMemory:
 
     async def remember(self, key: str, value: Any, complex_query: bool = False) -> None:
         """Универсальная запись (совместимость с 3.1/5b): user_fact:* ->
-        score 40 + страховка §8; остальные — 15/40. 6.2 переведёт тулзы
-        на явные методы."""
+        score 40 + страховка §8; остальные — 15/40."""
         if key.startswith("user_fact:"):
             await self.remember_user_fact(key, value)
             return
@@ -420,7 +420,7 @@ class GradientMemory:
                     heated += 1
                     continue
                 self._apply_heat(entry, HEAT_RECALL, key)
-                self._try_unprotect(entry, key)  # §6: снятие флага — при нагреве
+                self._try_unprotect(entry, key)  # §6: проверка снятия при нагреве
                 touched.add(zone)
                 heated += 1
                 if zone == "hot":
@@ -700,7 +700,7 @@ class GradientMemory:
     async def forget(self, key: str) -> bool:
         """Точечное удаление по ТОЧНОМУ ключу (§8). Страховка НЕ действует:
         осознанное действие. TGS -> HOT(40); HOT/COLD -> -50, удаление
-        или до-живание в COLD."""
+        или до-живание в COLD. Ключ при переносе зон НЕ меняется."""
         await self._acquire_write()
         try:
             entry = self._find_entry_unlocked(key)
@@ -740,7 +740,13 @@ class GradientMemory:
     async def forget_all(self, confirm: bool = False) -> dict:
         """Тотальная ротация. §8: амнистия user_fact свежее 10 тиков
         (total_ticks персистентен). Возвращает статистику для agent.py:
-        {rotated, amnestied, next_free_tick, confirmed}."""
+        {rotated, amnestied, next_free_tick, confirmed}.
+
+        Порядок ротации — ступеньки: TGS -> HOT(40); HOT -> COLD;
+        удаляются только записи, лежавшие в COLD ДО ротации. Каждый
+        проход берёт только «старожилов» своей ступени (hot_before /
+        cold_before-guard): переселенец этого вызова доживает на новой
+        ступени и не ротируется повторно тем же вызовом."""
         if not confirm:
             return {"rotated": 0, "amnestied": 0, "next_free_tick": 0, "confirmed": False}
         await self._acquire_write()
@@ -748,10 +754,12 @@ class GradientMemory:
             rotated = 0
             amnestied = 0
             next_free_tick = 0
+            cold_before = set(self._cold.keys())  # удалить можно только их
+            hot_before = set(self._hot.keys())  # TGS-переселенцы сюда не входят
 
-            def _immune(entry: dict) -> bool:
+            def _immune(entry_key: str, entry: dict) -> bool:
                 nonlocal amnestied, next_free_tick
-                if not key.startswith("user_fact:"):
+                if not entry_key.startswith("user_fact:"):
                     return False
                 created = entry.get("created_tick", 0)
                 if self._total_ticks - created < FACT_IMMUNE_TICKS:
@@ -760,8 +768,9 @@ class GradientMemory:
                     return True
                 return False
 
+            # ---- TGS -> HOT(40) ----
             for key, entry in list(self._tgs.items()):
-                if _immune(entry):
+                if _immune(key, entry):
                     continue
                 entry["score"] = TGS_EVICT_SCORE
                 entry["shield"] = False
@@ -770,8 +779,12 @@ class GradientMemory:
                 self._hot[key] = entry
                 rotated += 1
 
-            for key, entry in list(self._hot.items()):
-                if _immune(entry):
+            # ---- HOT -> COLD (только старожилы HOT; TGS-переселенцы не тронуты) ----
+            for key in list(self._hot.keys()):
+                if key not in hot_before:
+                    continue  # переселенец из TGS этого вызова: доживает в HOT
+                entry = self._hot[key]
+                if _immune(key, entry):
                     continue
                 entry["score"] = round(entry.get("score", 0) - 50.0, 1)
                 entry["is_cold"] = True
@@ -787,9 +800,12 @@ class GradientMemory:
                     self._cold[key] = cold_entry
                 rotated += 1
 
+            # ---- COLD -> удаление (только старожилы COLD) ----
             for key in list(self._cold.keys()):
+                if key not in cold_before:
+                    continue  # переселенец из HOT этого вызова: доживает, не удаляется
                 entry = self._cold[key]
-                if _immune(entry):
+                if _immune(key, entry):
                     continue
                 del self._cold[key]
                 rotated += 1
@@ -835,7 +851,7 @@ class GradientMemory:
                 return entry.get("value")
 
             self._apply_heat(entry, HEAT_RECALL, key)
-            self._try_unprotect(entry, key)  # §6: снятие флага — при операции нагрева
+            self._try_unprotect(entry, key)  # §6: проверка снятия при операции нагрева
             if zone == "tgs":
                 await self._save_zone("tgs", self._tgs)
             else:
@@ -909,7 +925,7 @@ class GradientMemory:
         finally:
             self._release_read()
 
-    # ================= совместимость (до 6.3) =================
+    # ================= совместимость =================
 
     async def session_close(self) -> None:
         """DEPRECATED (§3): заменена cold_start_penalty(). Заглушка,
