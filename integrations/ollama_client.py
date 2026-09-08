@@ -1,14 +1,9 @@
 """OllamaClient - async LLM client with retries and crash reporting.
-Requirements (T3-015):
-- Model: vasily-qwen (abliterated Qwen2.5-3B, q4_k_s, 32k context)
-- Temperature: 0.1 (strict, for stable function calling)
-- Async: aiohttp only (ADR-001)
-- Logging: structlog with request_id (ADR-004)
-- Resilience: 2 retries, then crash report and LLMUnavailableError
-- Context window: num_ctx configurable, auto-injected into options
-- num_predict: hard cap on response length, must fit into safety_margin
-- Token drift: compares real prompt_eval_count with TokenManager estimate
-- P2-1: retry delay base configurable via Config
+Stage 5a: num_predict passthrough, token drift calibration, honest
+timeout handling, unclosed-think handling.
+Stage 6.2b: third thinking case — CLOSING </think> without an opener
+(tail-of-thinking without head): everything BEFORE the tag is thinking
+junk, everything after is the answer. Qwen3.5 sometimes emits this.
 """
 
 import asyncio
@@ -23,8 +18,7 @@ from core.logging_config import get_logger
 
 logger = get_logger("llm", "OllamaClient")
 
-# Defaults kept IN SYNC with core/config.py defaults (ADR-011).
-# If a caller does not pass explicit values, these must not contradict Config.
+# Defaults kept in sync with core/config.py defaults (ADR-011).
 DEFAULT_URL = "http://localhost:11434"
 DEFAULT_MODEL = "vasily-qwen"
 DEFAULT_TEMPERATURE = 0.1
@@ -34,9 +28,6 @@ DEFAULT_NUM_PREDICT = 3072
 DEFAULT_RETRY_DELAY_BASE = 1.0
 MAX_RETRIES = 2
 
-# Warn when Ollama's real prompt token count differs from our estimate
-# by more than this fraction. NOTE: tools schemas are not counted by the
-# estimate, so with many/large tools a systematic positive drift is expected.
 TOKEN_DRIFT_WARNING_THRESHOLD = 0.15
 
 
@@ -70,7 +61,6 @@ class OllamaClient:
         self.num_ctx = num_ctx
         self.num_predict = num_predict
         self.retry_delay_base = retry_delay_base
-        # Optional: used for token estimate calibration (set by ReActLoop)
         self.token_manager = token_manager
         self._session: aiohttp.ClientSession | None = None
         self._crash_reporter = CrashReporter(Path(log_dir))
@@ -138,11 +128,10 @@ class OllamaClient:
         return await self._request_with_retries("/api/generate", payload)
 
     def _check_token_drift(self, messages: list[dict[str, Any]], result: dict[str, Any]) -> None:
-        """Compare Ollama's real prompt token count with TokenManager estimate.
-
-        Calibration feedback loop for T3-018: after a week of logs you will
-        know if the 2.5/4.0 chars-per-token coefficients are accurate.
-        """
+        """Compare Ollama's real prompt token count with our estimate.
+        Calibration for T3-018. Note: with tools attached, Ollama's
+        prompt includes tool schemas our estimate does not count —
+        a systematic positive drift there is EXPECTED."""
         if self.token_manager is None:
             return
         actual = result.get("prompt_eval_count")
@@ -165,27 +154,36 @@ class OllamaClient:
 
     @staticmethod
     def extract_thinking_and_answer(content: str) -> tuple[str, str]:
-        """Extracts <think>...</think> block and the rest of the content.
+        """Extract thinking and answer from model output.
         Returns (thinking_text, answer_text).
-        ADR-011: Used to separate reasoning from final answer.
+
+        Three cases (ADR-011 + stage 6.2b):
+        1. <think>...</think>      — block stripped, rest is the answer
+        2. <think> without closing — generation cut mid-thought:
+           everything after the opener is thinking, answer is empty
+        3. </think> without opener — Qwen3.5 emits a TAIL of thinking
+           without the head: everything BEFORE the tag is junk,
+           everything after is the answer
         """
         if not content:
             return "", ""
 
-        # Ищем блок <think>...</think> (регистронезависимо, с переносами строк)
         match = re.search(r"<think>(.*?)</think>", content, re.DOTALL | re.IGNORECASE)
         if match:
             thinking = match.group(1).strip()
-            # Удаляем блок из оригинального контента, чтобы получить чистый ответ
             answer = content[: match.start()] + content[match.end() :]
             return thinking, answer.strip()
 
-        # Незакрытый <think> (генерация оборвалась на размышлении):
-        # всё после открывающего тега — размышление, ответа нет.
         open_match = re.search(r"<think>", content, re.IGNORECASE)
         if open_match:
             thinking = content[open_match.end() :].strip()
             answer = content[: open_match.start()].strip()
+            return thinking, answer
+
+        close_match = re.search(r"</think>", content, re.IGNORECASE)
+        if close_match:
+            thinking = content[: close_match.start()].strip()
+            answer = content[close_match.end() :].strip()
             return thinking, answer
 
         return "", content.strip()

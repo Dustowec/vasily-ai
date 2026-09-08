@@ -1,4 +1,4 @@
-"""Tests for lazy per-request memory compression (replaces PeriodicScheduler)."""
+"""Tests for lazy per-request memory compression (ADR-013 §5, event queue)."""
 
 import pytest
 
@@ -60,6 +60,8 @@ async def test_trigger_does_not_stack_parallel_compressions():
 
 @pytest.mark.asyncio
 async def test_has_compression_candidates(tmp_path):
+    """ADR-013 §5: событийная модель — запись попадает в очередь
+    по итогам тика, впервые опустившись <= 5.0; no_compress — нет."""
     from memory.manager import GradientMemory
 
     memory = GradientMemory(data_dir=str(tmp_path))
@@ -68,8 +70,14 @@ async def test_has_compression_candidates(tmp_path):
     await memory.remember("k", "x" * 200, complex_query=True)  # score 40
     assert not memory.has_compression_candidates()
 
-    memory._hot["k"]["score"] = 0.0  # inside compression range
+    # запись подошла к порогу -> тик ставит её в очередь
+    memory._hot["k"]["score"] = 5.1
+    await memory.decay()  # 5.1 - 0.3 = 4.8 <= 5.0
     assert memory.has_compression_candidates()
 
-    memory._hot["k"]["protected"] = True
+    # no_compress не попадает в очередь (ей уготована ловушка миграции)
+    memory._hot["k"]["no_compress"] = True
+    memory._distill_queue.clear()
+    memory._hot["k"]["score"] = 5.1
+    await memory.decay()
     assert not memory.has_compression_candidates()

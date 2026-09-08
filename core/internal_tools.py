@@ -1,11 +1,8 @@
-"""Internal tools for Vasily AI agent.
+"""Internal tools for Vasily AI agent (ADR-013 aware).
 
-These tools are registered by AgentCore and available to the ReAct loop
-as built-in plugins. They are not loaded from the plugins/ directory.
-Stage 3: LLM-based semantic dedup (ДУБЛЬ/ДОПОЛНЕНИЕ/ПРОТИВОРЕЧИЕ),
-uuid fact keys, hardened query expansion, total_found fix.
-Stage 3.1: thinking stripped from LLM verdict/merge, whole-word dedup
-query, whole-word verdict matching.
+6.2: recall_memory heats found facts via memory.heat_facts() (§9);
+remember_fact uses explicit remember_user_fact (§8, score 40 + амнистия).
+Thinking-strip + whole-word dedup from stage 3.1 preserved.
 """
 
 import asyncio
@@ -24,7 +21,7 @@ logger = get_logger("core", "InternalTools")
 
 
 class RecallMemoryTool(BaseTool):
-    """Tool to search facts in agent's memory (HOT and COLD zones)."""
+    """Search facts across ALL zones (ADR-013 §9)."""
 
     name = "recall_memory"
     description = (
@@ -34,17 +31,16 @@ class RecallMemoryTool(BaseTool):
         "Immediately provide a final answer stating that you do not have this information in memory, "
         "or ask the user to provide the details."
     )
-    version = "1.3.0"
+    version = "2.0.0"
 
     def __init__(self, memory_manager=None, llm_client=None):
         self.memory = memory_manager
         self.llm_client = llm_client
 
     async def _expand_query(self, query: str) -> str:
-        """Расширяет запрос синонимами через LLM (0 МБ VRAM overhead)."""
+        """Query expansion via LLM (0 MB VRAM)."""
         if self.llm_client is None:
             return query
-
         prompt = (
             "Ты — генератор синонимов для поискового запроса. "
             "Верни ТОЛЬКО 3-5 ключевых слов-синонимов или связанных понятий "
@@ -65,18 +61,15 @@ class RecallMemoryTool(BaseTool):
             logger.warning("Query expansion timed out, using raw query")
         except Exception as e:
             logger.warning("Query expansion failed, using raw query", error=str(e))
-
         return query
 
     async def _execute(self, query: str = "", limit: int = 3, **kwargs) -> dict[str, Any]:
-        """Поиск фактов в памяти с предварительным расширением запроса через LLM."""
         if self.memory is None:
             return make_error(
                 "backend_unavailable",
                 "Memory manager not initialized",
                 "The agent is not ready. Please try again later.",
             )
-
         if not query or not query.strip():
             return {
                 "found": False,
@@ -94,56 +87,58 @@ class RecallMemoryTool(BaseTool):
         result = await self.memory.recall_memory(expanded_query)
 
         if result.get("found") and result.get("facts"):
-            # Fix: report the REAL total before slicing to limit.
+            # ADR-013 §9: нагрев найденного — heat_facts (write, после read-лока)
+            heated_keys = [f["key"] for f in result["facts"]]
+            try:
+                await self.memory.heat_facts(heated_keys)
+            except Exception as e:
+                logger.warning("heat_facts failed (non-fatal)", error=str(e))
+
             result["total_found"] = len(result["facts"])
             result["facts"] = result["facts"][:limit]
             result["expanded_query_used"] = expanded_query
         else:
             result["total_found"] = 0
             result["expanded_query_used"] = expanded_query
-
         return result
 
     def _get_parameters(self) -> dict[str, Any]:
         return {
             "query": {
                 "type": "string",
-                "description": "Keywords to search for in memory (e.g., 'имя главного героя', 'предпочтения пользователя')",
+                "description": "Keywords to search for in memory",
                 "required": True,
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of results to return (1-10, default: 3)",
+                "description": "Max results (1-10, default 3)",
                 "required": False,
             },
         }
 
 
 class RememberFactTool(BaseTool):
-    """Tool to save explicit facts to memory immediately."""
+    """Save explicit user facts (ADR-013 §8: score 40, 10-tick amnesty)."""
 
     name = "remember_fact"
     description = (
         "Save an important fact to agent's memory immediately. "
         "Use ONLY when user explicitly says 'запомни' or 'save this'. "
-        "Examples: 'Запомни: моего кота зовут Барсик', 'Save this: I prefer Python'. "
         "CRITICAL: Do NOT use for writing files. Use write_file for that."
     )
-    version = "2.1.0"
+    version = "3.0.0"
 
     def __init__(self, memory_manager=None, llm_client=None):
         self.memory = memory_manager
         self.llm_client = llm_client
 
     async def _execute(self, fact: str = "", **kwargs) -> dict[str, Any]:
-        """Save fact to HOT memory with LLM-based semantic dedup."""
         if self.memory is None:
             return make_error(
                 "backend_unavailable",
                 "Memory manager not initialized",
                 "The agent is not ready. Please try again later.",
             )
-
         if not fact or not fact.strip():
             return {
                 "status": "error",
@@ -151,16 +146,9 @@ class RememberFactTool(BaseTool):
             }
 
         clean_fact = fact.strip()[:2000]
-
-        # Stage 3.1: whole-word query instead of clean_fact[:50] —
-        # keywords beyond the first 50 chars are no longer invisible
-        # to the dedup pre-filter.
         words = re.findall(r"\w+", clean_fact.lower())
         search_query = " ".join(words)[:150]
 
-        # === СЕМАНТИЧЕСКАЯ ПРОВЕРКА НА ДУБЛИКАТ (LLM-вердикт) ===
-        # Консервативный fallback: если LLM недоступен, факт сохраняется
-        # как новый (потерять факт юзера хуже, чем сохранить дубликат).
         check = await self.memory.recall_memory(search_query)
         if check.get("found") and check.get("facts"):
             for existing in check["facts"][:2]:
@@ -172,53 +160,33 @@ class RememberFactTool(BaseTool):
                     return {
                         "status": "already_exists",
                         "message": (
-                            f"Этот факт уже сохранён в памяти (ключ: {existing['key']}). "
-                            "Не создавай дубликат. Просто ответь пользователю, "
-                            "что ты это уже знаешь."
+                            f"Этот факт уже сохранён (ключ: {existing['key']}). "
+                            "Не создавай дубликат — ответь, что уже знаешь."
                         ),
                         "existing_fact": existing_text,
                     }
                 if verdict == "ПРОТИВОРЕЧИЕ":
-                    # Новая информация заменяет устаревшую: перезапись по тому же ключу
-                    await self.memory.remember(existing["key"], clean_fact, complex_query=False)
+                    await self.memory.remember_user_fact(existing["key"], clean_fact)
                     return {
                         "status": "updated",
-                        "message": f"Факт обновлён (было устаревшее): {clean_fact[:100]}",
+                        "message": f"Факт обновлён: {clean_fact[:100]}",
                         "key": existing["key"],
                     }
                 if verdict == "ДОПОЛНЕНИЕ":
                     merged = await self._merge_facts(clean_fact, existing_text)
-                    await self.memory.remember(existing["key"], merged, complex_query=False)
+                    await self.memory.remember_user_fact(existing["key"], merged)
                     return {
                         "status": "merged",
                         "message": f"Факт дополнен: {merged[:150]}",
                         "key": existing["key"],
                     }
-        # =========================================================
 
-        # Дубликата нет — сохраняем как новый факт (uuid защищает от
-        # коллизий при двух фактах в одну секунду).
         key = f"user_fact:{uuid.uuid4().hex[:8]}"
-        await self.memory.remember(key, clean_fact, complex_query=len(clean_fact) > 100)
-
-        return {
-            "status": "success",
-            "message": f"Факт сохранён: {clean_fact[:100]}",
-            "key": key,
-        }
+        await self.memory.remember_user_fact(key, clean_fact)
+        return {"status": "success", "message": f"Факт сохранён: {clean_fact[:100]}", "key": key}
 
     async def _similarity_verdict(self, new_fact: str, existing_fact: str) -> str:
-        """Returns 'ДУБЛЬ' | 'ДОПОЛНЕНИЕ' | 'ПРОТИВОРЕЧИЕ' | 'НЕТ'.
-
-        Conservative fallback: if LLM is unavailable, treat as NEW fact
-        (storing a duplicate is better than losing a user's fact).
-
-        Stage 3.1: the thinking block is stripped BEFORE verdict matching.
-        A reasoning model may mention "ДУБЛЬ" inside its thinking while
-        actually answering "ДОПОЛНЕНИЕ" — matching on raw output would
-        misfire. Verdicts are matched as whole words, so "не ДУБЛЬ"
-        cannot accidentally match either.
-        """
+        """'ДУБЛЬ' | 'ДОПОЛНЕНИЕ' | 'ПРОТИВОРЕЧИЕ' | 'НЕТ'. Thinking stripped."""
         if self.llm_client is None:
             return "НЕТ"
         prompt = (
@@ -226,19 +194,17 @@ class RememberFactTool(BaseTool):
             f"A: {new_fact}\n"
             f"B: {existing_fact}\n"
             "Верни ровно одно слово-вердикт:\n"
-            "ДУБЛЬ — A и B утверждают одно и то же\n"
-            "ДОПОЛНЕНИЕ — A добавляет новое к B, противоречий нет\n"
-            "ПРОТИВОРЕЧИЕ — A противоречит B или заменяет устаревшую информацию\n"
-            "НЕТ — это разные факты\n"
-            "Ответ — ровно одно слово, без объяснений и без размышлений."
+            "ДУБЛЬ — одно и то же утверждение\n"
+            "ДОПОЛНЕНИЕ — A расширяет B без противоречий\n"
+            "ПРОТИВОРЕЧИЕ — A противоречит B или заменяет\n"
+            "НЕТ — разные факты\n"
+            "Ответ — ровно одно слово, без размышлений."
         )
         try:
             response = await asyncio.wait_for(
                 self.llm_client.generate(prompt, temperature=0.0), timeout=10.0
             )
-            raw = response.get("response", "")
-            # Strip thinking block: reasoning must never leak into the verdict
-            _, clean = OllamaClient.extract_thinking_and_answer(raw)
+            _, clean = OllamaClient.extract_thinking_and_answer(response.get("response", ""))
             answer_words = set(re.findall(r"\w+", clean.upper()))
             for word in ("ПРОТИВОРЕЧИЕ", "ДОПОЛНЕНИЕ", "ДУБЛЬ"):
                 if word in answer_words:
@@ -252,12 +218,6 @@ class RememberFactTool(BaseTool):
             return "НЕТ"
 
     async def _merge_facts(self, new_fact: str, existing_fact: str) -> str:
-        """Merge supplement into existing fact via LLM, fallback to concat.
-
-        Stage 3.1: thinking block is stripped from the merge result —
-        otherwise the model's internal monologue would be stored in
-        memory as part of a user fact.
-        """
         if self.llm_client is None:
             return f"{existing_fact}. {new_fact}"
         prompt = (
@@ -270,8 +230,7 @@ class RememberFactTool(BaseTool):
             response = await asyncio.wait_for(
                 self.llm_client.generate(prompt, temperature=0.1), timeout=15.0
             )
-            raw = response.get("response", "")
-            _, merged = OllamaClient.extract_thinking_and_answer(raw)
+            _, merged = OllamaClient.extract_thinking_and_answer(response.get("response", ""))
             merged = merged.strip()
             if merged and len(merged) < 500:
                 return merged
@@ -285,14 +244,14 @@ class RememberFactTool(BaseTool):
         return {
             "fact": {
                 "type": "string",
-                "description": "The fact to remember (e.g., 'моего кота зовут Барсик')",
+                "description": "The fact to remember",
                 "required": True,
             }
         }
 
 
 class ListFilesTool(BaseTool):
-    """Tool to list files in the workspace/reading directory."""
+    """List files in workspace/reading (unchanged, path-traversal safe)."""
 
     name = "list_files"
     description = (
@@ -310,11 +269,9 @@ class ListFilesTool(BaseTool):
             self.base_dir = Path(base_dir)
 
     async def _execute(self, path: str = "", **kwargs) -> dict[str, Any]:
-        """List files in the workspace/reading directory."""
         target_dir = Path(path) if path else self.base_dir
         if not target_dir.is_absolute():
             target_dir = self.base_dir / target_dir
-
         try:
             target_dir.resolve().relative_to(self.base_dir.resolve())
         except ValueError:
@@ -323,21 +280,18 @@ class ListFilesTool(BaseTool):
                 f"Path '{target_dir}' is outside workspace/reading directory.",
                 "Use a path within workspace/reading/.",
             )
-
         if not target_dir.exists():
             return make_error(
                 "invalid_url",
                 f"Directory '{target_dir}' does not exist.",
                 "Check that the directory exists and try again.",
             )
-
         if not target_dir.is_dir():
             return make_error(
                 "invalid_url",
                 f"Path '{target_dir}' is not a directory.",
                 "Provide a directory path.",
             )
-
         files = []
         try:
             for item in target_dir.iterdir():
@@ -355,21 +309,14 @@ class ListFilesTool(BaseTool):
                 f"Permission denied for directory '{target_dir}'.",
                 "The directory exists but cannot be read.",
             )
-
         files.sort(key=lambda x: x["name"])
-
-        return {
-            "status": "success",
-            "path": str(target_dir),
-            "count": len(files),
-            "files": files,
-        }
+        return {"status": "success", "path": str(target_dir), "count": len(files), "files": files}
 
     def _get_parameters(self) -> dict[str, Any]:
         return {
             "path": {
                 "type": "string",
-                "description": "Optional subdirectory within workspace/reading. Defaults to workspace/reading/.",
+                "description": "Optional subdirectory within workspace/reading.",
                 "required": False,
             },
         }
