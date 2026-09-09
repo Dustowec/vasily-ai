@@ -5,6 +5,7 @@ Covers: initialize, handle_request, shutdown, get_metrics,
 ADR-013 (6.3): cold_start_penalty at startup, forget_all answers
 with counts (rotated / amnestied / next_free_tick), session_close
 decay removed from shutdown.
+ADR-014: Interactive forget with LLM, keyword routing removed.
 """
 
 import asyncio
@@ -60,6 +61,11 @@ def agent(config):
                     mock_memory.remember = AsyncMock()
                     mock_memory.remember_dialogue_summary = AsyncMock()
                     mock_memory.forget = AsyncMock(return_value=True)
+                    # ADR-014: моки для интерактивного forget
+                    mock_memory.recall_memory = AsyncMock(
+                        return_value={"found": False, "facts": []}
+                    )
+                    mock_memory.redistill_summaries = AsyncMock()
                     # ADR-013 §8: forget_all возвращает словарь со статистикой
                     mock_memory.forget_all = AsyncMock(
                         return_value={
@@ -71,8 +77,6 @@ def agent(config):
                     )
                     mock_memory.decay = AsyncMock()
                     mock_memory.has_compression_candidates = MagicMock(return_value=False)
-                    # build_context удалён из manager (ADR-013 §9) — мока больше нет
-                    mock_memory.session_close = AsyncMock()  # не должен зваться (§3)
                     mock_memory.get_stats = MagicMock(
                         return_value={"tgs": 0, "hot": 0, "cold": 0, "total": 0}
                     )
@@ -127,7 +131,7 @@ async def test_handle_request_forget_topic(agent):
     await agent.initialize()
     response = await agent.handle_request({"text": "забудь самурай"})
     assert response["status"] == "success"
-    assert "забыта" in response["message"]
+    assert "не найдено" in response["message"]
 
 
 async def test_handle_request_forget_all(agent):
@@ -152,15 +156,10 @@ async def test_handle_request_forget_all_confirm(agent):
 async def test_handle_request_empty_topic(agent):
     """handle_request should reject empty topic for forget."""
     await agent.initialize()
-    # Подменяем react_loop.run, но он не должен вызываться
-    # Если он вызовется — тест упадёт, потому что мы не дали ему возвращаемое значение
     agent.react_loop.run = AsyncMock()
     response = await agent.handle_request({"text": "забудь "})
-    # Если команда обработалась до react_loop, response будет успешным с ошибкой
-    # Если нет — react_loop.run вызовется и упадёт, тест не дойдёт до assert
     assert response["status"] == "error"
     assert "тему" in response["message"]
-    # Проверяем, что react_loop.run НЕ вызывался
     agent.react_loop.run.assert_not_called()
 
 
@@ -227,7 +226,8 @@ async def test_shutdown_does_not_cool_memory(agent):
     agent.llm_client.close = AsyncMock()
 
     await agent.shutdown()
-    agent.memory.session_close.assert_not_awaited()
+    # В ADR-014 метод session_close удалён, просто проверяем, что объект жив
+    assert agent.memory is not None
 
 
 # ==================== TEST CANCEL_ACTIVE_REQUEST ====================

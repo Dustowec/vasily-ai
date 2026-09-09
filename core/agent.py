@@ -9,9 +9,13 @@ exist, compression runs as a BACKGROUND task (never blocks the reply).
 ADR-013 (6.3): cold_start_penalty() at startup (replaces the old
 session_close decay); forget_all answers with counts (rotated /
 amnestied / next free tick); session_close call removed.
+ADR-014: Keyword routing removed for all tools. LLM decides via tool-calling.
+Empty response safeguard for small models. Interactive forget with LLM classification.
 """
 
 import asyncio
+import json
+import re
 import signal
 import time
 import uuid
@@ -55,6 +59,8 @@ class AgentCore:
         self._dialogue_buffer: list[dict] = []
         self._llm_compressor = None
         self._compression_task: asyncio.Task | None = None
+        self._forget_candidates: list[dict] = []
+        self._forget_topic: str = ""
 
     async def initialize(self) -> None:
         """Initialize all subsystems."""
@@ -74,12 +80,10 @@ class AgentCore:
         )
 
         # ADR-013 §3: стартовое охлаждение (−2.0 всей памяти, кроме TGS).
-        # Заменяет собой старый session_close-decay при выключении.
         await self.memory.cold_start_penalty()
 
         self.plugin_registry.discover_plugins(self.config.plugins_dir)
 
-        # 1. Сначала инициализируем LLM клиент
         self.llm_client = OllamaClient(
             base_url=self.config.llm_url,
             model=self.config.llm_model,
@@ -90,7 +94,6 @@ class AgentCore:
             retry_delay_base=self.config.llm_retry_delay_base,
         )
 
-        # 2. Теперь регистрируем внутренние инструменты
         recall_tool = RecallMemoryTool(self.memory, self.llm_client)
         self.plugin_registry.register(recall_tool)
 
@@ -167,14 +170,13 @@ class AgentCore:
             if cmd == "help":
                 return {
                     "status": "success",
-                    "message": "Available commands: status, help, exit, забыть , забыть всё. "
+                    "message": "Available commands: status, help, exit, забыть [текст], забыть всё, удалить [номера/всех]. "
                     "Any other text is processed by AI with access to plugins. "
                     "Ctrl+C cancels the current request.",
                 }
 
             if "забудь всё" in cmd or "забыть всё" in cmd:
                 if "да" in cmd:
-                    # ADR-013 §8: ротация с амнистией свежих user_fact
                     result = await self.memory.forget_all(confirm=True)
                     if result.get("confirmed"):
                         self._dialogue_window.clear()
@@ -184,7 +186,6 @@ class AgentCore:
                             llm_client=self.llm_client,
                             plugin_registry=self.plugin_registry,
                         )
-                        # §8: ответ с числами (очищено N / сохранено M / тик X)
                         msg = (
                             f"Память очищена: удалено {result['rotated']} записей, "
                             f"сохранено {result['amnestied']} свежих фактов. "
@@ -200,115 +201,89 @@ class AgentCore:
                     }
 
             if cmd.startswith("забудь") or cmd.startswith("забыть"):
-                parts = cmd.split(maxsplit=1)
+                parts = user_text.split(maxsplit=1)
                 if len(parts) < 2 or not parts[1].strip():
                     return {"status": "error", "message": "Укажите тему для забывания."}
                 topic = parts[1].strip()
-                result = await self.memory.forget(topic)
-                if result:
-                    return {"status": "success", "message": f"Тема '{topic}' забыта."}
-                return {"status": "error", "message": f"Тема '{topic}' не найдена."}
+                self._forget_topic = topic
 
-            search_keywords = [
-                "поищи",
-                "найди",
-                "погода",
-                "новости",
-                "цена",
-                "курс",
-                "сколько стоит",
-                "узнай",
-                "расскажи про",
-                "что такое",
-                "как работает",
-                "когда",
-                "где",
-                "кто такой",
-                "что происходит",
-            ]
-            local_file_keywords = [
-                "прочитай",
-                "открой",
-                "файл",
-                "книга",
-                ".pdf",
-                ".txt",
-                ".docx",
-                "workspace",
-                "reading",
-                "папк",
-                "директори",
-                "посмотри в",
-            ]
-            text_lower = user_text.lower()
-            is_search = any(kw in text_lower for kw in search_keywords)
-            is_local = any(kw in text_lower for kw in local_file_keywords)
+                # 1. Поиск в базе памяти
+                search_result = await self.memory.recall_memory(topic)
+                if not search_result.get("found"):
+                    return {"status": "success", "message": f"По теме '{topic}' ничего не найдено."}
 
-            if is_search and not is_local:
-                web_search_tool = self.plugin_registry.get("web_search")
-                if web_search_tool:
-                    logger.info(
-                        "Auto-detected search query, calling web_search directly",
-                        text=user_text[:50],
-                    )
-                    try:
-                        result = await web_search_tool.execute(query=user_text, limit=5)
-                        if result.get("status") == "success":
-                            results = result.get("results", [])
-                            if results:
-                                answer = f"Результаты поиска по запросу '{user_text}':\n"
-                                for i, r in enumerate(results[:5], 1):
-                                    title = r.get("title", "Без названия")
-                                    snippet = r.get("snippet", "")
-                                    url = r.get("url", "")
-                                    answer += f"{i}. **{title}**\n"
-                                    if snippet:
-                                        answer += f"   {snippet}\n"
-                                    if url:
-                                        answer += f"   Источник: {url}\n"
-                                    answer += "\n"
-                                # Stage 5b: search results also go to dialogue
-                                # window/buffer, so the agent remembers what
-                                # was just searched in the next request.
-                                await self._store_dialogue(
-                                    user_text, {"status": "success", "answer": answer}
-                                )
-                                duration_ms = (time.time() - start) * 1000
-                                self.metrics.record_request(
-                                    duration_ms=duration_ms,
-                                    status="success",
-                                    iterations=0,
-                                )
-                                return {"status": "success", "message": answer, "iterations": 0}
-                            else:
-                                return {
-                                    "status": "success",
-                                    "message": f"По запросу '{user_text}' ничего не найдено.",
-                                }
-                        else:
-                            error_msg = result.get("message", "Неизвестная ошибка при поиске")
-                            return {"status": "error", "message": f"Ошибка поиска: {error_msg}"}
-                    except Exception as e:
-                        logger.error("Web search failed", error=str(e))
-                        return {
-                            "status": "error",
-                            "message": f"Ошибка при выполнении поиска: {str(e)}",
-                        }
+                # 2. LLM классификация
+                candidates = await self._llm_filter_forget(topic, search_result.get("facts", []))
+                if not candidates:
+                    return {"status": "success", "message": f"По теме '{topic}' ничего не найдено."}
+
+                # 3. Сценарий А: только 1 user_fact -> молчаливое удаление
+                if len(candidates) == 1 and candidates[0]["key"].startswith("user_fact:"):
+                    await self.memory.forget(candidates[0]["key"])
+                    await self.memory.redistill_summaries(topic, self._llm_rewrite_summary)
+                    return {"status": "success", "message": f"Факт по теме '{topic}' удален."}
+
+                # 4. Сценарий Б: несколько совпадений -> запрос юзеру
+                self._forget_candidates = candidates
+                msg = "Я нашел несколько упоминаний. Кого убиваем?\n"
+                for i, c in enumerate(candidates):
+                    text = c.get("summary") or str(c.get("value"))[:50]
+                    msg += f"{i+1}. {text}\n"
+                msg += "Напишите 'удалить 1, 2' или 'удалить всех'."
+                return {"status": "success", "message": msg}
+
+            if cmd.startswith("удалить"):
+                if not self._forget_candidates:
+                    return {"status": "error", "message": "Нет активных кандидатов на удаление."}
+
+                parts = cmd.split(maxsplit=1)
+                if len(parts) < 2:
+                    return {"status": "error", "message": "Укажите номера или 'всех'."}
+
+                choice = parts[1].strip()
+                keys_to_delete = []
+
+                if choice == "всех":
+                    keys_to_delete = [c["key"] for c in self._forget_candidates]
                 else:
-                    logger.warning("web_search plugin not found, falling back to ReAct")
+                    try:
+                        indices = [int(x.strip()) for x in choice.split(",")]
+                        for idx in indices:
+                            if 0 < idx <= len(self._forget_candidates):
+                                keys_to_delete.append(self._forget_candidates[idx - 1]["key"])
+                    except ValueError:
+                        return {"status": "error", "message": "Неверный формат. Пример: 1, 2"}
+
+                if not keys_to_delete:
+                    return {"status": "error", "message": "Ничего не выбрано."}
+
+                topic = self._forget_topic
+                for key in keys_to_delete:
+                    await self.memory.forget(key)
+
+                if topic:
+                    await self.memory.redistill_summaries(topic, self._llm_rewrite_summary)
+
+                self._forget_candidates = []
+                self._forget_topic = ""
+                return {"status": "success", "message": f"Удалено записей: {len(keys_to_delete)}."}
+
+            # === ADR-014: Keyword-роутинг полностью вырезан ===
+            # LLM сама решает, вызывать инструменты или нет.
 
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
             structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
 
-            # Stage 5b: deep-copy messages. token_manager.trim_messages MUTATES
-            # message dicts (truncation); sharing dicts with _dialogue_window
-            # would permanently corrupt stored dialogue history.
             dialogue_history = [dict(m) for m in self._dialogue_window]
             result = await self.react_loop.run(
                 user_text, dialogue_history=dialogue_history, prompt_type="default"
             )
+
+            # Защита от пустого ответа LLM
+            if result.get("status") == "success" and not str(result.get("answer", "")).strip():
+                result["answer"] = "Я задумался, но забыл ответить. Можешь переформулировать?"
 
             duration_ms = (time.time() - start) * 1000
             logger.info(
@@ -319,9 +294,6 @@ class AgentCore:
             )
 
             await self._store_dialogue(user_text, result)
-            await self.memory.decay(self._session_requests)
-            # Stage 8: lazy compression trigger (replaces PeriodicScheduler)
-            self._maybe_compress_memory()
 
             status = result.get("status")
             self.metrics.record_request(
@@ -361,18 +333,51 @@ class AgentCore:
             self._errors_count += 1
             logger.error("Request failed", error=str(e))
             return {"status": "error", "message": str(e)}
+        finally:
+            # ADR-014: Инвариант «1 запрос = 1 тик» соблюдается при любом исходе
+            await self.memory.decay(self._session_requests)
+            self._maybe_compress_memory()
+
+    async def _llm_filter_forget(self, topic: str, facts: list[dict]) -> list[dict]:
+        """Классификация найденных фактов через LLM."""
+        if not facts:
+            return []
+
+        prompt = f"Пользователь хочет забыть тему: '{topic}'. Вот найденные факты:\n"
+        for i, f in enumerate(facts):
+            text = f.get("summary") or str(f.get("value"))
+            prompt += f"{i+1}. {text}\n"
+        prompt += 'Верни ТОЛЬКО JSON-объект: {"ids": [1, 2]}. Где ids — номера фактов, которые СТРОГО относятся к теме.'
+
+        try:
+            resp = await self.llm_client.generate(prompt)
+            match = re.search(r"\{.*\}", resp, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+                ids = data.get("ids", [])
+                return [facts[i - 1] for i in ids if 0 < i <= len(facts)]
+        except Exception as e:
+            logger.error("LLM filter for forget failed", error=str(e))
+        return []
+
+    async def _llm_rewrite_summary(self, text: str, topic: str) -> str:
+        """Переписывает саммари, удаляя упоминания темы."""
+        prompt = (
+            f"Перепиши следующий текст, полностью удалив любую информацию о '{topic}'. "
+            f"Если без этой информации текст теряет смысл, просто верни пустую строку. "
+            f"Текст:\n{text}"
+        )
+        try:
+            resp = await self.llm_client.generate(prompt)
+            return resp.strip()
+        except Exception as e:
+            logger.error("LLM rewrite summary failed", error=str(e))
+            return text
 
     def _maybe_compress_memory(self) -> None:
-        """Kick off background HOT→COLD compression when cooled entries exist.
-
-        Stage 8: replaces the former PeriodicScheduler (blind 6-hour timer).
-        The check itself is a cheap sync dict scan on every request; the
-        expensive LLM summarization runs as a BACKGROUND task, so the user's
-        request latency is never affected by compression. ADR-013 §5: the
-        event-driven distill queue is drained by the same background worker.
-        """
+        """Kick off background HOT→COLD compression when cooled entries exist."""
         if self._compression_task and not self._compression_task.done():
-            return  # a compression run is already in flight
+            return
         try:
             if not self.memory.has_compression_candidates():
                 return
@@ -400,7 +405,7 @@ class AgentCore:
     async def _store_dialogue(self, user_text: str, result: dict[str, Any]) -> None:
         """Store dialogue turn in sliding window AND buffer for compression (ADR-011 fix)."""
         status = result.get("status")
-        answer = str(result.get("answer", "") or "").strip()
+        answer = str(result.get("answer", "") or result.get("message", "")).strip()
 
         if status not in ("success", "interrupted"):
             return
@@ -561,9 +566,6 @@ class AgentCore:
         """Graceful shutdown: save state, stop workers."""
         logger.info("Shutting down agent...")
 
-        # ADR-013 §3: сессионный decay при завершении отменён — остывание
-        # теперь применяется при СТАРТЕ (cold_start_penalty в initialize()).
-
         if self._dialogue_buffer:
             logger.info(
                 "Compressing remaining dialogue buffer on shutdown",
@@ -571,8 +573,6 @@ class AgentCore:
             )
             await self._compress_and_store_dialogue(force=True)
 
-        # Stage 8: let an in-flight background compression finish while
-        # the LLM client is still open.
         if self._compression_task and not self._compression_task.done():
             logger.info("Waiting for background memory compression to finish")
             try:

@@ -4,6 +4,7 @@
 границу ровно 10 тиков, next_free_tick, точечный forget поверх амнистии,
 префиксную фильтрацию амнистии, страховку поверх рестарта (total_ticks
 персистентен), механику ротации всех зон, очистку очереди дистилляции.
+ADR-014: точечный forget — строго физическое удаление.
 """
 
 import pytest
@@ -97,20 +98,19 @@ async def test_amnesty_only_for_user_fact_prefix(m):
     assert "dialogue_summary:d" in m._cold
 
 
-# ==================== точечный forget поверх амнистии (§8) ====================
+# ==================== точечный forget поверх амнистии (§8/§14) ====================
 
 
 async def test_point_forget_ignores_amnesty(m):
     """§8: амнистия НЕ распространяется на точечный 'забудь X' —
     юзер может осознанно удалить ошибочный факт в любой момент.
-    Ключ при переносе зон не меняется (user_fact:pf остаётся собой)."""
+    ADR-014: запись физически удаляется, в COLD не отправляется."""
     await m.remember_user_fact("user_fact:pf", "ошибочный факт")
     await m.decay()  # 1 тик — окно амнистии ещё идёт
     ok = await m.forget("user_fact:pf")
     assert ok is True
     assert "user_fact:pf" not in m._hot
-    assert "user_fact:pf" in m._cold  # 40-50=-10 -> COLD доживать
-    assert m._cold["user_fact:pf"]["value"] == "ошибочный факт"
+    assert "user_fact:pf" not in m._cold  # Физическое удаление (ADR-014)
 
 
 # ==================== страховка поверх рестарта (§3.1/§8) ====================

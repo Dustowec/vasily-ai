@@ -1,8 +1,8 @@
-"""Gradient Cascade Memory — Vasily AI (ADR-013).
+"""Gradient Cascade Memory — Vasily AI (ADR-013 / ADR-014).
 
 Зоны: TGS 50..60 (рабочий кэш топ-10) / HOT 0.1..49.9 (вход и фильтр) /
 COLD -0.1..-49.9 (прихожая перед удалением). Бессмертной памяти нет.
-Спека: docs/adr/013-gradient-cascade-memory.md
+Спека: docs/adr/013-gradient-cascade-memory.md, ADR-014 (physical forget).
 """
 
 import asyncio
@@ -62,24 +62,13 @@ LOCK_TIMEOUT = 2.0
 TEMP_SUFFIX = ".tmp"
 META_FILE = "meta.json"  # §3.1: data/meta.json -> {"total_ticks": N}
 
-# Пути зон как МОДУЛЬНЫЕ константы: тесты monkeypatch-ат их для изоляции
-# (см. _zone_path — разрешение абсолютных/относительных путей).
 TGS_FILE = "data/tgs_memory.json"
 HOT_FILE = "data/tg_hot_memory.json"
 COLD_FILE = "data/tg_cold_memory.json"
 
 
 class GradientMemory:
-    """Градиентно-каскадная память. Спека: ADR-013.
-
-    Locking model:
-    - write-операции (remember/forget/decay/heat_facts/recall/compress_cycle)
-      — под write-локом, сериализованы;
-    - recall_memory — read-лок; после захвата лока await'ов НЕТ
-      (atomic в event loop). Не добавлять await внутрь read-секции;
-    - нагрев найденного — отдельный write-метод heat_facts() ПОСЛЕ
-      закрытия read-лока (§9).
-    """
+    """Градиентно-каскадная память. Спека: ADR-013/014."""
 
     def __init__(self, data_dir: str = "data"):
         self.data_dir = Path(data_dir)
@@ -88,7 +77,7 @@ class GradientMemory:
         self.tgs_file = self._zone_path(TGS_FILE, "tgs_memory.json")
         self.hot_file = self._zone_path(HOT_FILE, "tg_hot_memory.json")
         self.cold_file = self._zone_path(COLD_FILE, "tg_cold_memory.json")
-        self.meta_file = self.data_dir / META_FILE  # §3.1
+        self.meta_file = self.data_dir / META_FILE
 
         self._read_lock = asyncio.Semaphore(5)
         self._write_lock = asyncio.Lock()
@@ -97,22 +86,20 @@ class GradientMemory:
         self._hot: dict[str, dict] = {}
         self._cold: dict[str, dict] = {}
 
-        self._distill_queue: list[str] = []  # §5: событийная очередь
-        self._ticks_since_recall = 0  # §4.1: активный режим
-        self._total_ticks = 0  # §3.1/§8: персистентный
+        self._distill_queue: list[str] = []
+        self._ticks_since_recall = 0
+        self._total_ticks = 0
 
         self._load_all()
         self._load_meta()
 
     def _zone_path(self, configured: str, fallback_filename: str) -> Path:
-        """Абсолютный путь (тестовый monkeypatch) — как есть;
-        относительный дефолт — от data_dir (прод с кастомным data_dir)."""
         p = Path(configured)
         if p.is_absolute():
             return p
         return self.data_dir / fallback_filename
 
-    # ---------------- meta.json (§3.1) ----------------
+    # ---------------- meta.json ----------------
 
     def _load_meta(self) -> None:
         if not self.meta_file.exists():
@@ -135,13 +122,9 @@ class GradientMemory:
         except Exception as e:
             logger.error("Failed to save meta", error=str(e))
 
-    # ---------------- загрузка (с миграцией legacy, §10.5) ----------------
+    # ---------------- загрузка ----------------
 
     def _load_all(self) -> None:
-        """- protected -> no_compress (§6); compressing (краш) срезается
-        - value-носители в COLD -> no_compress=True
-        - записи вне пулов -> прижим к ближайшей границе
-        - TGS-дубли в hot/cold -> удаляются (приоритет TGS)"""
         self._tgs = self._load_zone(self.tgs_file)
         self._hot = self._load_zone(self.hot_file)
         self._cold = self._load_zone(self.cold_file)
@@ -191,7 +174,7 @@ class GradientMemory:
             logger.warning("Failed to load memory zone", path=str(path), error=str(e))
             return {}
 
-    # ---------------- сохранение (атомарное) ----------------
+    # ---------------- сохранение ----------------
 
     async def _save_zone(self, zone: str, data: dict[str, dict]) -> None:
         path_map = {"tgs": self.tgs_file, "hot": self.hot_file, "cold": self.cold_file}
@@ -258,13 +241,9 @@ class GradientMemory:
             return "cold"
         return None
 
-    # ================= §4: единая точка нагрева =================
+    # ================= §4: нагрев =================
 
     def _apply_heat(self, entry: dict, amount: float, key: str) -> None:
-        """§4: enforcing «один нагрев за тик». Повторный нагрев того же
-        тика меняет только updated_at. Ревайвал — тоже нагрев тика.
-        Осознанный побочный эффект: recall+remember в одном тике ->
-        второй нагрев деградирует до updated_at."""
         if entry.get("last_heat_tick") == self._total_ticks:
             entry["updated_at"] = datetime.now().isoformat()
             logger.debug("Heat suppressed (same tick)", key=key, amount=amount)
@@ -282,10 +261,6 @@ class GradientMemory:
     # ================= §6: revival =================
 
     def _revive_entry(self, entry: dict, heat_amount: float, key: str) -> None:
-        """§6: score = max(текущий + N, 2.0); no_compress = True;
-        changed_since_revival = False. Value НЕ восстанавливается (§6):
-        содержимое дистиллированной записи — summary; remember восстановит.
-        Единственный нагрев записи в этом тике — здесь (N внутри)."""
         entry["score"] = max(entry.get("score", 0) + heat_amount, REVIVAL_FLOOR)
         entry["no_compress"] = True
         entry["changed_since_revival"] = False
@@ -296,9 +271,6 @@ class GradientMemory:
         logger.info("Revived from COLD", key=key, score=entry["score"])
 
     def _try_unprotect(self, entry: dict, key: str) -> None:
-        """§6: снятие no_compress — score >= 8 И изменён.
-        Единственный способ снятия флага. Вызов при операции нагрева —
-        это ПРОВЕРКА, само снятие требует обоих условий."""
         if (
             entry.get("no_compress")
             and entry.get("changed_since_revival")
@@ -307,11 +279,9 @@ class GradientMemory:
             entry["no_compress"] = False
             logger.info("no_compress released", key=key, score=entry["score"])
 
-    # ================= запись в память (§4/§6/§8) =================
+    # ================= запись =================
 
     async def remember(self, key: str, value: Any, complex_query: bool = False) -> None:
-        """Универсальная запись (совместимость с 3.1/5b): user_fact:* ->
-        score 40 + страховка §8; остальные — 15/40."""
         if key.startswith("user_fact:"):
             await self.remember_user_fact(key, value)
             return
@@ -319,11 +289,9 @@ class GradientMemory:
         await self._store_entry(key, value, initial)
 
     async def remember_user_fact(self, key: str, value: Any) -> None:
-        """§8: вход score=40, страховка forget_all = 10 тиков."""
         await self._store_entry(key, value, 40.0)
 
     async def remember_dialogue_summary(self, key: str, value: Any) -> None:
-        """Системное саммари: вход score=15 (низкий приоритет)."""
         await self._store_entry(key, value, DEFAULT_SIMPLE_SCORE)
 
     async def _store_entry(self, key: str, value: Any, initial_score: float) -> None:
@@ -341,12 +309,11 @@ class GradientMemory:
                 "last_heat_tick": -1,
                 "created_at": now,
                 "updated_at": now,
-                "created_tick": self._total_ticks,  # §8 страховка
+                "created_tick": self._total_ticks,
             }
 
             existing = self._find_entry_unlocked(key)
             if existing:
-                # метаданные существующей переносим в новую запись
                 entry["score"] = existing.get("score", 0)
                 entry["last_heat_tick"] = existing.get("last_heat_tick", -1)
                 entry["created_at"] = existing.get("created_at", now)
@@ -356,10 +323,9 @@ class GradientMemory:
                 zone = self._get_zone_unlocked(key)
 
                 if zone == "cold":
-                    # §6: revival; ЕДИНСТВЕННЫЙ нагрев — внутри _revive_entry
                     self._revive_entry(entry, HEAT_REMEMBER, key)
-                    entry["changed_since_revival"] = True  # remember = изменение
-                    entry["value"] = value  # remember восстанавливает value (§6)
+                    entry["changed_since_revival"] = True
+                    entry["value"] = value
                     del self._cold[key]
                     await self._save_zone("cold", self._cold)
                     self._hot[key] = entry
@@ -368,10 +334,8 @@ class GradientMemory:
                     logger.info("Remember: revived from COLD", key=key, score=entry["score"])
                     return
 
-                # TGS/HOT: нагрев через единую точку (§4)
                 self._apply_heat(entry, HEAT_REMEMBER, key)
                 if existing.get("no_compress"):
-                    # §6: remember = изменение
                     entry["no_compress"] = True
                     entry["changed_since_revival"] = True
                     self._try_unprotect(entry, key)
@@ -382,13 +346,11 @@ class GradientMemory:
                     logger.info("Remember: reinforced in TGS", key=key, score=entry["score"])
                     return
 
-                # zone == "hot"
                 self._hot[key] = entry
                 await self._save_zone("hot", self._hot)
-                await self._maybe_promote_to_tgs(key)  # §4/§7: лестница
+                await self._maybe_promote_to_tgs(key)
                 return
 
-            # новая запись -> HOT (создание = нагрев этого тика, §4)
             entry["last_heat_tick"] = self._total_ticks
             self._hot[key] = entry
             await self._save_zone("hot", self._hot)
@@ -397,12 +359,9 @@ class GradientMemory:
         finally:
             self._release_write()
 
-    # ================= §4/§9: heat_facts =================
+    # ================= heat_facts =================
 
     async def heat_facts(self, keys: list[str]) -> None:
-        """Нагрев фактов, попавших в ответ агенту (§4). Write-метод,
-        зовётся тулзой ПОСЛЕ закрытия read-лока поиска (§9).
-        Холодная находка воскрешается по общим правилам (§6)."""
         await self._acquire_write()
         try:
             heated = 0
@@ -420,11 +379,11 @@ class GradientMemory:
                     heated += 1
                     continue
                 self._apply_heat(entry, HEAT_RECALL, key)
-                self._try_unprotect(entry, key)  # §6: проверка снятия при нагреве
+                self._try_unprotect(entry, key)
                 touched.add(zone)
                 heated += 1
                 if zone == "hot":
-                    await self._maybe_promote_to_tgs(key)  # сам saves при промоции
+                    await self._maybe_promote_to_tgs(key)
             for z in ("tgs", "hot", "cold"):
                 if z in touched:
                     await self._save_zone(z, getattr(self, f"_{z}"))
@@ -433,12 +392,9 @@ class GradientMemory:
         finally:
             self._release_write()
 
-    # ================= §4/§7: лестница промоции в TGS =================
+    # ================= лестница промоции =================
 
     async def _maybe_promote_to_tgs(self, key: str) -> None:
-        """Нагрев HOT выше 49.9 -> TGS, вход min(расчётный, 60).
-        Переполнение -> LRU-evict -> HOT(40), shield снимается (§7).
-        Вызывать под write-локом."""
         entry = self._hot.get(key)
         if not entry:
             return
@@ -446,7 +402,7 @@ class GradientMemory:
             return
 
         entry["score"] = min(entry["score"], SCORE_CEILING)
-        entry["shield"] = True  # §7: иммунитет от старт-−2 = членство в TGS
+        entry["shield"] = True
         del self._hot[key]
         self._tgs[key] = entry
         await self._save_zone("hot", self._hot)
@@ -465,16 +421,12 @@ class GradientMemory:
         await self._save_zone("tgs", self._tgs)
         logger.info("Promoted to TGS", key=key, score=entry["score"])
 
-    # ================= §3: стартовое охлаждение =================
+    # ================= стартовое охлаждение =================
 
     async def cold_start_penalty(self) -> None:
-        """§3: при старте −2.0 всем, кроме TGS. После −2 записи
-        расходятся по классам (§3/§5): no_compress <= 0.5 -> миграция;
-        unprotected <= 5.0 -> очередь дистилляции. Мигрант этого вызова
-        свой −2 уже получил в HOT — повторно в COLD-проходе не остывает."""
         await self._acquire_write()
         try:
-            cold_before = set(self._cold.keys())  # фиксируем COLD до миграций
+            cold_before = set(self._cold.keys())
             hot_changed = False
             for key, entry in list(self._hot.items()):
                 entry["score"] = round(entry.get("score", 0) + COLD_START_PENALTY, 1)
@@ -493,7 +445,7 @@ class GradientMemory:
             cold_changed = False
             for key, entry in self._cold.items():
                 if key not in cold_before:
-                    continue  # переселенец этого вызова: −2 уже учтён выше
+                    continue
                 entry["score"] = round(entry.get("score", 0) + COLD_START_PENALTY, 1)
                 entry["updated_at"] = datetime.now().isoformat()
                 cold_changed = True
@@ -505,11 +457,6 @@ class GradientMemory:
             self._release_write()
 
     async def _migrate_to_cold(self, key: str, entry: dict) -> None:
-        """§5: миграция as-is (value ЦЕЛИКОМ, без LLM) + миграционный
-        штраф −0.7 на финише; прижим к -0.1 гарантирует пул COLD.
-        Вызывать под write-локом. Скор записи к моменту вызова должен
-        УЖЕ включать понижение текущего такта (§5: ловушка считается
-        от результата вычета)."""
         entry["score"] = min(round(entry.get("score", 0) + MIGRATION_FEE, 1), -0.1)
         entry["is_cold"] = True
         del self._hot[key]
@@ -518,21 +465,15 @@ class GradientMemory:
         await self._save_zone("cold", self._cold)
         logger.info("Migrated to COLD (as-is)", key=key, score=entry["score"])
 
-    # ================= §4.1: остывание =================
+    # ================= остывание =================
 
     async def decay(self, count_requests: int = 0) -> None:
-        """Тик. §4.1: 1 запрос = 1 тик; таблица коэффициентов; активный
-        режим (10 тиков без recall_memory). §5: событийная очередь
-        (впервые <= 5.0) и ловушка <= 0.5 применяются к результату
-        вычета НЕМЕДЛЕННО, до сохранения. no_compress decay НЕ блокирует.
-        Мигрант этого тика COLD-decay того же тика не получает."""
         await self._acquire_write()
         try:
             self._total_ticks += 1
             self._ticks_since_recall += 1
             active = self._ticks_since_recall >= ACTIVE_MODE_WINDOW
 
-            # ---- TGS (§7) ----
             tgs_changed = False
             for entry in self._tgs.values():
                 entry["score"] = round(entry.get("score", 0) + DECAY_TGS, 1)
@@ -542,15 +483,12 @@ class GradientMemory:
             if tgs_changed:
                 await self._save_zone("tgs", self._tgs)
 
-            # ---- HOT ----
             hot_rate = DECAY_HOT_ACTIVE if active else DECAY_HOT_BASE
             hot_changed = False
             migrated_this_tick: set[str] = set()
             for key, entry in list(self._hot.items()):
                 new_score = round(entry.get("score", 0) + hot_rate, 1)
                 if entry.get("no_compress", False):
-                    # §5: ловушка <= 0.5 -> миграция as-is (+штраф внутри),
-                    # от РЕЗУЛЬТАТА вычета, а не от старого скора
                     if new_score <= MIGRATION_TRAP:
                         entry["score"] = new_score
                         await self._migrate_to_cold(key, entry)
@@ -558,7 +496,6 @@ class GradientMemory:
                         hot_changed = True
                         continue
                 else:
-                    # §5: событийная очередь — впервые <= 5.0
                     if new_score <= DISTILL_TRIGGER and key not in self._distill_queue:
                         self._distill_queue.append(key)
                         logger.info("Queued for distillation", key=key, score=new_score)
@@ -573,12 +510,11 @@ class GradientMemory:
             if hot_changed:
                 await self._save_zone("hot", self._hot)
 
-            # ---- COLD ----
             cold_rate = DECAY_COLD_ACTIVE if active else DECAY_COLD_BASE
             cold_changed = False
             for key, entry in list(self._cold.items()):
                 if key in migrated_this_tick:
-                    continue  # мигрант этого тика: своё понижение уже учтено (§5)
+                    continue
                 new_score = round(entry.get("score", 0) + cold_rate, 1)
                 cold_changed = True
                 if new_score <= DELETE_BELOW:
@@ -590,7 +526,7 @@ class GradientMemory:
             if cold_changed:
                 await self._save_zone("cold", self._cold)
 
-            await self._save_meta()  # §3.1: total_ticks персистентен
+            await self._save_meta()
             logger.debug(
                 "Decay tick done",
                 tick=self._total_ticks,
@@ -601,7 +537,6 @@ class GradientMemory:
             self._release_write()
 
     async def _tgs_decay_demote(self) -> None:
-        """§7: TGS ниже 50.0 -> HOT(40), shield снимается."""
         for key in list(self._tgs.keys()):
             if self._tgs[key].get("score", TGS_MIN) < TGS_MIN:
                 entry = self._tgs.pop(key)
@@ -610,18 +545,12 @@ class GradientMemory:
                 self._hot[key] = entry
                 logger.info("TGS decay: demoted to HOT(40)", key=key)
 
-    # ================= §5: дистилляция очереди =================
+    # ================= дистилляция =================
 
     def has_compression_candidates(self) -> bool:
-        """Триггер ленивого фонового запуска (AgentCore): очередь не пуста?"""
         return len(self._distill_queue) > 0
 
     async def compress_cycle(self, compressor: Callable[[Any], Awaitable[str]]) -> int:
-        """§5, три фазы: 1) партия из очереди (под локом, compressing);
-        2) LLM-саммари БЕЗ лока (память дышит); 3) пере-валидация
-        (score > 5.0 / no_compress / заменена -> вычеркнуть, §5),
-        успех: COLD с score = -5.0, value -> None, содержимое = summary."""
-        # ---- Phase 1 ----
         await self._acquire_write()
         try:
             batch: list[tuple[str, dict]] = []
@@ -631,7 +560,7 @@ class GradientMemory:
                 if entry is None or entry.get("compressing"):
                     continue
                 if entry.get("score", 0) > DISTILL_TRIGGER or entry.get("no_compress"):
-                    continue  # пере-валидация на входе (§5)
+                    continue
                 entry["compressing"] = True
                 batch.append((key, dict(entry)))
             if batch:
@@ -642,7 +571,6 @@ class GradientMemory:
         if not batch:
             return 0
 
-        # ---- Phase 2: LLM, без лока ----
         summaries: dict[str, str | None] = {}
         for key, entry in batch:
             try:
@@ -652,7 +580,6 @@ class GradientMemory:
                 logger.error("Distillation failed", key=key, error=str(e))
                 summaries[key] = None
 
-        # ---- Phase 3: применить с пере-валидацией (§5) ----
         await self._acquire_write()
         try:
             distilled = 0
@@ -661,16 +588,16 @@ class GradientMemory:
             for key, summary in summaries.items():
                 live = self._hot.get(key)
                 if live is None or not live.get("compressing"):
-                    continue  # заменена/удалена, пока LLM думал
+                    continue
                 live.pop("compressing", None)
                 hot_dirty = True
                 if live.get("score", 0) > DISTILL_TRIGGER or live.get("no_compress"):
-                    continue  # нагрели/флаг — не дистиллируем (§5)
+                    continue
                 if not summary:
-                    continue  # компрессор сдался — следующий тик
+                    continue
                 cold_entry = {
-                    "value": None,  # §6: содержимое = summary
-                    "score": DISTILLED_SCORE,  # §5: фикс вход -5.0
+                    "value": None,
+                    "score": DISTILLED_SCORE,
                     "is_cold": True,
                     "no_compress": False,
                     "shield": False,
@@ -695,58 +622,83 @@ class GradientMemory:
         finally:
             self._release_write()
 
-    # ================= §8: forget =================
+    # ================= §8/§14: forget =================
 
     async def forget(self, key: str) -> bool:
-        """Точечное удаление по ТОЧНОМУ ключу (§8). Страховка НЕ действует:
-        осознанное действие. TGS -> HOT(40); HOT/COLD -> -50, удаление
-        или до-живание в COLD. Ключ при переносе зон НЕ меняется."""
+        """ADR-014: Точечное ФИЗИЧЕСКОЕ удаление по ключу.
+        Амнистия не действует: осознанное действие. Удаляет из любой зоны."""
         await self._acquire_write()
         try:
-            entry = self._find_entry_unlocked(key)
-            if not entry:
-                return False
             if key in self._tgs:
-                entry["score"] = TGS_EVICT_SCORE
-                entry["shield"] = False
                 del self._tgs[key]
-                self._hot[key] = entry
                 await self._save_zone("tgs", self._tgs)
-                await self._save_zone("hot", self._hot)
-                logger.info("Forget: demoted from TGS", key=key)
+                logger.info("Forget: physically deleted from TGS", key=key)
                 return True
-            zone = self._get_zone_unlocked(key)
-            entry["score"] = round(entry.get("score", 0) - 50.0, 1)
-            entry["updated_at"] = datetime.now().isoformat()
-            if entry["score"] <= DELETE_BELOW:
-                if zone == "hot":
-                    del self._hot[key]
-                    await self._save_zone("hot", self._hot)
-                elif zone == "cold":
-                    del self._cold[key]
-                    await self._save_zone("cold", self._cold)
-                logger.info("Forget: deleted", key=key)
-            elif zone == "hot":
-                entry["is_cold"] = True
+            if key in self._hot:
                 del self._hot[key]
-                self._cold[key] = entry
                 await self._save_zone("hot", self._hot)
+                logger.info("Forget: physically deleted from HOT", key=key)
+                return True
+            if key in self._cold:
+                del self._cold[key]
                 await self._save_zone("cold", self._cold)
-                logger.info("Forget: sent to COLD", key=key)
-            return True
+                logger.info("Forget: physically deleted from COLD", key=key)
+                return True
+            return False
+        finally:
+            self._release_write()
+
+    async def redistill_summaries(
+        self, topic: str, rewrite_func: Callable[[str, str], Awaitable[str]]
+    ) -> None:
+        """ADR-014: Принудительная дистилляция dialogue_summary после forget.
+        Новое саммари наследует score старого. Если новое саммари пустое —
+        запись удаляется целиком."""
+        await self._acquire_write()
+        try:
+            dirty_tgs = False
+            dirty_hot = False
+            dirty_cold = False
+
+            async def _process_zone(zone_dict: dict, zone_name: str) -> bool:
+                dirty = False
+                for key in list(zone_dict.keys()):
+                    if not key.startswith("dialogue_summary:"):
+                        continue
+
+                    entry = zone_dict[key]
+                    value = entry.get("value")
+                    if not isinstance(value, dict) or "summary" not in value:
+                        continue
+
+                    old_summary = str(value["summary"])
+                    new_summary = await rewrite_func(old_summary, topic)
+
+                    if not new_summary.strip():
+                        del zone_dict[key]
+                        logger.info("Redistill: deleted empty summary", key=key, zone=zone_name)
+                        dirty = True
+                    elif new_summary.strip() != old_summary.strip():
+                        value["summary"] = new_summary.strip()
+                        entry["updated_at"] = datetime.now().isoformat()
+                        logger.info("Redistill: updated summary", key=key, zone=zone_name)
+                        dirty = True
+                return dirty
+
+            dirty_tgs = await _process_zone(self._tgs, "tgs")
+            dirty_hot = await _process_zone(self._hot, "hot")
+            dirty_cold = await _process_zone(self._cold, "cold")
+
+            if dirty_tgs:
+                await self._save_zone("tgs", self._tgs)
+            if dirty_hot:
+                await self._save_zone("hot", self._hot)
+            if dirty_cold:
+                await self._save_zone("cold", self._cold)
         finally:
             self._release_write()
 
     async def forget_all(self, confirm: bool = False) -> dict:
-        """Тотальная ротация. §8: амнистия user_fact свежее 10 тиков
-        (total_ticks персистентен). Возвращает статистику для agent.py:
-        {rotated, amnestied, next_free_tick, confirmed}.
-
-        Порядок ротации — ступеньки: TGS -> HOT(40); HOT -> COLD;
-        удаляются только записи, лежавшие в COLD ДО ротации. Каждый
-        проход берёт только «старожилов» своей ступени (hot_before /
-        cold_before-guard): переселенец этого вызова доживает на новой
-        ступени и не ротируется повторно тем же вызовом."""
         if not confirm:
             return {"rotated": 0, "amnestied": 0, "next_free_tick": 0, "confirmed": False}
         await self._acquire_write()
@@ -754,8 +706,8 @@ class GradientMemory:
             rotated = 0
             amnestied = 0
             next_free_tick = 0
-            cold_before = set(self._cold.keys())  # удалить можно только их
-            hot_before = set(self._hot.keys())  # TGS-переселенцы сюда не входят
+            cold_before = set(self._cold.keys())
+            hot_before = set(self._hot.keys())
 
             def _immune(entry_key: str, entry: dict) -> bool:
                 nonlocal amnestied, next_free_tick
@@ -768,7 +720,6 @@ class GradientMemory:
                     return True
                 return False
 
-            # ---- TGS -> HOT(40) ----
             for key, entry in list(self._tgs.items()):
                 if _immune(key, entry):
                     continue
@@ -779,10 +730,9 @@ class GradientMemory:
                 self._hot[key] = entry
                 rotated += 1
 
-            # ---- HOT -> COLD (только старожилы HOT; TGS-переселенцы не тронуты) ----
             for key in list(self._hot.keys()):
                 if key not in hot_before:
-                    continue  # переселенец из TGS этого вызова: доживает в HOT
+                    continue
                 entry = self._hot[key]
                 if _immune(key, entry):
                     continue
@@ -800,10 +750,9 @@ class GradientMemory:
                     self._cold[key] = cold_entry
                 rotated += 1
 
-            # ---- COLD -> удаление (только старожилы COLD) ----
             for key in list(self._cold.keys()):
                 if key not in cold_before:
-                    continue  # переселенец из HOT этого вызова: доживает, не удаляется
+                    continue
                 entry = self._cold[key]
                 if _immune(key, entry):
                     continue
@@ -827,11 +776,9 @@ class GradientMemory:
         finally:
             self._release_write()
 
-    # ================= §4/§6: точный recall =================
+    # ================= точный recall =================
 
     async def recall(self, key: str) -> Any | None:
-        """Recall по точному ключу: §4 нагрев +5; §6 revival из COLD;
-        §4/§7 лестница промоции. Write-метод (нагрев/перенос зон)."""
         await self._acquire_write()
         try:
             entry = self._find_entry_unlocked(key)
@@ -841,7 +788,6 @@ class GradientMemory:
 
             if zone == "cold":
                 self._revive_entry(entry, HEAT_RECALL, key)
-                # recall НЕ меняет value -> changed не ставим (§6)
                 del self._cold[key]
                 await self._save_zone("cold", self._cold)
                 self._hot[key] = entry
@@ -851,7 +797,7 @@ class GradientMemory:
                 return entry.get("value")
 
             self._apply_heat(entry, HEAT_RECALL, key)
-            self._try_unprotect(entry, key)  # §6: проверка снятия при операции нагрева
+            self._try_unprotect(entry, key)
             if zone == "tgs":
                 await self._save_zone("tgs", self._tgs)
             else:
@@ -861,16 +807,13 @@ class GradientMemory:
         finally:
             self._release_write()
 
-    # ================= §9: поиск (канал доставки) =================
+    # ================= поиск =================
 
     async def recall_memory(self, query: str) -> dict:
-        """Поиск по ВСЕМ ТРЁМ зонам: value ИЛИ summary (§9).
-        Read-лок; нагрев найденного — heat_facts() из тулзы (§9).
-        Сброс счётчика активного режима — до лока (atomic int)."""
         if not query:
             return {"found": False, "facts": []}
 
-        self._ticks_since_recall = 0  # §4.1
+        self._ticks_since_recall = 0
 
         await self._acquire_read()
         try:
@@ -925,18 +868,10 @@ class GradientMemory:
         finally:
             self._release_read()
 
-    # ================= совместимость =================
-
-    async def session_close(self) -> None:
-        """DEPRECATED (§3): заменена cold_start_penalty(). Заглушка,
-        пока UI зовут её. Удалить отдельно."""
-        logger.debug("session_close is deprecated (ADR-013 §3), no-op")
-
     # ================= служебное =================
 
     @staticmethod
     def _extract_fallback_summary(value: Any) -> str:
-        """Саммари без LLM (forget_all §8 — быстрая ротация)."""
         if value is None:
             return ""
         if isinstance(value, dict):
@@ -958,7 +893,7 @@ class GradientMemory:
             "hot": len(self._hot),
             "cold": len(self._cold),
             "total": len(self),
-            "total_ticks": self._total_ticks,  # §3.1
-            "distill_queue": len(self._distill_queue),  # §5
+            "total_ticks": self._total_ticks,
+            "distill_queue": len(self._distill_queue),
             "active_mode": self._ticks_since_recall >= ACTIVE_MODE_WINDOW,
         }
