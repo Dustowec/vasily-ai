@@ -1,12 +1,13 @@
 """Web scraper hardening tests: HTML size cap and DNS timeout (T3-017.6)."""
 
 import asyncio
+import socket
 import time
 
 import pytest
 from aiohttp import web
 
-import plugins.web_scraper.tool as scraper_module
+from plugins.web_scraper import tool as scraper_module
 from plugins.web_scraper.tool import WebScraperTool
 
 
@@ -53,8 +54,8 @@ async def test_oversized_html_is_truncated_not_fatal(page_server, allow_local, m
     assert result["text_length"] < 5000
 
 
-async def test_dns_timeout_passes_through(monkeypatch):
-    """Slow DNS must be bounded and must not block validation."""
+async def test_safe_resolver_fails_closed_on_dns_timeout(monkeypatch):
+    """Slow DNS must be bounded and must fail closed (raise OSError), not pass."""
     monkeypatch.setattr(scraper_module, "DNS_TIMEOUT_SECONDS", 0.05)
     loop = asyncio.get_running_loop()
 
@@ -64,9 +65,25 @@ async def test_dns_timeout_passes_through(monkeypatch):
 
     monkeypatch.setattr(loop, "getaddrinfo", slow_getaddrinfo)
 
+    resolver = scraper_module.SafeResolver()
     start = time.monotonic()
-    result = await WebScraperTool()._validate_url("https://slow-dns.example/page")
+    with pytest.raises(OSError):
+        await resolver.resolve("slow-dns.example")
     elapsed = time.monotonic() - start
 
-    assert result is None
+    # Bounded: the timeout must fire well under the sleep duration.
     assert elapsed < 2.0
+
+
+async def test_safe_resolver_fails_closed_on_dns_failure(monkeypatch):
+    """Unresolvable hostname must fail closed (raise OSError), not pass."""
+    loop = asyncio.get_running_loop()
+
+    async def failing_getaddrinfo(*args, **kwargs):
+        raise socket.gaierror("nope")
+
+    monkeypatch.setattr(loop, "getaddrinfo", failing_getaddrinfo)
+
+    resolver = scraper_module.SafeResolver()
+    with pytest.raises(OSError):
+        await resolver.resolve("does-not-exist.example")
