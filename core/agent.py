@@ -312,9 +312,16 @@ class AgentCore:
                     "iterations": result.get("iterations"),
                     "steps": result.get("steps", []),
                 }
+
             elif result.get("status") == "interrupted":
                 return {
                     "status": "interrupted",
+                    "message": result.get("answer", ""),
+                    "iterations": result.get("iterations"),
+                }
+            elif result.get("status") == "failed":
+                return {
+                    "status": "failed",
                     "message": result.get("answer", ""),
                     "iterations": result.get("iterations"),
                 }
@@ -407,7 +414,7 @@ class AgentCore:
         status = result.get("status")
         answer = str(result.get("answer", "") or result.get("message", "")).strip()
 
-        if status not in ("success", "interrupted"):
+        if status not in ("success", "interrupted", "failed"):
             return
         if not answer:
             return
@@ -521,6 +528,8 @@ class AgentCore:
                         )
                     if "watchdog_icons" in response:
                         print(f"[Watchdog: {response['watchdog_icons']}]")
+                elif response.get("status") == "failed":
+                    print(f"\n{response.get('message', '')}")
                 elif response.get("status") == "interrupted":
                     print(f"\n[Interrupted] {response.get('message', '')}")
                 else:

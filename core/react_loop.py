@@ -14,6 +14,8 @@ session timeout, graceful LLM-unavailable result.
 - P2-1: limits and preview length taken from Config.
 - P3-3: strict TypedDict for ReActResult, ReActStep, TokenUsage.
 - ADR-011: Parsing thinking tags, Sliding Window support.
+- ADR-014: consecutive-error dush (3 errors in a row → system nudge);
+  max_iterations → final answer with tools=[] and status="failed".
 Stage 4:
 - per-plugin timeout (config.plugin_timeout) via asyncio.wait_for;
 - R3 extended to plugin execution (partial progress on interrupt);
@@ -44,6 +46,24 @@ DEFAULT_SYSTEM_PROMPT = (
     "Think step by step. If a tool is needed, call it. "
     "When you have the final answer, respond directly without tool calls. "
     "If a tool returns an error, consider another approach or explain the failure."
+)
+
+# ADR-014: how many consecutive errors on the same tool trigger the "dush".
+CONSECUTIVE_ERROR_DUSH_THRESHOLD = 3
+
+# ADR-014: system nudge injected once when the threshold is hit.
+CONSECUTIVE_ERROR_DUSH_MESSAGE = (
+    "Стоп. Этот подход не работает: инструмент возвращает "
+    "ошибку. Подумай снова и попробуй другой инструмент "
+    "или другие аргументы."
+)
+
+# ADR-014: user nudge injected before the final max_iterations answer,
+# to force the model to produce a text-only reply.
+MAX_ITERATIONS_FINAL_USER_MESSAGE = (
+    "Лимит итераций исчерпан. Дай финальный ответ "
+    "пользователю на основе того, что уже собрано. "
+    "Не вызывай инструменты."
 )
 
 
@@ -123,6 +143,8 @@ class ReActLoop:
         tool_call_counts: dict[str, int] = {}
         call_signatures: dict[str, int] = {}
         previous_results: dict[str, str] = {}
+        # ADR-014: consecutive real-execution errors per tool (reset on success).
+        consecutive_errors: dict[str, int] = {}
         steps: list[ReActStep] = []
         start_time = time.monotonic()
 
@@ -295,6 +317,9 @@ class ReActLoop:
                         args_preview=str(args)[: self.preview_length],
                     )
 
+                    # ADR-014: track whether this real execution ended in error.
+                    is_error = False
+
                     # R1: catch plugin errors, feed back to LLM
                     # Stage 4: per-plugin timeout + R3 interrupt handling
                     try:
@@ -325,6 +350,7 @@ class ReActLoop:
                                 ensure_ascii=False,
                             )
                             interaction_logger.warning("Mock result blocked", tool=tool_name)
+                            is_error = True
                         else:
                             tool_content = json.dumps(result, ensure_ascii=False, default=str)
                             # Stage 4: cap huge results — with a small num_ctx
@@ -343,6 +369,11 @@ class ReActLoop:
                                 tool=tool_name,
                                 result_preview=tool_content[: self.preview_length],
                             )
+                            # ADR-014: classify error result from a normal call.
+                            if isinstance(result, dict) and (
+                                result.get("status") == "error" or "error" in result
+                            ):
+                                is_error = True
                     except TimeoutError:
                         interaction_logger.warning("Plugin timed out", tool=tool_name)
                         tool_content = json.dumps(
@@ -354,6 +385,7 @@ class ReActLoop:
                             },
                             ensure_ascii=False,
                         )
+                        is_error = True
                     except (KeyboardInterrupt, asyncio.CancelledError):
                         # R3 (stage 4): interruption during plugin execution
                         # returns the partial progress collected so far.
@@ -372,6 +404,26 @@ class ReActLoop:
                     except Exception as e:
                         interaction_logger.error("Plugin failed", tool=tool_name, error=str(e))
                         tool_content = json.dumps({"error": str(e)}, ensure_ascii=False)
+                        is_error = True
+
+                    # ADR-014: update the consecutive-error counter and,
+                    # if the threshold is exactly hit, inject a system nudge
+                    # once (so the model reconsiders its approach).
+                    if is_error:
+                        consecutive_errors[tool_name] = consecutive_errors.get(tool_name, 0) + 1
+                    else:
+                        consecutive_errors[tool_name] = 0
+
+                    if consecutive_errors[tool_name] == CONSECUTIVE_ERROR_DUSH_THRESHOLD:
+                        interaction_logger.warning(
+                            "Consecutive error dush injected", tool=tool_name
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": CONSECUTIVE_ERROR_DUSH_MESSAGE,
+                            }
+                        )
 
                 previous_results[signature] = tool_content
                 steps.append(
@@ -384,14 +436,60 @@ class ReActLoop:
                 )
                 messages.append({"role": "tool", "content": tool_content})
 
-        final_usage = self.token_manager.get_usage_report(messages)
+        # ADR-014: max_iterations reached — give the model one final word
+        # with tools disabled, and return the text as status="failed".
         core_logger.warning("ReAct max iterations reached", max_iterations=self.max_iterations)
+
+        messages.append(
+            {
+                "role": "user",
+                "content": MAX_ITERATIONS_FINAL_USER_MESSAGE,
+            }
+        )
+
+        try:
+            response = await self.llm.chat(messages=messages, tools=[])
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            core_logger.warning("ReAct interrupted during final answer")
+            return ReActResult(
+                status="interrupted",
+                answer=self._last_assistant_content(messages),
+                iterations=self.max_iterations,
+                steps=steps,
+                token_usage=self.token_manager.get_usage_report(messages),
+            )
+        except LLMUnavailableError as e:
+            core_logger.error("LLM unavailable during final answer", error=str(e))
+            return ReActResult(
+                status="llm_unavailable",
+                answer="AI is temporarily unavailable. Try again later.",
+                iterations=self.max_iterations,
+                steps=steps,
+                token_usage=self.token_manager.get_usage_report(messages),
+            )
+        except Exception as e:
+            core_logger.error("Final answer failed", error=str(e))
+            return ReActResult(
+                status="failed",
+                answer=self._last_assistant_content(messages),
+                iterations=self.max_iterations,
+                steps=steps,
+                token_usage=self.token_manager.get_usage_report(messages),
+            )
+
+        message = response.get("message", {})
+        content = message.get("content", "")
+        _, clean_answer = OllamaClient.extract_thinking_and_answer(content)
+
+        if not clean_answer.strip():
+            clean_answer = self._last_assistant_content(messages)
+
         return ReActResult(
-            status="max_iterations",
-            answer=self._last_assistant_content(messages),
+            status="failed",
+            answer=clean_answer,
             iterations=self.max_iterations,
             steps=steps,
-            token_usage=final_usage,
+            token_usage=self.token_manager.get_usage_report(messages),
         )
 
     @staticmethod
