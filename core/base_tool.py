@@ -63,7 +63,6 @@ class BaseTool(ABC):
         Execute the tool with given parameters.
         Implement this method in subclasses.
         """
-        pass
 
     def get_schema(self) -> dict[str, Any]:
         """
@@ -82,4 +81,3 @@ class BaseTool(ABC):
         """
         Get parameter schema for this tool.
         """
-        pass

@@ -154,7 +154,9 @@ class GradientMemory:
         for entry in self._hot.values():
             entry["score"] = min(max(entry.get("score", HOT_MIN), HOT_MIN), HOT_PROMO)
         for entry in self._cold.values():
-            entry["score"] = min(max(entry.get("score", DISTILLED_SCORE), COLD_MIN), -0.1)
+            entry["score"] = min(
+                max(entry.get("score", DISTILLED_SCORE), COLD_MIN), -0.1
+            )
 
         logger.info(
             "GradientMemory loaded",
@@ -253,8 +255,7 @@ class GradientMemory:
         entry["updated_at"] = datetime.now().isoformat()
 
         new_score = entry.get("score", 0) + amount
-        if new_score > SCORE_CEILING:
-            new_score = SCORE_CEILING
+        new_score = min(new_score, SCORE_CEILING)
         entry["score"] = new_score
         logger.debug("Heat applied", key=key, amount=amount, new_score=new_score)
 
@@ -331,7 +332,9 @@ class GradientMemory:
                     self._hot[key] = entry
                     await self._save_zone("hot", self._hot)
                     self._try_unprotect(entry, key)
-                    logger.info("Remember: revived from COLD", key=key, score=entry["score"])
+                    logger.info(
+                        "Remember: revived from COLD", key=key, score=entry["score"]
+                    )
                     return
 
                 self._apply_heat(entry, HEAT_REMEMBER, key)
@@ -343,7 +346,9 @@ class GradientMemory:
                 if zone == "tgs":
                     self._tgs[key] = entry
                     await self._save_zone("tgs", self._tgs)
-                    logger.info("Remember: reinforced in TGS", key=key, score=entry["score"])
+                    logger.info(
+                        "Remember: reinforced in TGS", key=key, score=entry["score"]
+                    )
                     return
 
                 self._hot[key] = entry
@@ -452,7 +457,9 @@ class GradientMemory:
             if cold_changed:
                 await self._save_zone("cold", self._cold)
 
-            logger.info("Cold start penalty applied", hot=len(self._hot), cold=len(self._cold))
+            logger.info(
+                "Cold start penalty applied", hot=len(self._hot), cold=len(self._cold)
+            )
         finally:
             self._release_write()
 
@@ -676,12 +683,16 @@ class GradientMemory:
 
                     if not new_summary.strip():
                         del zone_dict[key]
-                        logger.info("Redistill: deleted empty summary", key=key, zone=zone_name)
+                        logger.info(
+                            "Redistill: deleted empty summary", key=key, zone=zone_name
+                        )
                         dirty = True
                     elif new_summary.strip() != old_summary.strip():
                         value["summary"] = new_summary.strip()
                         entry["updated_at"] = datetime.now().isoformat()
-                        logger.info("Redistill: updated summary", key=key, zone=zone_name)
+                        logger.info(
+                            "Redistill: updated summary", key=key, zone=zone_name
+                        )
                         dirty = True
                 return dirty
 
@@ -700,7 +711,12 @@ class GradientMemory:
 
     async def forget_all(self, confirm: bool = False) -> dict:
         if not confirm:
-            return {"rotated": 0, "amnestied": 0, "next_free_tick": 0, "confirmed": False}
+            return {
+                "rotated": 0,
+                "amnestied": 0,
+                "next_free_tick": 0,
+                "confirmed": False,
+            }
         await self._acquire_write()
         try:
             rotated = 0
@@ -830,7 +846,9 @@ class GradientMemory:
                             parts.append(str(value["summary"]))
                         elif "user" in value and "assistant" in value:
                             parts.append(
-                                str(value.get("user", "")) + " " + str(value.get("assistant", ""))
+                                str(value.get("user", ""))
+                                + " "
+                                + str(value.get("assistant", ""))
                             )
                         else:
                             parts.append(json.dumps(value, ensure_ascii=False))

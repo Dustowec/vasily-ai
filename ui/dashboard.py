@@ -1,7 +1,7 @@
-# ruff: noqa: E402
 """Streamlit дашборд для Vasily AI (с диагностикой web_search)."""
 
 import asyncio
+import html
 import os
 import sys
 import time
@@ -11,11 +11,11 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-import streamlit as st
+import streamlit as st  # noqa: E402
 
-from core.agent import AgentCore
-from core.config import Config
-from core.logging_config import setup_logging
+from core.agent import AgentCore  # noqa: E402
+from core.config import Config  # noqa: E402
+from core.logging_config import setup_logging  # noqa: E402
 
 st.set_page_config(
     page_title="Vasily AI Dashboard",
@@ -103,7 +103,9 @@ def send_message(user_input: str):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             st.session_state.loop = loop
-            response = loop.run_until_complete(agent.handle_request({"text": user_input}))
+            response = loop.run_until_complete(
+                agent.handle_request({"text": user_input})
+            )
         else:
             raise
 
@@ -201,7 +203,9 @@ with col1:
                 end = len(readme_content)
             st.markdown(readme_content[start:end])
         else:
-            st.markdown("```\n> help\n> status\n> exit\n> забыть <тема>\n> забыть всё\n```")
+            st.markdown(
+                "```\n> help\n> status\n> exit\n> забыть <тема>\n> забыть всё\n```"
+            )
     else:
         st.info("README.md не найден")
 
@@ -210,14 +214,15 @@ with col2:
     chat_container = st.container(height=350)
     with chat_container:
         for msg in st.session_state.messages:
+            safe_content = html.escape(str(msg["content"]))
             if msg["role"] == "user":
                 st.markdown(
-                    f'<div class="chat-message-user">🧑 {msg["content"]}</div>',
+                    f'<div class="chat-message-user">🧑 {safe_content}</div>',
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
-                    f'<div class="chat-message-assistant">🤖 {msg["content"]}</div>',
+                    f'<div class="chat-message-assistant">🤖 {safe_content}</div>',
                     unsafe_allow_html=True,
                 )
 
@@ -263,7 +268,9 @@ with col4:
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     st.session_state.loop = loop
-                    result = loop.run_until_complete(agent.memory.forget_all(confirm=True))
+                    result = loop.run_until_complete(
+                        agent.memory.forget_all(confirm=True)
+                    )
                 else:
                     raise
             if result:
@@ -337,7 +344,9 @@ with col6:
                             break
                     crash_info = {
                         "file": latest.name,
-                        "summary": "\n".join(summary) if summary else "Ошибка неизвестна",
+                        "summary": (
+                            "\n".join(summary) if summary else "Ошибка неизвестна"
+                        ),
                     }
             except Exception:
                 crash_info = {"file": latest.name, "summary": "Не удалось прочитать"}

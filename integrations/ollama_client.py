@@ -34,8 +34,6 @@ TOKEN_DRIFT_WARNING_THRESHOLD = 0.15
 class LLMUnavailableError(Exception):
     """Raised when LLM is unavailable after all retries."""
 
-    pass
-
 
 class OllamaClient:
     """Async client for Ollama LLM server."""
@@ -127,7 +125,9 @@ class OllamaClient:
         }
         return await self._request_with_retries("/api/generate", payload)
 
-    def _check_token_drift(self, messages: list[dict[str, Any]], result: dict[str, Any]) -> None:
+    def _check_token_drift(
+        self, messages: list[dict[str, Any]], result: dict[str, Any]
+    ) -> None:
         """Compare Ollama's real prompt token count with our estimate.
         Calibration for T3-018. Note: with tools attached, Ollama's
         prompt includes tool schemas our estimate does not count —
@@ -188,7 +188,9 @@ class OllamaClient:
 
         return "", content.strip()
 
-    async def _request_with_retries(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _request_with_retries(
+        self, endpoint: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         """Make request with exactly 2 retries. On failure: crash report."""
         last_error = None
         for attempt in range(self.max_retries + 1):
