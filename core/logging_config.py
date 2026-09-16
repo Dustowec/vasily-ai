@@ -14,6 +14,17 @@ Alert levels (auto-detected):
 - WARNING           - Warning (WARNING)
 - CRITICAL_WARNING  - Critical warning (ERROR)
 - CRASH             - Fatal crash (CRITICAL)
+
+Sanitizer (2026-09 revision):
+- Explicit redact keys (from Config.log_redact_keys) -> [REDACTED]
+- Explicit sensitive keys (from Config.log_sensitive_keys) ->
+    truncate on INFO/WARNING, hash+length on ERROR/CRITICAL
+- Key-substring patterns (SECRET_KEY_PATTERNS) -> [REDACTED] even if
+  the key is not present in Config.log_redact_keys. Catches non-standard
+  secret names like 'api_key', 'secret', 'access_token', 'refresh_token'.
+- Any nested dict/list is inspected recursively, regardless of the
+  top-level key name ('args', 'kwargs', 'payload', 'data', ...), so
+  secrets cannot leak through containers.
 """
 
 import hashlib
@@ -36,6 +47,25 @@ ALL_LOG = "vasily.log"
 ROTATION_WHEN = "midnight"
 ROTATION_INTERVAL = 1
 ROTATION_BACKUP_COUNT = 3
+
+# Substring patterns for key names that should always be redacted.
+# Case-insensitive. Deliberately over-broad: better to over-redact a log
+# field than to leak a secret under a non-standard key name.
+SECRET_KEY_PATTERNS: tuple[str, ...] = (
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "bearer",
+    "api_key",
+    "apikey",
+    "access_key",
+    "private_key",
+    "authorization",
+    "cookie",
+    "credential",
+)
 
 # --- Глобальное состояние для ленивой инициализации ---
 _logging_initialized = False
@@ -140,15 +170,34 @@ def reset_sanitize_config_cache() -> None:
     _SANITIZE_CONFIG_CACHE = None
 
 
+def _key_is_secret(key: str, redact_keys: set[str]) -> bool:
+    """
+    Return True if the key name should be treated as a secret.
+
+    Checks two sources:
+    1. Explicit entries from Config.log_redact_keys (exact, case-insensitive).
+    2. Substring patterns in SECRET_KEY_PATTERNS (case-insensitive) —
+       catches non-standard names like 'api_key', 'refresh_token',
+       'user_password', 'x_authorization', etc.
+    """
+    k = key.lower()
+    if k in redact_keys:
+        return True
+    return any(pattern in k for pattern in SECRET_KEY_PATTERNS)
+
+
 def sanitize_processor(logger, method_name, event_dict):
     """
     Sanitize sensitive fields based on log level and config.
 
     T3-016.5 / P3-1:
-    - Critical keys (password, token, authorization, cookie) -> [REDACTED]
+    - Critical keys (password, token, authorization, cookie, and any key
+      matching SECRET_KEY_PATTERNS) -> [REDACTED]
     - Sensitive keys (prompt, query, url, content, ...) ->
         - INFO/WARNING/DEBUG: truncate to max_log_field_length
         - ERROR/CRITICAL: replace with metadata {length, hash}
+    - Nested dicts/lists are inspected recursively, so secrets cannot
+      hide inside 'args', 'kwargs', 'payload', etc.
     - Respects sanitize_logs=False (dev/debug mode)
     """
     config = get_sanitize_config()
@@ -156,8 +205,8 @@ def sanitize_processor(logger, method_name, event_dict):
         return event_dict
 
     level = event_dict.get("level", "info").lower()
-    redact_keys = set(config.log_redact_keys)
-    sensitive_keys = set(config.log_sensitive_keys)
+    redact_keys = {k.lower() for k in config.log_redact_keys}
+    sensitive_keys = {k.lower() for k in config.log_sensitive_keys}
 
     system_keys = {
         "timestamp",
@@ -173,25 +222,50 @@ def sanitize_processor(logger, method_name, event_dict):
     for key in list(event_dict.keys()):
         if key in system_keys:
             continue
-
-        value = event_dict[key]
-
-        if key in redact_keys:
-            event_dict[key] = "[REDACTED]"
-            continue
-
-        if key in sensitive_keys:
-            event_dict[key] = _sanitize_value(value, level, sensitive_keys, redact_keys, config)
+        event_dict[key] = _sanitize_field(
+            key, event_dict[key], level, sensitive_keys, redact_keys, config
+        )
 
     return event_dict
 
 
+def _sanitize_field(key, value, level, sensitive_keys, redact_keys, config):
+    """
+    Decide how to treat a single (key, value) pair.
+
+    Priority:
+    1. Secret-looking key -> [REDACTED] (no exceptions).
+    2. Sensitive key -> truncate/hash by level.
+    3. Container value (dict/list) -> recurse, regardless of the key name.
+    4. Anything else -> pass through unchanged.
+    """
+    k = key.lower() if isinstance(key, str) else ""
+
+    if k and _key_is_secret(k, redact_keys):
+        return "[REDACTED]"
+
+    if k in sensitive_keys:
+        return _sanitize_value(value, level, sensitive_keys, redact_keys, config)
+
+    # Recurse into containers under any key name, to catch nested secrets.
+    if isinstance(value, (dict, list, tuple)):
+        return _sanitize_value(value, level, sensitive_keys, redact_keys, config)
+
+    return value
+
+
 def _sanitize_value(value, level, sensitive_keys, redact_keys, config):
+    """
+    Sanitize a value whose key already matched 'sensitive' or that is a
+    container being recursed into.
+    """
     if isinstance(value, str):
         if level in ("error", "critical"):
             return {
                 "length": len(value),
-                "hash": hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:8],
+                "hash": hashlib.sha256(
+                    value.encode("utf-8", errors="ignore")
+                ).hexdigest()[:8],
             }
         if len(value) > config.max_log_field_length:
             return value[: config.max_log_field_length] + "..."
@@ -200,13 +274,16 @@ def _sanitize_value(value, level, sensitive_keys, redact_keys, config):
     if isinstance(value, dict):
         result = {}
         for k, v in value.items():
-            if k in redact_keys:
-                result[k] = "[REDACTED]"
-            elif k in sensitive_keys:
-                result[k] = _sanitize_value(v, level, sensitive_keys, redact_keys, config)
-            else:
-                result[k] = v
+            result[k] = _sanitize_field(
+                k, v, level, sensitive_keys, redact_keys, config
+            )
         return result
+
+    if isinstance(value, (list, tuple)):
+        return [
+            _sanitize_value(v, level, sensitive_keys, redact_keys, config)
+            for v in value
+        ]
 
     return value
 
@@ -240,7 +317,9 @@ def setup_logging(
     ]
 
     console_renderer = structlog.dev.ConsoleRenderer(colors=True)
-    file_renderer = structlog.processors.JSONRenderer() if json_logs else console_renderer
+    file_renderer = (
+        structlog.processors.JSONRenderer() if json_logs else console_renderer
+    )
 
     structlog.configure(
         processors=shared_processors
@@ -282,14 +361,22 @@ def setup_logging(
     console_handler.setFormatter(console_formatter)
     console_handler.setLevel(log_level)
 
-    _configure_logger("vasily.core", core_handler, all_handler, console_handler, level=log_level)
     _configure_logger(
-        "vasily.interaction", interaction_handler, all_handler, console_handler, level=log_level
+        "vasily.core", core_handler, all_handler, console_handler, level=log_level
+    )
+    _configure_logger(
+        "vasily.interaction",
+        interaction_handler,
+        all_handler,
+        console_handler,
+        level=log_level,
     )
     _configure_logger(
         "vasily.plugins", plugins_handler, all_handler, console_handler, level=log_level
     )
-    _configure_logger("vasily.llm", llm_handler, all_handler, console_handler, level=log_level)
+    _configure_logger(
+        "vasily.llm", llm_handler, all_handler, console_handler, level=log_level
+    )
 
     _logging_initialized = True
 

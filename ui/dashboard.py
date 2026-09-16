@@ -7,6 +7,8 @@ import sys
 import time
 from pathlib import Path
 
+# Хак с sys.path: добавляем корень проекта, чтобы можно было импортировать core.*
+# Импорты ниже намеренно идут после этой манипуляции -> E402 подавляем.
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
