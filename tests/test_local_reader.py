@@ -19,10 +19,13 @@ def tool():
 
 
 @pytest.fixture
-def workspace_dir(tmp_path):
+def workspace_dir(tmp_path, monkeypatch):
     """Create workspace/reading/ directory with test files."""
     workspace = tmp_path / "workspace" / "reading"
     workspace.mkdir(parents=True)
+    # Подменяем корень проекта на временную папку теста,
+    # чтобы PROJECT_ROOT в tool.py совпадал с реальным расположением файлов.
+    monkeypatch.setattr("plugins.local_reader.tool.PROJECT_ROOT", tmp_path)
     return workspace
 
 
