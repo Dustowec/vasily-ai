@@ -352,6 +352,8 @@ def setup_logging(
     plugins_handler = create_rotating_handler(PLUGINS_LOG)
     llm_handler = create_rotating_handler(LLM_LOG)
     all_handler = create_rotating_handler(ALL_LOG)
+    crash_handler = make_crash_report_handler(log_dir)
+    crash_handler.setLevel(logging.ERROR)
 
     console_formatter = structlog.stdlib.ProcessorFormatter(
         processor=console_renderer,
@@ -362,20 +364,36 @@ def setup_logging(
     console_handler.setLevel(log_level)
 
     _configure_logger(
-        "vasily.core", core_handler, all_handler, console_handler, level=log_level
+        "vasily.core",
+        core_handler,
+        all_handler,
+        console_handler,
+        crash_handler,
+        level=log_level,
     )
     _configure_logger(
         "vasily.interaction",
         interaction_handler,
         all_handler,
         console_handler,
+        crash_handler,
         level=log_level,
     )
     _configure_logger(
-        "vasily.plugins", plugins_handler, all_handler, console_handler, level=log_level
+        "vasily.plugins",
+        plugins_handler,
+        all_handler,
+        console_handler,
+        crash_handler,
+        level=log_level,
     )
     _configure_logger(
-        "vasily.llm", llm_handler, all_handler, console_handler, level=log_level
+        "vasily.llm",
+        llm_handler,
+        all_handler,
+        console_handler,
+        crash_handler,
+        level=log_level,
     )
 
     _logging_initialized = True
@@ -400,3 +418,36 @@ def get_logger(category: str, name: str | None = None) -> structlog.stdlib.Bound
     if key not in _logger_proxies:
         _logger_proxies[key] = LazyLogger(category, name)
     return _logger_proxies[key]  # type: ignore
+
+
+def make_crash_report_handler(log_dir: Path):
+    """
+    Возвращает logging.Handler, который при появлении записи
+    уровня ERROR или CRITICAL дёргает crash reporter.
+    Защищён от рекурсии: не срабатывает на логи самого отчёта.
+    """
+    import logging
+
+    class CrashReportHandler(logging.Handler):
+        def emit(self, record):
+            # 1. Только ERROR и CRITICAL
+            if record.levelno < logging.ERROR:
+                return
+
+            # 2. Защита от рекурсии: не реагируем на логи краш-репортера
+            logger_name = record.name or ""
+            if "crash" in logger_name.lower():
+                return
+
+            # 3. Дёргаем отчёт
+            try:
+                from core.crash_reporter import CrashReporter
+
+                reporter = CrashReporter(log_dir)
+                error = RuntimeError(f"Critical log detected: {record.getMessage()}")
+                reporter.generate_report(error, request_id="log-handler")
+            except Exception:
+                # Если сам репортер упал — молчим, чтобы не зациклиться
+                pass
+
+    return CrashReportHandler()
