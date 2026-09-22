@@ -13,6 +13,10 @@ from typing import Any
 from core.base_tool import BaseTool
 from core.plugin_types import make_error
 
+# Корень проекта (определяем как директорию, содержащую пакет core)
+# Предполагаем, что файл находится в поддиректории проекта.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
 # Разрешённые директории (относительно корня проекта)
 ALLOWED_DIRS = ["workspace/reading"]
 
@@ -38,11 +42,18 @@ class LocalReaderTool(BaseTool):
 
     async def _execute(self, path: str = "", **kwargs) -> dict[str, Any]:
         """Read a file from an allowed directory."""
+        if not isinstance(path, str):
+            return make_error(
+                "invalid_url",
+                "File path must be a string",
+                "Provide a valid string path.",
+            )
+
         if not path:
             return make_error(
                 "invalid_url",
                 "File path is required",
-                "Provide a path to a file in data/ or reports/ directory.",
+                "Provide a path to a file in workspace/reading directory.",
             )
 
         # Проверяем path traversal
@@ -50,7 +61,7 @@ class LocalReaderTool(BaseTool):
             return make_error(
                 "invalid_url",
                 f"Path '{path}' is not allowed. Only files in {ALLOWED_DIRS} are accessible.",
-                "Use a path within data/ or reports/ directories.",
+                "Use a path within workspace/reading directory.",
             )
 
         file_path = Path(path)
@@ -107,21 +118,29 @@ class LocalReaderTool(BaseTool):
 
     def _is_path_allowed(self, path: str) -> bool:
         """Check if path is within allowed directories."""
-        # Получаем абсолютный путь
-        abs_path = os.path.abspath(path)
-        cwd = os.getcwd()
+        # 1. realpath вместо abspath/normpath.
+        # Он сразу и нормализует (убирает ..), и раскрывает симлинки (ярлыки)!
+        abs_path = os.path.realpath(path)
+        project_root_real = os.path.realpath(PROJECT_ROOT)
 
-        # Проверяем каждую разрешённую директорию
         for allowed in ALLOWED_DIRS:
-            # Разрешённый путь относительно CWD
-            allowed_path = os.path.abspath(os.path.join(cwd, allowed))
-            # Проверяем, что abs_path начинается с allowed_path
-            if abs_path.startswith(allowed_path):
-                # Дополнительная проверка: убеждаемся, что не вышли за пределы
-                # через .. (например, data/../../etc/passwd)
-                normalized = os.path.normpath(abs_path)
-                if normalized.startswith(allowed_path):
-                    return True
+            # Тоже используем realpath для разрешенной папки
+            allowed_path = os.path.realpath(os.path.join(PROJECT_ROOT, allowed))
+
+            # Проверяем, что сама разрешённая папка не является симлинком наружу
+            # (т.е. после раскрытия симлинков она остаётся внутри проекта)
+            if not allowed_path.startswith(project_root_real + os.sep):
+                continue  # пропускаем эту разрешённую папку, так как она ведёт за пределы проекта
+
+            # 2. МАГИЯ: Добавляем разделитель папок (слэш) в конец.
+            # Теперь мы проверяем, начинается ли путь с "workspace/reading/",
+            # а не просто с "workspace/reading".
+            allowed_prefix = allowed_path + os.sep
+
+            # 3. Проверяем, что файл строго внутри папки
+            if abs_path.startswith(allowed_prefix):
+                return True
+
         return False
 
     def _parse_file(self, file_path: Path, parser_type: str) -> Any:
