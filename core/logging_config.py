@@ -430,24 +430,26 @@ def make_crash_report_handler(log_dir: Path):
 
     class CrashReportHandler(logging.Handler):
         def emit(self, record):
-            # 1. Только ERROR и CRITICAL
+            print(
+                f"[crash_handler] fired: level={record.levelno}, name={record.name}",
+                file=sys.stderr,
+            )
             if record.levelno < logging.ERROR:
                 return
-
-            # 2. Защита от рекурсии: не реагируем на логи краш-репортера
             logger_name = record.name or ""
             if "crash" in logger_name.lower():
                 return
-
-            # 3. Дёргаем отчёт
             try:
                 from core.crash_reporter import CrashReporter
 
                 reporter = CrashReporter(log_dir)
                 error = RuntimeError(f"Critical log detected: {record.getMessage()}")
                 reporter.generate_report(error, request_id="log-handler")
-            except Exception:
-                # Если сам репортер упал — молчим, чтобы не зациклиться
-                pass
+                print("[crash_handler] report generated", file=sys.stderr)
+            except Exception as e:
+                import traceback
+
+                print(f"[crash_handler] FAILED: {e}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
 
     return CrashReportHandler()

@@ -192,7 +192,10 @@ class AgentCore:
                             f"Повторить можно после тика {result['next_free_tick']}."
                         )
                         return {"status": "success", "message": msg}
-                    return {"status": "error", "message": "Не удалось выполнить ротацию памяти."}
+                    return {
+                        "status": "error",
+                        "message": "Не удалось выполнить ротацию памяти.",
+                    }
                 else:
                     return {
                         "status": "error",
@@ -210,18 +213,33 @@ class AgentCore:
                 # 1. Поиск в базе памяти
                 search_result = await self.memory.recall_memory(topic)
                 if not search_result.get("found"):
-                    return {"status": "success", "message": f"По теме '{topic}' ничего не найдено."}
+                    return {
+                        "status": "success",
+                        "message": f"По теме '{topic}' ничего не найдено.",
+                    }
 
                 # 2. LLM классификация
-                candidates = await self._llm_filter_forget(topic, search_result.get("facts", []))
+                candidates = await self._llm_filter_forget(
+                    topic, search_result.get("facts", [])
+                )
                 if not candidates:
-                    return {"status": "success", "message": f"По теме '{topic}' ничего не найдено."}
+                    return {
+                        "status": "success",
+                        "message": f"По теме '{topic}' ничего не найдено.",
+                    }
 
                 # 3. Сценарий А: только 1 user_fact -> молчаливое удаление
-                if len(candidates) == 1 and candidates[0]["key"].startswith("user_fact:"):
+                if len(candidates) == 1 and candidates[0]["key"].startswith(
+                    "user_fact:"
+                ):
                     await self.memory.forget(candidates[0]["key"])
-                    await self.memory.redistill_summaries(topic, self._llm_rewrite_summary)
-                    return {"status": "success", "message": f"Факт по теме '{topic}' удален."}
+                    await self.memory.redistill_summaries(
+                        topic, self._llm_rewrite_summary
+                    )
+                    return {
+                        "status": "success",
+                        "message": f"Факт по теме '{topic}' удален.",
+                    }
 
                 # 4. Сценарий Б: несколько совпадений -> запрос юзеру
                 self._forget_candidates = candidates
@@ -234,7 +252,10 @@ class AgentCore:
 
             if cmd.startswith("удалить"):
                 if not self._forget_candidates:
-                    return {"status": "error", "message": "Нет активных кандидатов на удаление."}
+                    return {
+                        "status": "error",
+                        "message": "Нет активных кандидатов на удаление.",
+                    }
 
                 parts = cmd.split(maxsplit=1)
                 if len(parts) < 2:
@@ -250,9 +271,14 @@ class AgentCore:
                         indices = [int(x.strip()) for x in choice.split(",")]
                         for idx in indices:
                             if 0 < idx <= len(self._forget_candidates):
-                                keys_to_delete.append(self._forget_candidates[idx - 1]["key"])
+                                keys_to_delete.append(
+                                    self._forget_candidates[idx - 1]["key"]
+                                )
                     except ValueError:
-                        return {"status": "error", "message": "Неверный формат. Пример: 1, 2"}
+                        return {
+                            "status": "error",
+                            "message": "Неверный формат. Пример: 1, 2",
+                        }
 
                 if not keys_to_delete:
                     return {"status": "error", "message": "Ничего не выбрано."}
@@ -262,11 +288,16 @@ class AgentCore:
                     await self.memory.forget(key)
 
                 if topic:
-                    await self.memory.redistill_summaries(topic, self._llm_rewrite_summary)
+                    await self.memory.redistill_summaries(
+                        topic, self._llm_rewrite_summary
+                    )
 
                 self._forget_candidates = []
                 self._forget_topic = ""
-                return {"status": "success", "message": f"Удалено записей: {len(keys_to_delete)}."}
+                return {
+                    "status": "success",
+                    "message": f"Удалено записей: {len(keys_to_delete)}.",
+                }
 
             # === ADR-014: Keyword-роутинг полностью вырезан ===
             # LLM сама решает, вызывать инструменты или нет.
@@ -274,7 +305,9 @@ class AgentCore:
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
-            structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
+            structlog.contextvars.bind_contextvars(
+                request_id=f"req-{self._requests_count:04d}"
+            )
 
             dialogue_history = [dict(m) for m in self._dialogue_window]
             result = await self.react_loop.run(
@@ -282,8 +315,13 @@ class AgentCore:
             )
 
             # Защита от пустого ответа LLM
-            if result.get("status") == "success" and not str(result.get("answer", "")).strip():
-                result["answer"] = "Я задумался, но забыл ответить. Можешь переформулировать?"
+            if (
+                result.get("status") == "success"
+                and not str(result.get("answer", "")).strip()
+            ):
+                result["answer"] = (
+                    "Я задумался, но забыл ответить. Можешь переформулировать?"
+                )
 
             duration_ms = (time.time() - start) * 1000
             logger.info(
@@ -335,7 +373,10 @@ class AgentCore:
         except LLMUnavailableError as e:
             self._errors_count += 1
             logger.error("LLM unavailable", error=str(e))
-            return {"status": "error", "message": "AI is temporarily unavailable. Try again later."}
+            return {
+                "status": "error",
+                "message": "AI is temporarily unavailable. Try again later.",
+            }
         except Exception as e:
             self._errors_count += 1
             logger.error("Request failed", error=str(e))
@@ -357,7 +398,13 @@ class AgentCore:
         prompt += 'Верни ТОЛЬКО JSON-объект: {"ids": [1, 2]}. Где ids — номера фактов, которые СТРОГО относятся к теме.'
 
         try:
-            resp = await self.llm_client.generate(prompt)
+            response = await self.llm_client.generate(prompt)
+            resp = (
+                response.get("response", "")
+                if isinstance(response, dict)
+                else str(response)
+            )
+            _, resp = OllamaClient.extract_thinking_and_answer(resp)
             match = re.search(r"\{.*\}", resp, re.DOTALL)
             if match:
                 data = json.loads(match.group(0))
@@ -375,7 +422,13 @@ class AgentCore:
             f"Текст:\n{text}"
         )
         try:
-            resp = await self.llm_client.generate(prompt)
+            response = await self.llm_client.generate(prompt)
+            resp = (
+                response.get("response", "")
+                if isinstance(response, dict)
+                else str(response)
+            )
+            _, resp = OllamaClient.extract_thinking_and_answer(resp)
             return resp.strip()
         except Exception as e:
             logger.error("LLM rewrite summary failed", error=str(e))
@@ -507,13 +560,18 @@ class AgentCore:
                     self.running = False
                     break
 
-                task = asyncio.create_task(self.handle_request({"id": "cli", "text": raw.strip()}))
+                task = asyncio.create_task(
+                    self.handle_request({"id": "cli", "text": raw.strip()})
+                )
                 self._active_request_task = task
 
                 try:
                     response = await task
                 except asyncio.CancelledError:
-                    response = {"status": "interrupted", "message": "Request cancelled by user."}
+                    response = {
+                        "status": "interrupted",
+                        "message": "Request cancelled by user.",
+                    }
                 finally:
                     self._active_request_task = None
 
@@ -546,7 +604,9 @@ class AgentCore:
         """Main agent loop with interactive CLI."""
         self.running = True
         logger.info("Agent started", plugins=len(self.plugin_registry))
-        logger.info("Lazy memory compression enabled (per-request check, background run)")
+        logger.info(
+            "Lazy memory compression enabled (per-request check, background run)"
+        )
 
         if self.config.watchdog_enabled:
             self.watchdog = Watchdog(
@@ -615,14 +675,18 @@ class AgentCore:
         }
         if self.watchdog:
             watchdog_status = self.watchdog.get_status()
-            base_metrics["watchdog_llm"] = "OK" if watchdog_status["llm"]["available"] else "FAIL"
+            base_metrics["watchdog_llm"] = (
+                "OK" if watchdog_status["llm"]["available"] else "FAIL"
+            )
             base_metrics["watchdog_plugins"] = (
                 "OK" if watchdog_status["plugins"]["available"] else "FAIL"
             )
             base_metrics["watchdog_memory"] = (
                 "OK" if watchdog_status["memory"]["available"] else "FAIL"
             )
-            base_metrics["watchdog_disk"] = "OK" if watchdog_status["disk"]["available"] else "FAIL"
+            base_metrics["watchdog_disk"] = (
+                "OK" if watchdog_status["disk"]["available"] else "FAIL"
+            )
         base_metrics.update(self.metrics.snapshot())
         return base_metrics
 
