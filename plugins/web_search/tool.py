@@ -6,7 +6,15 @@ import aiohttp
 
 from core.base_tool import BaseTool
 from core.config import Config
+from core.logging_config import get_logger
 from core.plugin_types import make_error
+
+# блок: SSRF-защита для исходящих запросов к SearXNG.
+# почему: если SearXNG когда-нибудь переедет на localhost — защита
+# его не сломает, если хост добавлен в Config.ssrf_allowed_hosts.
+from security import preflight_check, safe_connector
+
+logger = get_logger("plugins", name="web_search")
 
 
 class WebSearchTool(BaseTool):
@@ -14,7 +22,7 @@ class WebSearchTool(BaseTool):
 
     name = "web_search"
     description = "Search the web for information"
-    version = "1.2.0"
+    version = "1.3.0"  # минор: подключена SSRF-защита к бэкенду
 
     async def _execute(
         self,
@@ -24,11 +32,32 @@ class WebSearchTool(BaseTool):
         **kwargs,
     ) -> dict[str, Any]:
         """Search web via SearXNG."""
+        # блок: нормализация входа (обрезка, клампы).
         query, limit = self._validate_inputs(query, limit)
         config = Config.load()
 
+        # блок: preflight бэкенд-URL.
+        # почему: конфиг может быть изменён пользователем на локальный
+        # хост, который не в allow-list — тогда лучше внятная ошибка,
+        # чем тихий таймаут.
+        backend_check = preflight_check(config.searxng_url)
+        if backend_check:
+            logger.warning(
+                "SSRF preflight blocked search backend",
+                url=config.searxng_url,
+                reason=backend_check,
+            )
+            return make_error(
+                "invalid_url",
+                f"Search backend URL is blocked: {backend_check}",
+                "Add the backend host to Config.ssrf_allowed_hosts, "
+                "or point searxng_url to a public instance.",
+            )
+
         try:
-            async with aiohttp.ClientSession() as session:
+            # блок: safe_connector вместо дефолтного.
+            # почему: DNS-резолв SearXNG тоже должен проходить через SafeResolver.
+            async with aiohttp.ClientSession(connector=safe_connector()) as session:
                 params = {
                     "q": query,
                     "format": "json",
@@ -45,6 +74,7 @@ class WebSearchTool(BaseTool):
                     headers=headers,
                     timeout=timeout,
                 ) as response:
+                    # блок: не-200 — либо мок (dev), либо ошибка.
                     if response.status != 200:
                         if config.dev_mode:
                             return self._mock_response(query, limit)
@@ -56,6 +86,9 @@ class WebSearchTool(BaseTool):
                             http_status=response.status,
                         )
 
+                    # блок: проверка Content-Type.
+                    # почему: SearXNG может вернуть HTML, если format=json
+                    # не разрешён в его настройках. Это конфиг-ошибка.
                     content_type = (response.headers.get("Content-Type") or "").lower()
                     if "application/json" not in content_type:
                         if config.dev_mode:
@@ -68,11 +101,13 @@ class WebSearchTool(BaseTool):
                             "allowed). Do not retry. Try another instance or tool.",
                         )
 
+                    # блок: парсинг JSON и обрезка до limit.
                     data = await response.json()
                     raw_results = data.get("results", [])[:limit]
 
-                    # Deduplicate by URL (SearXNG often returns duplicates
-                    # from different engines).
+                    # блок: дедупликация по URL.
+                    # почему: SearXNG агрегирует несколько движков,
+                    # часто возвращает один URL несколько раз.
                     seen: set[str] = set()
                     results = []
                     for r in raw_results:
@@ -96,6 +131,7 @@ class WebSearchTool(BaseTool):
                         "results": results,
                     }
         except Exception as e:
+            # блок: любая сетевая/парсинговая ошибка — мок или error.
             if config.dev_mode:
                 return self._mock_response(query, limit)
             return make_error(
