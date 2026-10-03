@@ -5,5 +5,6 @@
   "llm_timeout": 120.0,
   "request_timeout": 180.0,
   "max_react_iterations": 7,
-  "dev_mode": false
+  "dev_mode": false,
+  "searxng_url": "http://127.0.0.1:8888/"
 }
