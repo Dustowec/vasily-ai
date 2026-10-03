@@ -92,8 +92,16 @@ class Config:
     enable_query_expansion: bool = True
 
     # External backends (plugins)
+    # External backends (plugins)
     searxng_url: str = "https://searx.oloke.xyz/"
     danbooru_url: str = "https://danbooru.donmai.us"
+
+    # SSRF allow-list: хосты/IP, к которым разрешено ходить, даже если
+    # в остальном они были бы заблокированы как private/loopback.
+    # Пример: ["localhost", "nas.local"] / ["127.0.0.1", "192.168.1.50"]
+    # Формат env: VASILY_SSRF_ALLOWED_HOSTS='["localhost","nas.local"]'
+    ssrf_allowed_hosts: list[str] = field(default_factory=list)
+    ssrf_allowed_ips: list[str] = field(default_factory=list)
 
     # Watchdog (мониторинг и автовосстановление)
     watchdog_enabled: bool = True

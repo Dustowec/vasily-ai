@@ -91,6 +91,9 @@ class LazyLogger:
                 "interaction": "vasily.interaction",
                 "plugins": "vasily.plugins",
                 "llm": "vasily.llm",
+                # SSRF-логи идут в plugins.log — это часть плагинной инфры,
+                # отдельный файл заводить смысла нет.
+                "security": "vasily.plugins",
             }
             logger_name = logger_names.get(self.category, "vasily.core")
             self._logger = structlog.get_logger(logger_name)
