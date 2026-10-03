@@ -1,10 +1,13 @@
 """Публичный API SSRF-защиты для всех инструментов, ходящих в сеть.
 
 Инструменты импортируют отсюда только две функции:
-    preflight_check(url, is_ip_forbidden=None) -> reason | None
-    safe_connector(is_ip_forbidden=None)       -> aiohttp.TCPConnector
+    preflight_check(url, trusted_hosts=None, is_ip_forbidden=None) -> reason | None
+    safe_connector(trusted_hosts=None, is_ip_forbidden=None, **kw) -> aiohttp.TCPConnector
 
-Внутренности (allowlist, ip_rules, SafeResolver) — не публичны.
+trusted_hosts — опциональный список хостов, которые инструмент считает
+доверенными (например, web_search передаёт сюда хост своего бэкенда).
+Это НЕ то же самое, что Config.ssrf_allowed_hosts: тот список глобальный
+и применяется ко всем инструментам.
 """
 
 import ipaddress
@@ -23,32 +26,42 @@ DEFAULT_PORTS = {"http": 80, "https": 443}
 MAX_URL_LENGTH = 2048
 
 
-def safe_connector(is_ip_forbidden=None, **kwargs) -> aiohttp.TCPConnector:
+def safe_connector(
+    trusted_hosts=None, is_ip_forbidden=None, **kwargs
+) -> aiohttp.TCPConnector:
     """Фабрика коннектора с SSRF-защитой и отключённым DNS-кэшем.
 
     use_dns_cache=False обязателен: иначе aiohttp может закэшировать
     результат до проверки SafeResolver.
 
-    is_ip_forbidden — опциональный callable для подмены IP-проверки
-    (нужен тестам, которые разрешают локальный stub-сервер).
+    trusted_hosts — список hostname'ов, доверенных для данного инструмента.
+    is_ip_forbidden — callable для подмены IP-проверки (для тестов).
     """
     return aiohttp.TCPConnector(
-        resolver=SafeResolver(is_ip_forbidden=is_ip_forbidden),
+        resolver=SafeResolver(
+            trusted_hosts=trusted_hosts,
+            is_ip_forbidden=is_ip_forbidden,
+        ),
         use_dns_cache=False,
         force_close=True,
         **kwargs,
     )
 
 
-def preflight_check(url: str, is_ip_forbidden=None) -> str | None:
+def preflight_check(
+    url: str,
+    trusted_hosts=None,
+    is_ip_forbidden=None,
+) -> str | None:
     """Статическая (без DNS) проверка URL. Возвращает reason или None.
 
-    Порядок: scheme → embedded_credentials → hostname → allow-list →
-    localhost → literal IP → port.
+    Порядок: scheme → embedded_credentials → hostname → allow-list
+    (ручной + trusted_hosts) → localhost → literal IP → port.
     DNS-проверка происходит позже, внутри SafeResolver.
 
-    is_ip_forbidden — опциональный callable(ip) -> bool для подмены
-    IP-проверки (тесты с локальным stub-сервером).
+    trusted_hosts — список hostname'ов, доверенных для вызывающего
+    инструмента (web_search передаёт хост своего бэкенда).
+    is_ip_forbidden — callable для подмены IP-проверки (для тестов).
     """
     # блок: дефолтный чекер, если кастомный не передан.
     check_ip = (
@@ -56,6 +69,10 @@ def preflight_check(url: str, is_ip_forbidden=None) -> str | None:
         if is_ip_forbidden is not None
         else (lambda ip: forbidden_reason(ip) is not None)
     )
+
+    # блок: нормализуем trusted_hosts в set[str] lowercase один раз.
+    # почему: иначе проверка внутри горячего цикла будет O(N).
+    trusted_set = {h.lower() for h in (trusted_hosts or []) if h}
 
     # блок: парсинг URL. Ошибка парсинга = блок.
     try:
@@ -84,14 +101,21 @@ def preflight_check(url: str, is_ip_forbidden=None) -> str | None:
     if port is None:
         port = DEFAULT_PORTS[parsed.scheme.lower()]
 
-    # блок: allow-list хоста — ДО всех блокировок.
-    # почему: если хост явно разрешён (ручной список или backend URL из
-    # конфига), пропускаем и localhost, и IP-проверки, и порт-whitelist.
+    h = hostname.lower()
+
+    # блок: trusted_hosts от инструмента — пропускаем всё для этого хоста.
+    # почему: web_search знает, что его бэкенд из конфига доверенный.
+    # web_scraper не передаёт trusted_hosts, поэтому loopback для него
+    # остаётся запрещённым.
+    if h in trusted_set:
+        return None
+
+    # блок: ручной allowlist из Config — тоже пропускает всё.
+    # почему: это осознанное решение пользователя, глобально доверенное.
     if allowlist.is_host_allowed(hostname):
         return None
 
     # блок: literal localhost.
-    h = hostname.lower()
     if h in ("localhost", "localhost.localdomain"):
         return "localhost"
 
@@ -116,8 +140,6 @@ def preflight_check(url: str, is_ip_forbidden=None) -> str | None:
         return f"literal_ip:{reason}:{ip}"
 
     # блок: loopback пропускает порт-whitelist (для тестовых stub-серверов).
-    # почему: в проде loopback сюда не доходит (заблокирован выше),
-    # только через allow-list. А там порт уже пропущен.
     if not ip.is_loopback and port not in ALLOWED_PORTS:
         return f"blocked_port:{port}"
 

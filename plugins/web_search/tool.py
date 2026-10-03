@@ -1,6 +1,7 @@
 """Web Search plugin - searches via SearXNG."""
 
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -10,11 +11,28 @@ from core.logging_config import get_logger
 from core.plugin_types import make_error
 
 # блок: SSRF-защита для исходящих запросов к SearXNG.
-# почему: если SearXNG когда-нибудь переедет на localhost — защита
-# его не сломает, если хост добавлен в Config.ssrf_allowed_hosts.
 from security import preflight_check, safe_connector
 
 logger = get_logger("plugins", name="web_search")
+
+
+def _backend_trusted_hosts(url: str) -> list[str]:
+    """Возвращает [hostname] из URL бэкенда или [] при ошибке.
+
+    Это «локальный» доверенный список для web_search: он НЕ попадает
+    в глобальный allowlist и не влияет на другие инструменты.
+    """
+    # блок: парсим hostname из URL бэкенда.
+    # почему: config.searxng_url может быть http://127.0.0.1:8888/ или
+    # https://searx.be/ — в обоих случаях хотим именно хост без порта.
+    try:
+        h = urlparse(url).hostname
+        return [h.lower()] if h else []
+    except Exception:
+        # блок: молча возвращаем пустой список.
+        # почему: кривой URL в конфиге всё равно вызовет ошибку ниже
+        # при попытке подключиться — не надо падать здесь.
+        return []
 
 
 class WebSearchTool(BaseTool):
@@ -22,7 +40,7 @@ class WebSearchTool(BaseTool):
 
     name = "web_search"
     description = "Search the web for information"
-    version = "1.3.0"  # минор: подключена SSRF-защита к бэкенду
+    version = "1.4.0"  # минор: trusted_hosts для бэкенда
 
     async def _execute(
         self,
@@ -36,11 +54,15 @@ class WebSearchTool(BaseTool):
         query, limit = self._validate_inputs(query, limit)
         config = Config.load()
 
-        # блок: preflight бэкенд-URL.
-        # почему: конфиг может быть изменён пользователем на локальный
-        # хост, который не в allow-list — тогда лучше внятная ошибка,
-        # чем тихий таймаут.
-        backend_check = preflight_check(config.searxng_url)
+        # блок: доверенный хост — бэкенд из конфига.
+        # почему: config.searxng_url — осознанное решение пользователя.
+        # Передаём его локально (не глобально) в preflight и connector.
+        trusted = _backend_trusted_hosts(config.searxng_url)
+
+        # блок: preflight бэкенд-URL с trusted_hosts.
+        # почему: если бэкенд на loopback — это ок для web_search,
+        # но НЕ делает loopback разрешённым для web_scraper.
+        backend_check = preflight_check(config.searxng_url, trusted_hosts=trusted)
         if backend_check:
             logger.warning(
                 "SSRF preflight blocked search backend",
@@ -55,9 +77,12 @@ class WebSearchTool(BaseTool):
             )
 
         try:
-            # блок: safe_connector вместо дефолтного.
-            # почему: DNS-резолв SearXNG тоже должен проходить через SafeResolver.
-            async with aiohttp.ClientSession(connector=safe_connector()) as session:
+            # блок: safe_connector с trusted_hosts для бэкенда.
+            # почему: DNS-резолв SearXNG должен проходить через SafeResolver,
+            # но loopback/private из конфига — пропускаться.
+            async with aiohttp.ClientSession(
+                connector=safe_connector(trusted_hosts=trusted)
+            ) as session:
                 params = {
                     "q": query,
                     "format": "json",
@@ -87,8 +112,6 @@ class WebSearchTool(BaseTool):
                         )
 
                     # блок: проверка Content-Type.
-                    # почему: SearXNG может вернуть HTML, если format=json
-                    # не разрешён в его настройках. Это конфиг-ошибка.
                     content_type = (response.headers.get("Content-Type") or "").lower()
                     if "application/json" not in content_type:
                         if config.dev_mode:
@@ -106,8 +129,6 @@ class WebSearchTool(BaseTool):
                     raw_results = data.get("results", [])[:limit]
 
                     # блок: дедупликация по URL.
-                    # почему: SearXNG агрегирует несколько движков,
-                    # часто возвращает один URL несколько раз.
                     seen: set[str] = set()
                     results = []
                     for r in raw_results:
