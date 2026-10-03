@@ -92,7 +92,7 @@ class Config:
     enable_query_expansion: bool = True
 
     # External backends (plugins)
-    searxng_url: str = "http://localhost:8080/search"
+    searxng_url: str = "https://searx.oloke.xyz/"
     danbooru_url: str = "https://danbooru.donmai.us"
 
     # Watchdog (мониторинг и автовосстановление)

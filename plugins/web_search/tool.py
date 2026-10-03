@@ -14,19 +14,36 @@ class WebSearchTool(BaseTool):
 
     name = "web_search"
     description = "Search the web for information"
-    version = "1.1.0"
+    version = "1.2.0"
 
-    async def _execute(self, query: str = "", limit: int = 5, **kwargs) -> dict[str, Any]:
+    async def _execute(
+        self,
+        query: str = "",
+        limit: int = 5,
+        language: str = "ru",
+        **kwargs,
+    ) -> dict[str, Any]:
         """Search web via SearXNG."""
         query, limit = self._validate_inputs(query, limit)
         config = Config.load()
 
         try:
             async with aiohttp.ClientSession() as session:
-                params = {"q": query, "format": "json"}
+                params = {
+                    "q": query,
+                    "format": "json",
+                    "language": language,
+                }
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Vasily AI Agent; +local)",
+                    "Accept": "application/json",
+                }
                 timeout = aiohttp.ClientTimeout(total=10)
                 async with session.get(
-                    config.searxng_url, params=params, timeout=timeout
+                    config.searxng_url,
+                    params=params,
+                    headers=headers,
+                    timeout=timeout,
                 ) as response:
                     if response.status != 200:
                         if config.dev_mode:
@@ -38,21 +55,45 @@ class WebSearchTool(BaseTool):
                             "same call. Inform the user or try another tool.",
                             http_status=response.status,
                         )
+
+                    content_type = (response.headers.get("Content-Type") or "").lower()
+                    if "application/json" not in content_type:
+                        if config.dev_mode:
+                            return self._mock_response(query, limit)
+                        return make_error(
+                            "invalid_response",
+                            f"Search backend returned non-JSON "
+                            f"(Content-Type: {content_type})",
+                            "Search backend is misconfigured (JSON format not "
+                            "allowed). Do not retry. Try another instance or tool.",
+                        )
+
                     data = await response.json()
-                    results = data.get("results", [])[:limit]
+                    raw_results = data.get("results", [])[:limit]
+
+                    # Deduplicate by URL (SearXNG often returns duplicates
+                    # from different engines).
+                    seen: set[str] = set()
+                    results = []
+                    for r in raw_results:
+                        url = r.get("url", "")
+                        if url and url in seen:
+                            continue
+                        seen.add(url)
+                        results.append(
+                            {
+                                "title": r.get("title", ""),
+                                "url": url,
+                                "snippet": r.get("content", ""),
+                            }
+                        )
+
                     return {
                         "status": "success",
                         "source": "searxng",
                         "query": query,
                         "results_count": len(results),
-                        "results": [
-                            {
-                                "title": r.get("title", ""),
-                                "url": r.get("url", ""),
-                                "snippet": r.get("content", ""),
-                            }
-                            for r in results
-                        ],
+                        "results": results,
                     }
         except Exception as e:
             if config.dev_mode:
@@ -94,6 +135,19 @@ class WebSearchTool(BaseTool):
     def _get_parameters(self) -> dict[str, Any]:
         """Get parameter schema."""
         return {
-            "query": {"type": "string", "description": "Search query", "required": True},
-            "limit": {"type": "integer", "description": "Max results", "required": False},
+            "query": {
+                "type": "string",
+                "description": "Search query",
+                "required": True,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max results",
+                "required": False,
+            },
+            "language": {
+                "type": "string",
+                "description": "ISO 639-1 language code (ru, en). Default: ru",
+                "required": False,
+            },
         }
