@@ -8,13 +8,18 @@ COLD -0.1..-49.9 (прихожая перед удалением). Бессме�
 import asyncio
 import json
 import os
-import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from core.logging_config import get_logger
+
+# блок: токенизация и стемминг для retrieval (Шаг 2 Задачи №2).
+# почему: заменяет substring-поиск ("кот" in "который") на сравнение
+# основ слов. Живёт в отдельном модуле — retrieval может эволюционировать
+# независимо от остальной памяти.
+from memory.tokenizer import matches, tokenize
 
 logger = get_logger("core", "GradientMemory")
 
@@ -845,23 +850,16 @@ class GradientMemory:
     # только gate.
 
     @staticmethod
-    def _extract_query_words(query: str) -> set[str]:
-        """Нормализует запрос в набор слов для substring-поиска.
+    def _entry_tokens(entry: dict) -> set[str]:
+        """Возвращает множество основ слов из entry.
 
-        Выделено отдельно, потому что токенизация — ответственность
-        retrieval-слоя, а не оркестратора. В Шаге 2 (FTS5/BM25) эта
-        функция либо исчезнет, либо заменится на стемминг.
-        """
-        return set(re.findall(r"\w+", query.lower()))
+        Используется только retrieval'ом. Логика извлечения текста из
+        value сложная (dict со summary / user+assistant / произвольный
+        dict / скаляр), поэтому вынесена отдельно, чтобы retrieval был
+        тонким.
 
-    @staticmethod
-    def _entry_text(entry: dict) -> str:
-        """Возвращает нормализованное текстовое представление entry.
-
-        Используется только retrieval'ом для substring-матча. Логика
-        извлечения текста из value сложная (dict со summary / user+assistant
-        / произвольный dict / скаляр), поэтому вынесена отдельно, чтобы
-        retrieval был тонким.
+        Возвращает set[str] основ, а не строку — сравнение через
+        пересечение множеств вместо substring.
         """
         value = entry.get("value")
         parts: list[str] = []
@@ -884,17 +882,20 @@ class GradientMemory:
         summary = entry.get("summary")
         if summary:
             parts.append(str(summary))
-        return " ".join(parts).lower()
+        # блок: tokenize делает .lower() + стемминг + set дедупликацию.
+        # почему: логика нормализации живёт в tokenizer.py — retrieval
+        # не должен знать про Snowball, регистр или регекспы.
+        return tokenize(" ".join(parts))
 
-    def _find_candidates(self, query_words: set[str]) -> list[dict]:
-        """RETRIEVAL: находит всех кандидатов по substring-матчу.
+    def _find_candidates(self, query_tokens: set[str]) -> list[dict]:
+        """RETRIEVAL: находит всех кандидатов по пересечению основ.
 
         НЕ знает про score. НЕ сортирует. НЕ обрезает.
 
-        Здесь живёт единственная связь с substring-поиском. В Шаге 2
-        (FTS5/BM25) эта функция заменится на SQL-запрос, но контракт
-        останется: query_words на входе — плоский список кандидатов
-        на выходе.
+        Здесь живёт единственная связь с retrieval-стратегией. В Шаге 2
+        substring заменён на стемминг: "кот" больше не находит "который",
+        зато "коты" находит "кот". Контракт тот же: query_tokens на
+        входе — плоский список кандидатов на выходе.
         """
         results: list[dict] = []
         for zone_name, zone_dict in (
@@ -903,7 +904,10 @@ class GradientMemory:
             ("cold", self._cold),
         ):
             for key, entry in zone_dict.items():
-                if any(w in self._entry_text(entry) for w in query_words):
+                # блок: сравнение множеств основ вместо substring.
+                # почему: "кот" in "который" → True (ошибка);
+                # {"кот"} ∩ {"котор"} → пусто → False (правильно).
+                if matches(query_tokens, self._entry_tokens(entry)):
                     results.append(
                         {
                             "key": key,
@@ -959,10 +963,12 @@ class GradientMemory:
 
         await self._acquire_read()
         try:
-            # блок: шаг 1 — retrieval. Находим ВСЕХ, кто хоть как-то
-            # подходит по substring. Про score и лимит не знаем.
-            query_words = self._extract_query_words(query)
-            candidates = self._find_candidates(query_words)
+            # блок: шаг 1 — retrieval. Находим ВСЕХ, у кого есть хоть
+            # одна общая основа с запросом. Про score и лимит не знаем.
+            # tokenize делает lowercase + стемминг — "коты" и "кот"
+            # дадут одну основу, "который" — другую.
+            query_tokens = tokenize(query)
+            candidates = self._find_candidates(query_tokens)
 
             # блок: шаг 2 — rerank. Сортируем найденное по zone_score.
             # Про запрос и лимит не знаем — просто применяем термодинамику.
