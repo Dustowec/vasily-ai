@@ -15,10 +15,12 @@ from typing import Any
 
 from core.logging_config import get_logger
 
+# блок: admission gate (Шаг 3 Задачи №2) — фильтр на секреты перед записью.
+# почему: единственная точка, где проверяется ЛЮБАЯ запись в память.
+# Никто не обойдёт: ни RememberFactTool, ни фоновая компрессия диалога.
+from memory.admission import check_admission
+
 # блок: токенизация и стемминг для retrieval (Шаг 2 Задачи №2).
-# почему: заменяет substring-поиск ("кот" in "который") на сравнение
-# основ слов. Живёт в отдельном модуле — retrieval может эволюционировать
-# независимо от остальной памяти.
 from memory.tokenizer import matches, tokenize
 
 logger = get_logger("core", "GradientMemory")
@@ -293,20 +295,36 @@ class GradientMemory:
 
     # ================= запись =================
 
-    async def remember(self, key: str, value: Any, complex_query: bool = False) -> None:
+    async def remember(self, key: str, value: Any, complex_query: bool = False) -> dict:
+        """Записывает факт в память. Возвращает {"stored": bool, ...}.
+
+        Проверка admission — внутри _store_entry, здесь только делегирование.
+        """
         if key.startswith("user_fact:"):
-            await self.remember_user_fact(key, value)
-            return
+            return await self.remember_user_fact(key, value)
         initial = DEFAULT_COMPLEX_SCORE if complex_query else DEFAULT_SIMPLE_SCORE
-        await self._store_entry(key, value, initial)
+        return await self._store_entry(key, value, initial)
 
-    async def remember_user_fact(self, key: str, value: Any) -> None:
-        await self._store_entry(key, value, 40.0)
+    async def remember_user_fact(self, key: str, value: Any) -> dict:
+        """Записывает user_fact (score 40). Возвращает {"stored": bool, ...}."""
+        return await self._store_entry(key, value, 40.0)
 
-    async def remember_dialogue_summary(self, key: str, value: Any) -> None:
-        await self._store_entry(key, value, DEFAULT_SIMPLE_SCORE)
+    async def remember_dialogue_summary(self, key: str, value: Any) -> dict:
+        """Записывает диалоговое саммари (score 15). Возвращает {"stored": bool, ...}."""
+        return await self._store_entry(key, value, DEFAULT_SIMPLE_SCORE)
 
-    async def _store_entry(self, key: str, value: Any, initial_score: float) -> None:
+    async def _store_entry(self, key: str, value: Any, initial_score: float) -> dict:
+        """Единственная точка записи в память. Возвращает {"stored": bool, ...}."""
+        # блок: admission gate ДО взятия write-lock.
+        # почему: если блокируем — незачем захватывать lock и писать
+        # на диск. Также это самая ранняя точка отказа, что упрощает
+        # диагностику: в логе видно "admission rejected" до любых
+        # side effects.
+        reason = check_admission(value)
+        if reason:
+            logger.warning("Memory admission rejected", key=key, reason=reason)
+            return {"stored": False, "reason": reason}
+
         await self._acquire_write()
         try:
             now = datetime.now().isoformat()
@@ -346,7 +364,7 @@ class GradientMemory:
                     logger.info(
                         "Remember: revived from COLD", key=key, score=entry["score"]
                     )
-                    return
+                    return {"stored": True, "key": key}
 
                 self._apply_heat(entry, HEAT_REMEMBER, key)
                 if existing.get("no_compress"):
@@ -360,18 +378,19 @@ class GradientMemory:
                     logger.info(
                         "Remember: reinforced in TGS", key=key, score=entry["score"]
                     )
-                    return
+                    return {"stored": True, "key": key}
 
                 self._hot[key] = entry
                 await self._save_zone("hot", self._hot)
                 await self._maybe_promote_to_tgs(key)
-                return
+                return {"stored": True, "key": key}
 
             entry["last_heat_tick"] = self._total_ticks
             self._hot[key] = entry
             await self._save_zone("hot", self._hot)
             logger.info("Remember: stored (new)", key=key, score=entry["score"])
             await self._maybe_promote_to_tgs(key)
+            return {"stored": True, "key": key}
         finally:
             self._release_write()
 

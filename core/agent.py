@@ -511,7 +511,12 @@ class AgentCore:
             summary = await self._llm_compressor.compress(text_for_compression)
 
             key = f"dialogue_summary:{int(time.time())}-{uuid.uuid4().hex[:6]}"
-            await self.memory.remember_dialogue_summary(
+            # блок: проверяем результат admission gate.
+            # почему: если пользователь в диалоге упомянул пароль, компрессор
+            # мог утащить его в summary. Gate в manager'е отклонит запись.
+            # Мы не можем "сказать об этом пользователю" (это фоновая задача),
+            # но обязаны залогировать — иначе потеря памяти будет незаметна.
+            store = await self.memory.remember_dialogue_summary(
                 key,
                 {
                     "summary": summary,
@@ -524,12 +529,19 @@ class AgentCore:
                     ),
                 },
             )
-            logger.info(
-                "Dialogue buffer compressed and stored",
-                pairs=chunk_size // 2,
-                summary_len=len(summary),
-                key=key,
-            )
+            if not store.get("stored", True):
+                logger.warning(
+                    "Dialogue summary rejected by admission gate",
+                    pairs=chunk_size // 2,
+                    reason=store.get("reason"),
+                )
+            else:
+                logger.info(
+                    "Dialogue buffer compressed and stored",
+                    pairs=chunk_size // 2,
+                    summary_len=len(summary),
+                    key=key,
+                )
         except Exception as e:
             logger.error("Failed to compress dialogue buffer", error=str(e))
             self._dialogue_buffer = messages + self._dialogue_buffer

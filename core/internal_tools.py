@@ -204,7 +204,23 @@ class RememberFactTool(BaseTool):
                         "existing_fact": existing_text,
                     }
                 if verdict == "ПРОТИВОРЕЧИЕ":
-                    await self.memory.remember_user_fact(existing["key"], clean_fact)
+                    # блок: проверяем результат admission gate.
+                    # почему: если в новом значении секрет — manager вернёт
+                    # {"stored": False, "reason": ...}. Не записываем,
+                    # сообщаем LLM причину, чтобы она сказала пользователю.
+                    upd = await self.memory.remember_user_fact(
+                        existing["key"], clean_fact
+                    )
+                    if not upd.get("stored", True):
+                        return {
+                            "status": "rejected",
+                            "message": (
+                                f"Не сохранил: в новом значении есть "
+                                f"{upd.get('reason')}. Скажи пользователю, "
+                                f"что не записал — там пароль или токен."
+                            ),
+                            "reason": upd.get("reason"),
+                        }
                     return {
                         "status": "updated",
                         "message": f"Факт обновлён: {clean_fact[:100]}",
@@ -212,7 +228,21 @@ class RememberFactTool(BaseTool):
                     }
                 if verdict == "ДОПОЛНЕНИЕ":
                     merged = await self._merge_facts(clean_fact, existing_text)
-                    await self.memory.remember_user_fact(existing["key"], merged)
+                    # блок: gate проверяется на СЛИТОМ тексте, а не на clean_fact.
+                    # почему: merge мог сам вклеить секрет из старого факта
+                    # (если тот был сохранён ДО включения gate). Проверяем
+                    # итоговое значение, которое реально пойдёт в память.
+                    mrg = await self.memory.remember_user_fact(existing["key"], merged)
+                    if not mrg.get("stored", True):
+                        return {
+                            "status": "rejected",
+                            "message": (
+                                f"Не сохранил: в объединённом факте есть "
+                                f"{mrg.get('reason')}. Скажи пользователю, "
+                                f"что не записал — там пароль или токен."
+                            ),
+                            "reason": mrg.get("reason"),
+                        }
                     return {
                         "status": "merged",
                         "message": f"Факт дополнен: {merged[:150]}",
@@ -220,7 +250,20 @@ class RememberFactTool(BaseTool):
                     }
 
         key = f"user_fact:{uuid.uuid4().hex[:8]}"
-        await self.memory.remember_user_fact(key, clean_fact)
+        # блок: проверяем результат записи.
+        # почему: admission gate мог отклонить факт. Возвращаем LLM
+        # понятный статус "rejected" с причиной — модель скажет
+        # пользователю, почему не сохранила.
+        store = await self.memory.remember_user_fact(key, clean_fact)
+        if not store.get("stored", True):
+            return {
+                "status": "rejected",
+                "message": (
+                    f"Не сохранил: в факте есть {store.get('reason')}. "
+                    f"Скажи пользователю, что не записал — там пароль или токен."
+                ),
+                "reason": store.get("reason"),
+            }
         return {
             "status": "success",
             "message": f"Факт сохранён: {clean_fact[:100]}",
