@@ -96,3 +96,8 @@ workspace/wrote/*
 !workspace/reading/.gitkeep
 !workspace/wrote/.gitkeep
 commit_msg.txt
+# Рабочие дампы и отчёты (не коммитить)
+git_history_with_changes.txt
+test_results.txt
+pytest_*.log
+commit_msg.txt
