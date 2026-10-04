@@ -54,7 +54,9 @@ class RecallMemoryTool(BaseTool):
             )
             expanded = response.get("response", "")
             query_words = set(re.findall(r"\w+", query.lower()))
-            words = [w for w in re.findall(r"\w+", expanded.lower()) if w not in query_words][:6]
+            words = [
+                w for w in re.findall(r"\w+", expanded.lower()) if w not in query_words
+            ][:6]
             if words:
                 return f"{query} {' '.join(words)}"
         except TimeoutError:
@@ -63,7 +65,9 @@ class RecallMemoryTool(BaseTool):
             logger.warning("Query expansion failed, using raw query", error=str(e))
         return query
 
-    async def _execute(self, query: str = "", limit: int = 3, **kwargs) -> dict[str, Any]:
+    async def _execute(
+        self, query: str = "", limit: int = 3, **kwargs
+    ) -> dict[str, Any]:
         if self.memory is None:
             return make_error(
                 "backend_unavailable",
@@ -87,15 +91,30 @@ class RecallMemoryTool(BaseTool):
         result = await self.memory.recall_memory(expanded_query)
 
         if result.get("found") and result.get("facts"):
-            # ADR-013 §9: нагрев найденного — heat_facts (write, после read-лока)
+            # блок: total_found — сколько менеджер вернул ДО обрезки до limit.
+            # почему: manager.recall_memory отдаёт facts[:5]. Здесь мы уже
+            # обрезаем их до limit (по умолчанию 3). total_found должен
+            # отражать «сколько пришло из менеджера», а не «сколько показали».
+            result["total_found"] = len(result["facts"])
+
+            # блок: сначала обрезаем до limit — ровно то, что уйдёт в LLM.
+            # почему: раньше обрезка была ПОСЛЕ нагрева. Итог — 5 фактов
+            # нагревались, а LLM видела 3. Искажалась статистика: 2 из 5
+            # обновляли last_heat_tick, попадая в анти-дубль-нагрев на
+            # следующем тике, хотя модель их не видела.
+            result["facts"] = result["facts"][:limit]
+
+            # блок: heat_facts получает ключи РОВНО показанных фактов.
+            # почему: инвариант «нагрев = показ» (ADR-013 §9). Если факт
+            # не попал в контекст LLM — он не должен нагреваться: иначе
+            # искажается динамика остывания, и scores «утекают» вверх.
             heated_keys = [f["key"] for f in result["facts"]]
             try:
                 await self.memory.heat_facts(heated_keys)
             except Exception as e:
+                # блок: нагрев не критичен для ответа — не роняем запрос.
                 logger.warning("heat_facts failed (non-fatal)", error=str(e))
 
-            result["total_found"] = len(result["facts"])
-            result["facts"] = result["facts"][:limit]
             result["expanded_query_used"] = expanded_query
         else:
             result["total_found"] = 0
@@ -152,7 +171,9 @@ class RememberFactTool(BaseTool):
         check = await self.memory.recall_memory(search_query)
         if check.get("found") and check.get("facts"):
             for existing in check["facts"][:2]:
-                existing_text = str(existing.get("value") or existing.get("summary", ""))
+                existing_text = str(
+                    existing.get("value") or existing.get("summary", "")
+                )
                 if len(existing_text) < 5:
                     continue
                 verdict = await self._similarity_verdict(clean_fact, existing_text)
@@ -183,7 +204,11 @@ class RememberFactTool(BaseTool):
 
         key = f"user_fact:{uuid.uuid4().hex[:8]}"
         await self.memory.remember_user_fact(key, clean_fact)
-        return {"status": "success", "message": f"Факт сохранён: {clean_fact[:100]}", "key": key}
+        return {
+            "status": "success",
+            "message": f"Факт сохранён: {clean_fact[:100]}",
+            "key": key,
+        }
 
     async def _similarity_verdict(self, new_fact: str, existing_fact: str) -> str:
         """'ДУБЛЬ' | 'ДОПОЛНЕНИЕ' | 'ПРОТИВОРЕЧИЕ' | 'НЕТ'. Thinking stripped."""
@@ -204,7 +229,9 @@ class RememberFactTool(BaseTool):
             response = await asyncio.wait_for(
                 self.llm_client.generate(prompt, temperature=0.0), timeout=10.0
             )
-            _, clean = OllamaClient.extract_thinking_and_answer(response.get("response", ""))
+            _, clean = OllamaClient.extract_thinking_and_answer(
+                response.get("response", "")
+            )
             answer_words = set(re.findall(r"\w+", clean.upper()))
             for word in ("ПРОТИВОРЕЧИЕ", "ДОПОЛНЕНИЕ", "ДУБЛЬ"):
                 if word in answer_words:
@@ -214,7 +241,9 @@ class RememberFactTool(BaseTool):
             logger.warning("Similarity verdict timed out, treating fact as new")
             return "НЕТ"
         except Exception as e:
-            logger.warning("Similarity verdict failed, treating fact as new", error=str(e))
+            logger.warning(
+                "Similarity verdict failed, treating fact as new", error=str(e)
+            )
             return "НЕТ"
 
     async def _merge_facts(self, new_fact: str, existing_fact: str) -> str:
@@ -230,7 +259,9 @@ class RememberFactTool(BaseTool):
             response = await asyncio.wait_for(
                 self.llm_client.generate(prompt, temperature=0.1), timeout=15.0
             )
-            _, merged = OllamaClient.extract_thinking_and_answer(response.get("response", ""))
+            _, merged = OllamaClient.extract_thinking_and_answer(
+                response.get("response", "")
+            )
             merged = merged.strip()
             if merged and len(merged) < 500:
                 return merged
@@ -300,7 +331,9 @@ class ListFilesTool(BaseTool):
                         {
                             "name": item.name,
                             "size_bytes": item.stat().st_size,
-                            "modified": datetime.fromtimestamp(item.stat().st_mtime).isoformat(),
+                            "modified": datetime.fromtimestamp(
+                                item.stat().st_mtime
+                            ).isoformat(),
                         }
                     )
         except PermissionError:
@@ -310,7 +343,12 @@ class ListFilesTool(BaseTool):
                 "The directory exists but cannot be read.",
             )
         files.sort(key=lambda x: x["name"])
-        return {"status": "success", "path": str(target_dir), "count": len(files), "files": files}
+        return {
+            "status": "success",
+            "path": str(target_dir),
+            "count": len(files),
+            "files": files,
+        }
 
     def _get_parameters(self) -> dict[str, Any]:
         return {
