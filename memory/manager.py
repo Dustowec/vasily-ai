@@ -969,8 +969,12 @@ class GradientMemory:
             ranked = self._rank_by_zone_score(candidates)
 
             # блок: шаг 3 — gate. Обрезаем до внутреннего лимита manager'а.
-            # MAX_RECALL_RESULTS = 5 — это граница ПЕРЕДАЧИ между слоями,
-            # не «что увидит LLM». Второй gate (limit=3) — в tool._execute.
+            # блок: пул кандидатов для LLM-ранжирования (Задача №3).
+            # почему: LLM судит по смыслу и отсеивает ~90% кандидатов, поэтому
+            # в recall_memory имеет смысл отдавать шире, чем «показать 3».
+            # 30 — эмпирический потолок: 30 × 150 симв. превью ≈ 1500 токенов,
+            # ничто для контекста, но хватает на весь потенциальный шум.
+            MAX_RECALL_RESULTS = 30
             gated = self._gate_for_output(ranked, limit=MAX_RECALL_RESULTS)
 
             # блок: total_found — сколько было найдено ДО обрезки.

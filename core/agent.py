@@ -14,8 +14,6 @@ Empty response safeguard for small models. Interactive forget with LLM classific
 """
 
 import asyncio
-import json
-import re
 import signal
 import time
 import uuid
@@ -34,6 +32,12 @@ from core.service_launcher import ensure_ollama_running
 from core.watchdog import Watchdog
 from integrations.ollama_client import LLMUnavailableError, OllamaClient
 from memory.manager import GradientMemory
+
+# блок: единая точка правды для LLM-фильтрации (Задача №3, вариант B).
+# почему: агент и RecallMemoryTool используют одну и ту же логику
+# «покажи LLM список → получи ids → оставь выбранные». Один модуль,
+# один формат промпта, одна обработка ошибок.
+from memory.ranking import filter_for_forget
 
 logger = get_logger("core", "AgentCore")
 
@@ -387,32 +391,16 @@ class AgentCore:
             self._maybe_compress_memory()
 
     async def _llm_filter_forget(self, topic: str, facts: list[dict]) -> list[dict]:
-        """Классификация найденных фактов через LLM."""
-        if not facts:
-            return []
+        """Классификация найденных фактов через LLM.
 
-        prompt = f"Пользователь хочет забыть тему: '{topic}'. Вот найденные факты:\n"
-        for i, f in enumerate(facts):
-            text = f.get("summary") or str(f.get("value"))
-            prompt += f"{i+1}. {text}\n"
-        prompt += 'Верни ТОЛЬКО JSON-объект: {"ids": [1, 2]}. Где ids — номера фактов, которые СТРОГО относятся к теме.'
+        Тонкая обёртка над memory.ranking.filter_for_forget — общая
+        логика с RecallMemoryTool (Задача №3, вариант B).
 
-        try:
-            response = await self.llm_client.generate(prompt)
-            resp = (
-                response.get("response", "")
-                if isinstance(response, dict)
-                else str(response)
-            )
-            _, resp = OllamaClient.extract_thinking_and_answer(resp)
-            match = re.search(r"\{.*\}", resp, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-                ids = data.get("ids", [])
-                return [facts[i - 1] for i in ids if 0 < i <= len(facts)]
-        except Exception as e:
-            logger.error("LLM filter for forget failed", error=str(e))
-        return []
+        Поведение сохранено: при сбое LLM возвращает [] — это безопаснее
+        для forget, чем удалить не то. Промпт, парсинг JSON, strip
+        thinking — всё вынесено в ranking.py.
+        """
+        return await filter_for_forget(self.llm_client, topic, facts)
 
     async def _llm_rewrite_summary(self, text: str, topic: str) -> str:
         """Переписывает саммари, удаляя упоминания темы."""

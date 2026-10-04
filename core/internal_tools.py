@@ -17,6 +17,11 @@ from core.logging_config import get_logger
 from core.plugin_types import make_error
 from integrations.ollama_client import OllamaClient
 
+# блок: LLM-ранжирование кандидатов (Задача №3, вариант B).
+# почему: одна точка правды — memory/ranking.py; RecallMemoryTool
+# и AgentCore._llm_filter_forget оба ходят туда.
+from memory.ranking import rank_for_recall
+
 logger = get_logger("core", "InternalTools")
 
 
@@ -91,23 +96,35 @@ class RecallMemoryTool(BaseTool):
         result = await self.memory.recall_memory(expanded_query)
 
         if result.get("found") and result.get("facts"):
-            # блок: total_found — сколько менеджер вернул ДО обрезки до limit.
-            # почему: manager.recall_memory отдаёт facts[:5]. Здесь мы уже
-            # обрезаем их до limit (по умолчанию 3). total_found должен
-            # отражать «сколько пришло из менеджера», а не «сколько показали».
+            # блок: total_found — сколько пришло из retrieval ДО ранжирования.
+            # почему: это метрика «сколько вообще подошло по substring».
+            # После LLM-ранжирования в result["facts"] останется меньше —
+            # это видно отдельно, не смешиваем два числа.
             result["total_found"] = len(result["facts"])
 
-            # блок: сначала обрезаем до limit — ровно то, что уйдёт в LLM.
-            # почему: раньше обрезка была ПОСЛЕ нагрева. Итог — 5 фактов
-            # нагревались, а LLM видела 3. Искажалась статистика: 2 из 5
-            # обновляли last_heat_tick, попадая в анти-дубль-нагрев на
-            # следующем тике, хотя модель их не видела.
+            # блок: LLM-ранжирование между retrieval и gate (Задача №3).
+            # почему: substring-поиск даёт ложные срабатывания ("кот" в
+            # "который") и пропускает синонимы ("ноутбук" для "компьютер").
+            # LLM судит по смыслу — без эмбеддингов, но с реальным
+            # пониманием. При сбое rank_for_recall вернёт всех кандидатов
+            # (on_error="all"), не теряем данные.
+            if self.llm_client is not None:
+                result["facts"] = await rank_for_recall(
+                    self.llm_client,
+                    result["facts"],
+                    query=query,
+                )
+
+            # блок: gate — обрезаем до limit РОВНО тех, что прошли ранжирование.
+            # почему: сначала LLM-фильтр, потом лимит. Иначе релевантный
+            # факт с низким score мог бы не попасть в топ-3 из-за
+            # score-сортировки. Порядок важен: rank выше, limit ниже.
             result["facts"] = result["facts"][:limit]
 
             # блок: heat_facts получает ключи РОВНО показанных фактов.
-            # почему: инвариант «нагрев = показ» (ADR-013 §9). Если факт
-            # не попал в контекст LLM — он не должен нагреваться: иначе
-            # искажается динамика остывания, и scores «утекают» вверх.
+            # почему: инвариант «нагрев = показ» (ADR-013 §9). После
+            # LLM-фильтра греем только реально релевантные — мусор
+            # остаётся холодным и умирает естественным путём.
             heated_keys = [f["key"] for f in result["facts"]]
             try:
                 await self.memory.heat_facts(heated_keys)
