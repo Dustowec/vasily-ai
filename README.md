@@ -1,7 +1,7 @@
 Vasily AI
 Vasily AI — локальный ИИ-агент на архитектуре ReAct (Reasoning + Acting). Работает через Ollama, поддерживает плагины, градиентно-каскадную память с динамическим охлаждением, структурированное логирование, watchdog и автоматические crash-репорты.
 
-Статус: стабильная версия · 319/319 тестов проходят
+Статус: стабильная версия · 376/376 тестов проходят
 
 Возможности
 Область	Описание
@@ -116,11 +116,11 @@ vasily_ai/
 │   └── llm_compressor.py
 ├── integrations/       # Внешние сервисы
 │   └── ollama_client.py
-├── tests/              # Тесты (319 collected, 319 passed)
+├── tests/              # Тесты (376 collected, 376 passed)
 ├── logs/               # Логи (создаётся автоматически)
 └── data/               # Данные и память (создаётся автоматически)
 Тестирование
-319 тестов, все проходят.
+376 тестов, все проходят.
 
 Быстрый старт
 Требования: Python 3.14+, Ollama с моделью (рекомендуется Qwen 3.5-4B Q6_m), опционально SearXNG для веб-поиска.
@@ -155,7 +155,7 @@ MIT
 🌐 English Version
 Vasily AI — a local AI agent with a ReAct (Reasoning + Acting) architecture. Runs on Ollama, supports plugins, gradient-cascade memory with dynamic cooling, structured logging, a watchdog, and automatic crash reports.
 
-Status: stable · 319/319 tests passing
+Status: stable · 376/376 tests passing
 
 Features
 Area	Description
@@ -243,11 +243,11 @@ vasily_ai/
 ├── plugins/            # Auto-discovered plugins
 ├── memory/             # Gradient Cascade Memory
 ├── integrations/       # External services
-├── tests/              # Test suite (319 collected, 319 passed)
+├── tests/              # Test suite (376 collected, 376 passed)
 ├── logs/               # Rotated logs (auto-created)
 └── data/               # Persistent data (auto-created)
 Testing
-319 tests, all passing.
+376 tests, all passing.
 
 Quick Start
 Requirements: Python 3.14+, Ollama with a compatible model (recommended: Qwen 3.5-4B Q6_m), optionally SearXNG for web search.

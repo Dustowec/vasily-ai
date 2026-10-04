@@ -1,0 +1,63 @@
+[project]
+name = "vasily-ai"
+version = "0.1.0"
+description = "Vasily - локальный AI-агент на архитектуре ReAct (Reasoning + Acting)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # --- HTTP и парсинг веба ---
+    "aiohttp>=3.14.0",
+    "beautifulsoup4>=4.15.0",
+
+    # --- Структурное логирование ---
+    "structlog>=26.0.0",
+
+    # --- Морфология для retrieval памяти (ADR-015 §2) ---
+    "snowballstemmer>=3.1.1",
+
+    # --- GUI (ui/desktop.py) ---
+    "PyQt6>=6.11.0",
+    "qasync>=0.28.0",
+
+    # --- Плагин local_reader: xlsx / pdf ---
+    "openpyxl>=3.1.5",
+    "PyPDF2>=3.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.0.0",
+    "black>=26.0.0",
+    "ruff>=0.16.0",
+    "pre-commit>=4.0.0",
+]
+
+# проект — приложение, а не библиотека.
+# Это отключает установку самого проекта в venv как editable-пакета.
+# Без этого uv будет искать [build-system] и требовать структуру пакета.
+[tool.uv]
+package = false
+
+# --- Конфигурация pytest (перенесено из pytest.ini) ---
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+# --- Конфигурация black (из старого pyproject.toml) ---
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+# --- Конфигурация ruff (из старого pyproject.toml) ---
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = ["E501", "B008", "E722"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
