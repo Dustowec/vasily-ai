@@ -95,3 +95,4 @@ workspace/reading/*
 workspace/wrote/*
 !workspace/reading/.gitkeep
 !workspace/wrote/.gitkeep
+commit_msg.txt
