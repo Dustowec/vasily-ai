@@ -101,6 +101,12 @@ class GradientMemory:
 
         self._distill_queue: list[str] = []
         self._ticks_since_recall = 0
+        # блок: отдельный счётчик "тиков без записи" (Шаг 4 Задачи №2).
+        # почему: раньше был только recall-счётчик, и внутренний дедуп
+        # в RememberFactTool маскировал активный режим — агент не "читал"
+        # память, но счётчик сбрасывался. Теперь write-счётчик живёт
+        # отдельно и растёт, пока в память ничего не пишут.
+        self._ticks_since_write = 0
         self._total_ticks = 0
 
         self._load_all()
@@ -323,9 +329,22 @@ class GradientMemory:
         reason = check_admission(value)
         if reason:
             logger.warning("Memory admission rejected", key=key, reason=reason)
+            # блок: счётчик write НЕ сбрасываем при отклонении.
+            # почему: "пользователь писал в память" — это факт состоявшейся
+            # записи. Отклонение admission'ом — попытка, а не запись.
+            # Инвариант: _ticks_since_write растёт, пока в память не попадёт
+            # реальная новая информация.
             return {"stored": False, "reason": reason}
 
         await self._acquire_write()
+
+        # блок: сброс счётчика write — после успешного захвата lock.
+        # почему: если запись прошла admission и получила write-lock,
+        # она состоится (exception при _save_zone — исключительный случай,
+        # не штатная работа). Симметрия инварианта:
+        #   admission-reject → счётчик НЕ сбрасывается;
+        #   захватили lock и пишем → счётчик = 0.
+        self._ticks_since_write = 0
         try:
             now = datetime.now().isoformat()
             entry = {
@@ -508,7 +527,14 @@ class GradientMemory:
         await self._acquire_write()
         try:
             self._total_ticks += 1
+            # блок: оба счётчика инкрементируются на каждом тике.
+            # почему: _ticks_since_recall управляет активным режимом
+            # остывания (долго не читали → быстрее остывает).
+            # _ticks_since_write пока наблюдательный — фиксирует, когда
+            # последний раз писали. Симметрия важна для будущих решений
+            # (например, "не сжимать свежую запись").
             self._ticks_since_recall += 1
+            self._ticks_since_write += 1
             active = self._ticks_since_recall >= ACTIVE_MODE_WINDOW
 
             tgs_changed = False
@@ -964,21 +990,26 @@ class GradientMemory:
         """
         return ranked[:limit]
 
-    async def recall_memory(self, query: str) -> dict:
+    async def recall_memory(self, query: str, external: bool = True) -> dict:
         """Поиск фактов во всех зонах (ADR-013 §9).
 
         Оркестратор трёх шагов: retrieval → rerank → gate.
-        Само поведение не меняется по сравнению с прежней реализацией —
-        это чистый рефакторинг ради изоляции ответственностей.
+
+        external (Шаг 4 Задачи №2):
+          True  — публичный вызов (LLM/пользователь читает память);
+                  сбрасывает _ticks_since_recall.
+          False — внутренний вызов (RememberFactTool для дедупа);
+                  счётчик НЕ трогает, потому что это не пользовательское
+                  чтение и не должно маскировать активный режим.
         """
         if not query:
             return {"found": False, "facts": []}
 
-        # блок: сброс счётчика «тиков без чтения» (см. §4.1 активный режим).
-        # почему: любой успешный recall — это чтение памяти, он обязан
-        # выключать активный режим остывания. Инвариант сохраняется
-        # независимо от того, сколько шагов в пайплайне.
-        self._ticks_since_recall = 0
+        # блок: сброс счётчика «тиков без чтения» — только для внешних.
+        # почему: см. docstring. Внутренний дедуп — служебная операция,
+        # она не означает, что пользователь «потреблял» память.
+        if external:
+            self._ticks_since_recall = 0
 
         await self._acquire_read()
         try:
@@ -1041,5 +1072,10 @@ class GradientMemory:
             "total": len(self),
             "total_ticks": self._total_ticks,
             "distill_queue": len(self._distill_queue),
+            # блок: оба счётчика наружу (Шаг 4 Задачи №2).
+            # почему: диагностика и тесты. Активный режим по-прежнему
+            # определяется ТОЛЬКО через recall-счётчик — это его смысл.
+            "ticks_since_recall": self._ticks_since_recall,
+            "ticks_since_write": self._ticks_since_write,
             "active_mode": self._ticks_since_recall >= ACTIVE_MODE_WINDOW,
         }

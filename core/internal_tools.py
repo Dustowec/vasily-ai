@@ -185,7 +185,11 @@ class RememberFactTool(BaseTool):
         words = re.findall(r"\w+", clean_fact.lower())
         search_query = " ".join(words)[:150]
 
-        check = await self.memory.recall_memory(search_query)
+        # блок: internal recall для дедупа (Шаг 4 Задачи №2).
+        # почему: это не пользовательское чтение памяти — это служебная
+        # проверка «есть ли уже такой факт». Она не должна сбрасывать
+        # _ticks_since_recall и маскировать активный режим остывания.
+        check = await self.memory.recall_memory(search_query, external=False)
         if check.get("found") and check.get("facts"):
             for existing in check["facts"][:2]:
                 existing_text = str(
