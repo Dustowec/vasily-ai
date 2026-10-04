@@ -62,6 +62,12 @@ LOCK_TIMEOUT = 2.0
 TEMP_SUFFIX = ".tmp"
 META_FILE = "meta.json"  # §3.1: data/meta.json -> {"total_ticks": N}
 
+# блок: внутренний лимит recall_memory до gate на стороне инструмента.
+# почему: manager не должен тащить в tool тысячи записей — там уже
+# второй gate (limit, по умолчанию 3). Этот лимит — только граница
+# передачи между слоями, не «что показать LLM».
+MAX_RECALL_RESULTS = 5
+
 TGS_FILE = "data/tgs_memory.json"
 HOT_FILE = "data/tg_hot_memory.json"
 COLD_FILE = "data/tg_cold_memory.json"
@@ -825,63 +831,156 @@ class GradientMemory:
 
     # ================= поиск =================
 
+    # ================= §9: пайплайн recall =================
+    #
+    # recall_memory разделён на три изолированных шага:
+    #   1. retrieval  — «найди похожее»  (знает про substring, не про score)
+    #   2. rerank     — «отсортируй»     (знает про score, не про query)
+    #   3. gate       — «что показать»   (знает только про лимит)
+    #
+    # Зачем: раньше одна функция смешивала три измерения, и при косяке
+    # нельзя было понять, что именно сломалось. Сейчас каждая ступень
+    # можно тестировать и менять независимо. BM25 (Шаг 2) тронет только
+    # retrieval; термодинамика — только rerank; фильтр мусора (Шаг 3) —
+    # только gate.
+
+    @staticmethod
+    def _extract_query_words(query: str) -> set[str]:
+        """Нормализует запрос в набор слов для substring-поиска.
+
+        Выделено отдельно, потому что токенизация — ответственность
+        retrieval-слоя, а не оркестратора. В Шаге 2 (FTS5/BM25) эта
+        функция либо исчезнет, либо заменится на стемминг.
+        """
+        return set(re.findall(r"\w+", query.lower()))
+
+    @staticmethod
+    def _entry_text(entry: dict) -> str:
+        """Возвращает нормализованное текстовое представление entry.
+
+        Используется только retrieval'ом для substring-матча. Логика
+        извлечения текста из value сложная (dict со summary / user+assistant
+        / произвольный dict / скаляр), поэтому вынесена отдельно, чтобы
+        retrieval был тонким.
+        """
+        value = entry.get("value")
+        parts: list[str] = []
+        if value is not None:
+            if isinstance(value, str):
+                parts.append(value)
+            elif isinstance(value, dict):
+                if "summary" in value:
+                    parts.append(str(value["summary"]))
+                elif "user" in value and "assistant" in value:
+                    parts.append(
+                        str(value.get("user", ""))
+                        + " "
+                        + str(value.get("assistant", ""))
+                    )
+                else:
+                    parts.append(json.dumps(value, ensure_ascii=False))
+            else:
+                parts.append(str(value))
+        summary = entry.get("summary")
+        if summary:
+            parts.append(str(summary))
+        return " ".join(parts).lower()
+
+    def _find_candidates(self, query_words: set[str]) -> list[dict]:
+        """RETRIEVAL: находит всех кандидатов по substring-матчу.
+
+        НЕ знает про score. НЕ сортирует. НЕ обрезает.
+
+        Здесь живёт единственная связь с substring-поиском. В Шаге 2
+        (FTS5/BM25) эта функция заменится на SQL-запрос, но контракт
+        останется: query_words на входе — плоский список кандидатов
+        на выходе.
+        """
+        results: list[dict] = []
+        for zone_name, zone_dict in (
+            ("tgs", self._tgs),
+            ("hot", self._hot),
+            ("cold", self._cold),
+        ):
+            for key, entry in zone_dict.items():
+                if any(w in self._entry_text(entry) for w in query_words):
+                    results.append(
+                        {
+                            "key": key,
+                            "zone": zone_name,
+                            "score": entry.get("score", 0),
+                            "value": entry.get("value"),
+                            "summary": entry.get("summary", ""),
+                        }
+                    )
+        return results
+
+    @staticmethod
+    def _rank_by_zone_score(candidates: list[dict]) -> list[dict]:
+        """RERANK: сортирует кандидатов по zone_score (термодинамика).
+
+        НЕ знает про query. НЕ знает про substring.
+
+        zone_score отвечает на вопрос «факт жив прямо сейчас», а не
+        «релевантен ли он запросу». Раньше эти два измерения путались:
+        сортировка шла только по score, поэтому случайное substring-
+        совпадение с высоким score оказывалось выше точного попадания
+        с низким. Разделение делает это явным.
+        """
+        return sorted(candidates, key=lambda x: x["score"], reverse=True)
+
+    @staticmethod
+    def _gate_for_output(ranked: list[dict], limit: int) -> list[dict]:
+        """GATE: обрезает список до limit для передачи вызывающему.
+
+        НЕ знает ни про query, ни про score. Единственная зона
+        ответственности — «сколько отдаём наружу».
+
+        В Шаге 3 сюда добавится фильтр мусора (regex на пароли/токены,
+        LLM-ранжирование в tool) — но сам gate останется тонким.
+        """
+        return ranked[:limit]
+
     async def recall_memory(self, query: str) -> dict:
+        """Поиск фактов во всех зонах (ADR-013 §9).
+
+        Оркестратор трёх шагов: retrieval → rerank → gate.
+        Само поведение не меняется по сравнению с прежней реализацией —
+        это чистый рефакторинг ради изоляции ответственностей.
+        """
         if not query:
             return {"found": False, "facts": []}
 
+        # блок: сброс счётчика «тиков без чтения» (см. §4.1 активный режим).
+        # почему: любой успешный recall — это чтение памяти, он обязан
+        # выключать активный режим остывания. Инвариант сохраняется
+        # независимо от того, сколько шагов в пайплайне.
         self._ticks_since_recall = 0
 
         await self._acquire_read()
         try:
-            query_words = set(re.findall(r"\w+", query.lower()))
+            # блок: шаг 1 — retrieval. Находим ВСЕХ, кто хоть как-то
+            # подходит по substring. Про score и лимит не знаем.
+            query_words = self._extract_query_words(query)
+            candidates = self._find_candidates(query_words)
 
-            def _entry_text(entry: dict) -> str:
-                value = entry.get("value")
-                parts: list[str] = []
-                if value is not None:
-                    if isinstance(value, str):
-                        parts.append(value)
-                    elif isinstance(value, dict):
-                        if "summary" in value:
-                            parts.append(str(value["summary"]))
-                        elif "user" in value and "assistant" in value:
-                            parts.append(
-                                str(value.get("user", ""))
-                                + " "
-                                + str(value.get("assistant", ""))
-                            )
-                        else:
-                            parts.append(json.dumps(value, ensure_ascii=False))
-                    else:
-                        parts.append(str(value))
-                summary = entry.get("summary")
-                if summary:
-                    parts.append(str(summary))
-                return " ".join(parts).lower()
+            # блок: шаг 2 — rerank. Сортируем найденное по zone_score.
+            # Про запрос и лимит не знаем — просто применяем термодинамику.
+            ranked = self._rank_by_zone_score(candidates)
 
-            results: list[dict] = []
-            for zone_name, zone_dict in (
-                ("tgs", self._tgs),
-                ("hot", self._hot),
-                ("cold", self._cold),
-            ):
-                for key, entry in zone_dict.items():
-                    if any(w in _entry_text(entry) for w in query_words):
-                        results.append(
-                            {
-                                "key": key,
-                                "zone": zone_name,
-                                "score": entry.get("score", 0),
-                                "value": entry.get("value"),
-                                "summary": entry.get("summary", ""),
-                            }
-                        )
+            # блок: шаг 3 — gate. Обрезаем до внутреннего лимита manager'а.
+            # MAX_RECALL_RESULTS = 5 — это граница ПЕРЕДАЧИ между слоями,
+            # не «что увидит LLM». Второй gate (limit=3) — в tool._execute.
+            gated = self._gate_for_output(ranked, limit=MAX_RECALL_RESULTS)
 
-            results.sort(key=lambda x: x["score"], reverse=True)
+            # блок: total_found — сколько было найдено ДО обрезки.
+            # почему: tool использует это для метрик, а также чтобы
+            # понимать, был ли отсев. len(gated) тут не подходит — там
+            # уже потолок MAX_RECALL_RESULTS.
             return {
-                "found": len(results) > 0,
-                "facts": results[:5],
-                "total_found": len(results),
+                "found": len(gated) > 0,
+                "facts": gated,
+                "total_found": len(candidates),
             }
         finally:
             self._release_read()
