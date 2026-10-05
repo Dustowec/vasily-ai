@@ -55,13 +55,11 @@ class RecallMemoryTool(BaseTool):
         )
         try:
             response = await asyncio.wait_for(
-                self.llm_client.generate(prompt, temperature=0.1), timeout=5.0
+                self.llm_client.generate(prompt, temperature=0.1), timeout=10.0
             )
             expanded = response.get("response", "")
             query_words = set(re.findall(r"\w+", query.lower()))
-            words = [
-                w for w in re.findall(r"\w+", expanded.lower()) if w not in query_words
-            ][:6]
+            words = [w for w in re.findall(r"\w+", expanded.lower()) if w not in query_words][:6]
             if words:
                 return f"{query} {' '.join(words)}"
         except TimeoutError:
@@ -70,9 +68,7 @@ class RecallMemoryTool(BaseTool):
             logger.warning("Query expansion failed, using raw query", error=str(e))
         return query
 
-    async def _execute(
-        self, query: str = "", limit: int = 3, **kwargs
-    ) -> dict[str, Any]:
+    async def _execute(self, query: str = "", limit: int = 3, **kwargs) -> dict[str, Any]:
         if self.memory is None:
             return make_error(
                 "backend_unavailable",
@@ -192,9 +188,7 @@ class RememberFactTool(BaseTool):
         check = await self.memory.recall_memory(search_query, external=False)
         if check.get("found") and check.get("facts"):
             for existing in check["facts"][:2]:
-                existing_text = str(
-                    existing.get("value") or existing.get("summary", "")
-                )
+                existing_text = str(existing.get("value") or existing.get("summary", ""))
                 if len(existing_text) < 5:
                     continue
                 verdict = await self._similarity_verdict(clean_fact, existing_text)
@@ -212,9 +206,7 @@ class RememberFactTool(BaseTool):
                     # почему: если в новом значении секрет — manager вернёт
                     # {"stored": False, "reason": ...}. Не записываем,
                     # сообщаем LLM причину, чтобы она сказала пользователю.
-                    upd = await self.memory.remember_user_fact(
-                        existing["key"], clean_fact
-                    )
+                    upd = await self.memory.remember_user_fact(existing["key"], clean_fact)
                     if not upd.get("stored", True):
                         return {
                             "status": "rejected",
@@ -291,11 +283,9 @@ class RememberFactTool(BaseTool):
         )
         try:
             response = await asyncio.wait_for(
-                self.llm_client.generate(prompt, temperature=0.0), timeout=10.0
+                self.llm_client.generate(prompt, temperature=0.0), timeout=20.0
             )
-            _, clean = OllamaClient.extract_thinking_and_answer(
-                response.get("response", "")
-            )
+            _, clean = OllamaClient.extract_thinking_and_answer(response.get("response", ""))
             answer_words = set(re.findall(r"\w+", clean.upper()))
             for word in ("ПРОТИВОРЕЧИЕ", "ДОПОЛНЕНИЕ", "ДУБЛЬ"):
                 if word in answer_words:
@@ -305,9 +295,7 @@ class RememberFactTool(BaseTool):
             logger.warning("Similarity verdict timed out, treating fact as new")
             return "НЕТ"
         except Exception as e:
-            logger.warning(
-                "Similarity verdict failed, treating fact as new", error=str(e)
-            )
+            logger.warning("Similarity verdict failed, treating fact as new", error=str(e))
             return "НЕТ"
 
     async def _merge_facts(self, new_fact: str, existing_fact: str) -> str:
@@ -321,11 +309,9 @@ class RememberFactTool(BaseTool):
         )
         try:
             response = await asyncio.wait_for(
-                self.llm_client.generate(prompt, temperature=0.1), timeout=15.0
+                self.llm_client.generate(prompt, temperature=0.1), timeout=30.0
             )
-            _, merged = OllamaClient.extract_thinking_and_answer(
-                response.get("response", "")
-            )
+            _, merged = OllamaClient.extract_thinking_and_answer(response.get("response", ""))
             merged = merged.strip()
             if merged and len(merged) < 500:
                 return merged
@@ -395,9 +381,7 @@ class ListFilesTool(BaseTool):
                         {
                             "name": item.name,
                             "size_bytes": item.stat().st_size,
-                            "modified": datetime.fromtimestamp(
-                                item.stat().st_mtime
-                            ).isoformat(),
+                            "modified": datetime.fromtimestamp(item.stat().st_mtime).isoformat(),
                         }
                     )
         except PermissionError:
