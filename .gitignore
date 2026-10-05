@@ -85,7 +85,8 @@ data/prompts/*.json
 
 # Personal files
 commits_detailed.txt
-Modelfile.txt
+Modelfile
+*.modelfile
 SUMMARY.md
 SUMMARY1.txt
 ПОДСКАЗКИ!!!.txt
