@@ -7,6 +7,10 @@ ADR-016: JSON tool-call fallback for models without native tools
 capability (e.g. gemma3n in Ollama 0.35.x). Client auto-detects
 capabilities at first use, chooses native or fallback path, and
 returns the SAME message.tool_calls format to ReActLoop.
+
+P0-fix (ADR-016): in fallback, normalize history before sending to
+Ollama — strip role:"tool" and assistant.tool_calls (native-only
+constructs that break fallback parser generation with HTTP 400).
 """
 
 import asyncio
@@ -34,8 +38,6 @@ MAX_RETRIES = 2
 TOKEN_DRIFT_WARNING_THRESHOLD = 0.15
 
 # ADR-016: теги для JSON-вызовов инструментов (fallback-режим).
-# Модель оборачивает вызов в <tool_call>...</tool_call>, парсер
-# извлекает JSON и синтезирует message.tool_calls формата Ollama.
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 
@@ -107,8 +109,8 @@ class OllamaClient:
             return None
 
         # блок: arguments может прийти dict или JSON-строкой.
-        # почему: некоторые модели пишут `"arguments": "{\"a\":1}"`,
-        # другие — `"arguments": {"a": 1}`. Унифицируем в dict.
+        # почему: некоторые модели пишут "arguments": "{\"a\":1}",
+        # другие — "arguments": {"a": 1}. Унифицируем в dict.
         args = obj.get("arguments", {})
         if isinstance(args, str):
             try:
@@ -269,6 +271,89 @@ class OllamaClient:
         # теги, следующая итерация может их «подсмотреть» и повторить.
         message["content"] = _TAG_BLOCK_RE.sub("", content).strip()
 
+    @staticmethod
+    def _normalize_history_for_fallback(messages: list[dict]) -> list[dict]:
+        """Нормализует историю для fallback-режима (ADR-016, P0-фикс).
+
+        Native tool-семантика в Ollama использует:
+          - role: "assistant" с полем tool_calls;
+          - role: "tool" с результатами инструментов.
+
+        Модели без native tools (например, gemma3n) при виде role: "tool"
+        пытаются построить парсер по TEMPLATE и падают с HTTP 400
+        "Unable to generate parser for this template".
+
+        Решение: восстановить «текстовую» форму истории —
+          - assistant с tool_calls → assistant с content, содержащим
+            <tool_call>{...}</tool_call> блоки;
+          - role: "tool" → role: "user" с префиксом "[Результат инструмента]".
+
+        Возвращает новый список (не мутирует исходный).
+        ReActLoop продолжает работать с оригиналом — его messages не портятся.
+        """
+        result: list[dict] = []
+        for m in messages:
+            # блок: shallow copy верхнего уровня.
+            # почему: мы заменяем role/content/tool_calls у самого message,
+            # вложенные структуры (arguments) только читаем. Shallow достаточно.
+            msg = dict(m)
+            role = msg.get("role")
+
+            if role == "tool":
+                # блок: role:tool → role:user с префиксом-маркером.
+                # почему: Ollama в fallback не должна видеть role:tool —
+                # это триггер для генерации parser'а по TEMPLATE, который
+                # у gemma3n ломается. User-сообщение с явным префиксом
+                # сохраняет семантику для модели.
+                content = msg.get("content", "")
+                result.append(
+                    {
+                        "role": "user",
+                        "content": f"[Результат инструмента]: {content}",
+                    }
+                )
+                continue
+
+            if role == "assistant" and msg.get("tool_calls"):
+                # блок: assistant.tool_calls → текст <tool_call>...</tool_call>.
+                # почему: модель в fallback-режиме пишет вызовы как текст.
+                # Если показать ей историю в нативном формате (tool_calls),
+                # Ollama попытается применить native-parser и упадёт 400.
+                calls_text_parts = []
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", {})
+                    # блок: arguments может быть dict или JSON-строкой.
+                    # почему: модели вольны присылать и так, и так.
+                    if isinstance(args, str):
+                        args_json = args
+                    else:
+                        args_json = json.dumps(args, ensure_ascii=False, default=str)
+                    calls_text_parts.append(
+                        f'{TOOL_CALL_OPEN}{{"name": "{name}", "arguments": {args_json}}}{TOOL_CALL_CLOSE}'
+                    )
+
+                old_content = msg.get("content", "")
+                if calls_text_parts:
+                    if old_content.strip():
+                        new_content = old_content + "\n" + "\n".join(calls_text_parts)
+                    else:
+                        new_content = "\n".join(calls_text_parts)
+                else:
+                    new_content = old_content
+
+                msg.pop("tool_calls", None)
+                msg["content"] = new_content
+                result.append(msg)
+                continue
+
+            # блок: обычные сообщения (system, user, assistant без tool_calls)
+            # проходят без изменений.
+            result.append(msg)
+
+        return result
+
     async def _detect_tools_support(self) -> bool:
         """Определить, поддерживает ли модель native tools.
 
@@ -372,6 +457,10 @@ class OllamaClient:
         через payload["tools"]. Если нет — вставляем схему в system prompt
         как текст, парсим <tool_call> из ответа, синтезируем
         message.tool_calls. ReActLoop видит один и тот же формат.
+
+        P0-фикс: в fallback нормализуем историю — убираем role:"tool"
+        и assistant.tool_calls, потому что иначе Ollama пытается строить
+        native-parser по TEMPLATE и падает с HTTP 400.
         """
         # блок: ветвление native/fallback только если tools переданы.
         # почему: chat() без tools используется для финального ответа
@@ -385,10 +474,18 @@ class OllamaClient:
                 use_fallback = True
 
         if use_fallback:
+            # блок: нормализация истории ДО injection инструкции.
+            # почему: если в messages остались role: "tool" или
+            # assistant.tool_calls от предыдущей итерации ReAct, Ollama
+            # попытается сгенерировать parser по TEMPLATE и упадёт с 400
+            # "Unable to generate parser for this template".
+            # Приводим историю к текстовой форме — как будто модель
+            # всегда общалась через <tool_call>.
+            normalized = self._normalize_history_for_fallback(messages)
             # блок: fallback-режим — схема идёт текстом в system.
             # почему: модель не знает про tools, но должна узнать формат
             # из промпта, чтобы написать <tool_call>{...}</tool_call>.
-            payload_messages = self._inject_tools_instruction(messages, tools)
+            payload_messages = self._inject_tools_instruction(normalized, tools)
             payload = {
                 "model": self.model,
                 "messages": payload_messages,
