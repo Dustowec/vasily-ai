@@ -75,6 +75,20 @@ META_FILE = "meta.json"  # §3.1: data/meta.json -> {"total_ticks": N}
 # передачи между слоями, не «что показать LLM».
 MAX_RECALL_RESULTS = 5
 
+# блок: известные каналы памяти — по префиксу ключа до ':'.
+# почему: категоризация по префиксу не требует миграции данных и
+# опирается на уже сложившийся контракт ключей (user_fact:,
+# dialogue_summary:, task_state:). Список используется только для
+# диагностики — предупредить о возможной опечатке в категории.
+KNOWN_CATEGORIES = frozenset({"user_fact", "dialogue_summary", "task_state"})
+
+# блок: каналы, участвующие в дедупе RememberFactTool.
+# почему: дедуп — это «не создавать дубликат факта». dialogue_summary
+# — конспект, а не факт; в дедупе он даёт ложные срабатывания
+# (HANDOFF §7.1). task_state включён заранее — дедуп должен работать
+# и для автономных задач (HANDOFF §7.2).
+DEDUP_CATEGORIES = ("user_fact", "task_state")
+
 TGS_FILE = "data/tgs_memory.json"
 HOT_FILE = "data/tg_hot_memory.json"
 COLD_FILE = "data/tg_cold_memory.json"
@@ -173,9 +187,7 @@ class GradientMemory:
         for entry in self._hot.values():
             entry["score"] = min(max(entry.get("score", HOT_MIN), HOT_MIN), HOT_PROMO)
         for entry in self._cold.values():
-            entry["score"] = min(
-                max(entry.get("score", DISTILLED_SCORE), COLD_MIN), -0.1
-            )
+            entry["score"] = min(max(entry.get("score", DISTILLED_SCORE), COLD_MIN), -0.1)
 
         logger.info(
             "GradientMemory loaded",
@@ -380,9 +392,7 @@ class GradientMemory:
                     self._hot[key] = entry
                     await self._save_zone("hot", self._hot)
                     self._try_unprotect(entry, key)
-                    logger.info(
-                        "Remember: revived from COLD", key=key, score=entry["score"]
-                    )
+                    logger.info("Remember: revived from COLD", key=key, score=entry["score"])
                     return {"stored": True, "key": key}
 
                 self._apply_heat(entry, HEAT_REMEMBER, key)
@@ -394,9 +404,7 @@ class GradientMemory:
                 if zone == "tgs":
                     self._tgs[key] = entry
                     await self._save_zone("tgs", self._tgs)
-                    logger.info(
-                        "Remember: reinforced in TGS", key=key, score=entry["score"]
-                    )
+                    logger.info("Remember: reinforced in TGS", key=key, score=entry["score"])
                     return {"stored": True, "key": key}
 
                 self._hot[key] = entry
@@ -506,9 +514,7 @@ class GradientMemory:
             if cold_changed:
                 await self._save_zone("cold", self._cold)
 
-            logger.info(
-                "Cold start penalty applied", hot=len(self._hot), cold=len(self._cold)
-            )
+            logger.info("Cold start penalty applied", hot=len(self._hot), cold=len(self._cold))
         finally:
             self._release_write()
 
@@ -739,16 +745,12 @@ class GradientMemory:
 
                     if not new_summary.strip():
                         del zone_dict[key]
-                        logger.info(
-                            "Redistill: deleted empty summary", key=key, zone=zone_name
-                        )
+                        logger.info("Redistill: deleted empty summary", key=key, zone=zone_name)
                         dirty = True
                     elif new_summary.strip() != old_summary.strip():
                         value["summary"] = new_summary.strip()
                         entry["updated_at"] = datetime.now().isoformat()
-                        logger.info(
-                            "Redistill: updated summary", key=key, zone=zone_name
-                        )
+                        logger.info("Redistill: updated summary", key=key, zone=zone_name)
                         dirty = True
                 return dirty
 
@@ -915,11 +917,7 @@ class GradientMemory:
                 if "summary" in value:
                     parts.append(str(value["summary"]))
                 elif "user" in value and "assistant" in value:
-                    parts.append(
-                        str(value.get("user", ""))
-                        + " "
-                        + str(value.get("assistant", ""))
-                    )
+                    parts.append(str(value.get("user", "")) + " " + str(value.get("assistant", "")))
                 else:
                     parts.append(json.dumps(value, ensure_ascii=False))
             else:
@@ -932,7 +930,9 @@ class GradientMemory:
         # не должен знать про Snowball, регистр или регекспы.
         return tokenize(" ".join(parts))
 
-    def _find_candidates(self, query_tokens: set[str]) -> list[dict]:
+    def _find_candidates(
+        self, query_tokens: set[str], categories: set[str] | None = None
+    ) -> list[dict]:
         """RETRIEVAL: находит всех кандидатов по пересечению основ.
 
         НЕ знает про score. НЕ сортирует. НЕ обрезает.
@@ -941,6 +941,9 @@ class GradientMemory:
         substring заменён на стемминг: "кот" больше не находит "который",
         зато "коты" находит "кот". Контракт тот же: query_tokens на
         входе — плоский список кандидатов на выходе.
+
+        categories: опциональный фильтр по каналу памяти (префикс ключа
+        до ':'). None = все каналы (обратная совместимость).
         """
         results: list[dict] = []
         for zone_name, zone_dict in (
@@ -949,6 +952,14 @@ class GradientMemory:
             ("cold", self._cold),
         ):
             for key, entry in zone_dict.items():
+                # блок: фильтр по каналу — ДО проверки совпадения по токенам.
+                # почему: сначала дешёвое отсечение по префиксу (одна
+                # операция split), потом дорогое по содержимому (стемминг
+                # и пересечение множеств). Порядок важен для тысяч записей.
+                if categories is not None:
+                    channel = key.split(":", 1)[0]
+                    if channel not in categories:
+                        continue
                 # блок: сравнение множеств основ вместо substring.
                 # почему: "кот" in "который" → True (ошибка);
                 # {"кот"} ∩ {"котор"} → пусто → False (правильно).
@@ -990,7 +1001,12 @@ class GradientMemory:
         """
         return ranked[:limit]
 
-    async def recall_memory(self, query: str, external: bool = True) -> dict:
+    async def recall_memory(
+        self,
+        query: str,
+        external: bool = True,
+        categories: list[str] | None = None,
+    ) -> dict:
         """Поиск фактов во всех зонах (ADR-013 §9).
 
         Оркестратор трёх шагов: retrieval → rerank → gate.
@@ -1001,6 +1017,13 @@ class GradientMemory:
           False — внутренний вызов (RememberFactTool для дедупа);
                   счётчик НЕ трогает, потому что это не пользовательское
                   чтение и не должно маскировать активный режим.
+
+        categories (HANDOFF §7.1/§7.3):
+          None               — все каналы (обратная совместимость).
+          ["user_fact", ...] — только указанные каналы (префикс ключа
+                               до ':'). Неизвестная категория логируется
+                               warning'ом, но не роняет вызов: фильтр
+                               остаётся строгим, просто не даёт совпадений.
         """
         if not query:
             return {"found": False, "facts": []}
@@ -1011,14 +1034,31 @@ class GradientMemory:
         if external:
             self._ticks_since_recall = 0
 
+        # блок: валидация categories — warning при неизвестных, но не отказ.
+        # почему: опечатка не должна молча давать пустой результат (тогда
+        # агент решит, что факта нет), но и не должна ронять вызов.
+        # Неизвестная категория просто не даст совпадений — фильтр
+        # остаётся строгим.
+        categories_set: set[str] | None = None
+        if categories is not None:
+            categories_set = set(categories)
+            unknown = categories_set - KNOWN_CATEGORIES
+            if unknown:
+                logger.warning(
+                    "Unknown memory category in recall_memory filter",
+                    unknown=sorted(unknown),
+                    known=sorted(KNOWN_CATEGORIES),
+                )
+
         await self._acquire_read()
         try:
             # блок: шаг 1 — retrieval. Находим ВСЕХ, у кого есть хоть
             # одна общая основа с запросом. Про score и лимит не знаем.
             # tokenize делает lowercase + стемминг — "коты" и "кот"
-            # дадут одну основу, "который" — другую.
+            # дадут одну основу, "который" — другую. Фильтр по categories
+            # применяется здесь же — до rerank и gate.
             query_tokens = tokenize(query)
-            candidates = self._find_candidates(query_tokens)
+            candidates = self._find_candidates(query_tokens, categories_set)
 
             # блок: шаг 2 — rerank. Сортируем найденное по zone_score.
             # Про запрос и лимит не знаем — просто применяем термодинамику.

@@ -17,6 +17,12 @@ from core.logging_config import get_logger
 from core.plugin_types import make_error
 from integrations.ollama_client import OllamaClient
 
+# блок: каналы для дедупа RememberFactTool (HANDOFF §7.1).
+# почему: источник правды — manager, чтобы категоризация не расползалась
+# по коду. DEDUP_CATEGORIES также используется во второй линии защиты
+# ниже (проверка префикса вернувшегося ключа).
+from memory.manager import DEDUP_CATEGORIES
+
 # блок: LLM-ранжирование кандидатов (Задача №3, вариант B).
 # почему: одна точка правды — memory/ranking.py; RecallMemoryTool
 # и AgentCore._llm_filter_forget оба ходят туда.
@@ -181,13 +187,32 @@ class RememberFactTool(BaseTool):
         words = re.findall(r"\w+", clean_fact.lower())
         search_query = " ".join(words)[:150]
 
-        # блок: internal recall для дедупа (Шаг 4 Задачи №2).
+        # блок: internal recall для дедупа (Шаг 4 Задачи №2, HANDOFF §7.1).
         # почему: это не пользовательское чтение памяти — это служебная
         # проверка «есть ли уже такой факт». Она не должна сбрасывать
         # _ticks_since_recall и маскировать активный режим остывания.
-        check = await self.memory.recall_memory(search_query, external=False)
+        # categories ограничивает поиск каналами user_fact/task_state:
+        # dialogue_summary даёт ложные срабатывания по общим словам
+        # («пользователь», «зовут») — HANDOFF §7.1.
+        check = await self.memory.recall_memory(
+            search_query, external=False, categories=list(DEDUP_CATEGORIES)
+        )
         if check.get("found") and check.get("facts"):
             for existing in check["facts"][:2]:
+                # блок: вторая линия защиты (HANDOFF §7.1).
+                # почему: слой 1 (categories) в норме не пустит чужой
+                # канал. Но если что-то рассогласуется (опечатка, будущий
+                # рефактор) — не даём перезаписать чужую запись (например,
+                # dialogue_summary) через remember_user_fact. Это защита,
+                # а не цель: см. ADR-018 при добавлении task_state.
+                existing_channel = existing["key"].split(":", 1)[0]
+                if existing_channel not in DEDUP_CATEGORIES:
+                    logger.warning(
+                        "Dedup: foreign channel in results, skipping",
+                        key=existing["key"],
+                        channel=existing_channel,
+                    )
+                    continue
                 existing_text = str(existing.get("value") or existing.get("summary", ""))
                 if len(existing_text) < 5:
                     continue
