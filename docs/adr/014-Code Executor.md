@@ -1,6 +1,7 @@
 ADR-014: Code Executor — песочница, тулзы, TDD-протокол, failure-policy
-Статус: Accepted (draft accepted to implementation)
+Статус: **Rejected** (отклонён)
 Дата: 2026-09-12
+Дата отклонения: 2026-10-10
 Суперсиде: ADR-012 (BaseTool, PluginRegistry), ADR-013 (Gradient Cascade Memory)
 Автор: Архитектор (User)
 Red team: 6 раундов. Раунды 1–3 — текст. Раунды 4–6 — PoC-эмпирика. Все P0/P1 закрыты. P2 — отложены осознанно в §11.
