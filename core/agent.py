@@ -117,6 +117,7 @@ class AgentCore:
             config=self.config,
             llm_client=self.llm_client,
             plugin_registry=self.plugin_registry,
+            memory_manager=self.memory,
         )
 
         await ensure_ollama_running(self.config)
@@ -189,6 +190,7 @@ class AgentCore:
                             config=self.config,
                             llm_client=self.llm_client,
                             plugin_registry=self.plugin_registry,
+                            memory_manager=self.memory,
                         )
                         msg = (
                             f"Память очищена: удалено {result['rotated']} записей, "
@@ -223,9 +225,7 @@ class AgentCore:
                     }
 
                 # 2. LLM классификация
-                candidates = await self._llm_filter_forget(
-                    topic, search_result.get("facts", [])
-                )
+                candidates = await self._llm_filter_forget(topic, search_result.get("facts", []))
                 if not candidates:
                     return {
                         "status": "success",
@@ -233,13 +233,9 @@ class AgentCore:
                     }
 
                 # 3. Сценарий А: только 1 user_fact -> молчаливое удаление
-                if len(candidates) == 1 and candidates[0]["key"].startswith(
-                    "user_fact:"
-                ):
+                if len(candidates) == 1 and candidates[0]["key"].startswith("user_fact:"):
                     await self.memory.forget(candidates[0]["key"])
-                    await self.memory.redistill_summaries(
-                        topic, self._llm_rewrite_summary
-                    )
+                    await self.memory.redistill_summaries(topic, self._llm_rewrite_summary)
                     return {
                         "status": "success",
                         "message": f"Факт по теме '{topic}' удален.",
@@ -275,9 +271,7 @@ class AgentCore:
                         indices = [int(x.strip()) for x in choice.split(",")]
                         for idx in indices:
                             if 0 < idx <= len(self._forget_candidates):
-                                keys_to_delete.append(
-                                    self._forget_candidates[idx - 1]["key"]
-                                )
+                                keys_to_delete.append(self._forget_candidates[idx - 1]["key"])
                     except ValueError:
                         return {
                             "status": "error",
@@ -292,9 +286,7 @@ class AgentCore:
                     await self.memory.forget(key)
 
                 if topic:
-                    await self.memory.redistill_summaries(
-                        topic, self._llm_rewrite_summary
-                    )
+                    await self.memory.redistill_summaries(topic, self._llm_rewrite_summary)
 
                 self._forget_candidates = []
                 self._forget_topic = ""
@@ -309,9 +301,7 @@ class AgentCore:
             if not self.react_loop:
                 return {"status": "error", "message": "ReAct loop not initialized"}
 
-            structlog.contextvars.bind_contextvars(
-                request_id=f"req-{self._requests_count:04d}"
-            )
+            structlog.contextvars.bind_contextvars(request_id=f"req-{self._requests_count:04d}")
 
             dialogue_history = [dict(m) for m in self._dialogue_window]
             result = await self.react_loop.run(
@@ -319,13 +309,8 @@ class AgentCore:
             )
 
             # Защита от пустого ответа LLM
-            if (
-                result.get("status") == "success"
-                and not str(result.get("answer", "")).strip()
-            ):
-                result["answer"] = (
-                    "Я задумался, но забыл ответить. Можешь переформулировать?"
-                )
+            if result.get("status") == "success" and not str(result.get("answer", "")).strip():
+                result["answer"] = "Я задумался, но забыл ответить. Можешь переформулировать?"
 
             duration_ms = (time.time() - start) * 1000
             logger.info(
@@ -411,11 +396,7 @@ class AgentCore:
         )
         try:
             response = await self.llm_client.generate(prompt)
-            resp = (
-                response.get("response", "")
-                if isinstance(response, dict)
-                else str(response)
-            )
+            resp = response.get("response", "") if isinstance(response, dict) else str(response)
             _, resp = OllamaClient.extract_thinking_and_answer(resp)
             return resp.strip()
         except Exception as e:
@@ -560,9 +541,7 @@ class AgentCore:
                     self.running = False
                     break
 
-                task = asyncio.create_task(
-                    self.handle_request({"id": "cli", "text": raw.strip()})
-                )
+                task = asyncio.create_task(self.handle_request({"id": "cli", "text": raw.strip()}))
                 self._active_request_task = task
 
                 try:
@@ -604,9 +583,7 @@ class AgentCore:
         """Main agent loop with interactive CLI."""
         self.running = True
         logger.info("Agent started", plugins=len(self.plugin_registry))
-        logger.info(
-            "Lazy memory compression enabled (per-request check, background run)"
-        )
+        logger.info("Lazy memory compression enabled (per-request check, background run)")
 
         if self.config.watchdog_enabled:
             self.watchdog = Watchdog(
@@ -675,18 +652,14 @@ class AgentCore:
         }
         if self.watchdog:
             watchdog_status = self.watchdog.get_status()
-            base_metrics["watchdog_llm"] = (
-                "OK" if watchdog_status["llm"]["available"] else "FAIL"
-            )
+            base_metrics["watchdog_llm"] = "OK" if watchdog_status["llm"]["available"] else "FAIL"
             base_metrics["watchdog_plugins"] = (
                 "OK" if watchdog_status["plugins"]["available"] else "FAIL"
             )
             base_metrics["watchdog_memory"] = (
                 "OK" if watchdog_status["memory"]["available"] else "FAIL"
             )
-            base_metrics["watchdog_disk"] = (
-                "OK" if watchdog_status["disk"]["available"] else "FAIL"
-            )
+            base_metrics["watchdog_disk"] = "OK" if watchdog_status["disk"]["available"] else "FAIL"
         base_metrics.update(self.metrics.snapshot())
         return base_metrics
 

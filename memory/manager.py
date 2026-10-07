@@ -544,7 +544,12 @@ class GradientMemory:
             active = self._ticks_since_recall >= ACTIVE_MODE_WINDOW
 
             tgs_changed = False
-            for entry in self._tgs.values():
+            for _, entry in list(self._tgs.items()):
+                # ADR-017: freeze active tasks in TGS
+                if entry.get("status") == "in_progress":
+                    entry["updated_at"] = datetime.now().isoformat()
+                    tgs_changed = True
+                    continue
                 entry["score"] = round(entry.get("score", 0) + DECAY_TGS, 1)
                 entry["updated_at"] = datetime.now().isoformat()
                 tgs_changed = True
@@ -556,6 +561,11 @@ class GradientMemory:
             hot_changed = False
             migrated_this_tick: set[str] = set()
             for key, entry in list(self._hot.items()):
+                # ADR-017: freeze active tasks in HOT
+                if entry.get("status") == "in_progress":
+                    entry["updated_at"] = datetime.now().isoformat()
+                    hot_changed = True
+                    continue
                 new_score = round(entry.get("score", 0) + hot_rate, 1)
                 if entry.get("no_compress", False):
                     if new_score <= MIGRATION_TRAP:
@@ -607,6 +617,9 @@ class GradientMemory:
 
     async def _tgs_decay_demote(self) -> None:
         for key in list(self._tgs.keys()):
+            # ADR-017: do not demote active tasks from TGS
+            if self._tgs[key].get("status") == "in_progress":
+                continue
             if self._tgs[key].get("score", TGS_MIN) < TGS_MIN:
                 entry = self._tgs.pop(key)
                 entry["score"] = TGS_EVICT_SCORE
@@ -785,6 +798,11 @@ class GradientMemory:
 
             def _immune(entry_key: str, entry: dict) -> bool:
                 nonlocal amnestied, next_free_tick
+                # ADR-017: active tasks — amnesty like user_fact (age-independent)
+                if entry_key.startswith("task_state:") and entry.get("status") == "in_progress":
+                    amnestied += 1
+                    next_free_tick = max(next_free_tick, self._total_ticks + FACT_IMMUNE_TICKS)
+                    return True
                 if not entry_key.startswith("user_fact:"):
                     return False
                 created = entry.get("created_tick", 0)
@@ -850,7 +868,107 @@ class GradientMemory:
         finally:
             self._release_write()
 
-    # ================= точный recall =================
+    # ================= ADR-017: task_state канал =================
+
+    async def remember_task_state(self, key, goal, steps=None, checkpoints=None):
+        """Создать задачу в канале task_state."""
+        if not key.startswith("task_state:"):
+            raise ValueError(f"Ключ должен начинаться с 'task_state:', got: {key}")
+        await self._acquire_write()
+        try:
+            entry = {
+                "value": goal,
+                "score": 40.0,
+                "is_cold": False,
+                "no_compress": True,
+                "shield": False,
+                "summary": None,
+                "changed_since_revival": False,
+                "last_heat_tick": -1,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "created_tick": self._total_ticks,
+                "status": "in_progress",
+                "goal": goal,
+                "steps": steps or [],
+                "checkpoints": checkpoints or [],
+                "category": "task_state",
+            }
+            self._hot[key] = entry
+            await self._save_zone("hot", self._hot)
+            logger.info("Remember task_state: stored (new)", key=key, score=entry["score"])
+            return {"stored": True, "key": key}
+        finally:
+            self._release_write()
+
+    async def update_task_metadata(self, key, action, data=None):
+        """Обновить метаданные задачи по действию."""
+        if not key.startswith("task_state:"):
+            raise ValueError(f"Ключ должен начинаться с 'task_state:', got: {key}")
+        entry = self._find_entry_unlocked(key)
+        if entry is None:
+            raise KeyError(f"Задача не найдена: {key}")
+        await self._acquire_write()
+        try:
+            now = datetime.now().isoformat()
+            zone_name = self._get_zone_unlocked(key)
+            if action == "checkpoint":
+                cp_list = entry.setdefault("checkpoints", [])
+                cp_list.append(
+                    {
+                        "index": (data or {}).get("index", len(cp_list)),
+                        "desc": (data or {}).get("desc", ""),
+                        "time": now,
+                    }
+                )
+                entry["updated_at"] = now
+            elif action == "step_done":
+                si = (data or {}).get("step_index", 0)
+                entry.setdefault("_completed_steps", []).append(si)
+                entry["updated_at"] = now
+            elif action == "complete":
+                entry["status"] = "done"
+                entry["updated_at"] = now
+            elif action == "cancel":
+                entry["status"] = "cancelled"
+                entry["updated_at"] = now
+            else:
+                raise ValueError(f"Неизвестное действие: {action}")
+            zone_dict = getattr(self, f"_{zone_name}", {})
+            zone_dict[key] = entry
+            await self._save_zone(zone_name, zone_dict)
+            return {"updated": True, "key": key, "action": action, "status": entry.get("status")}
+        except Exception:
+            await self._save_hot()
+            raise
+        finally:
+            self._release_write()
+
+    def get_active_tasks(self, limit=3):
+        """Вернуть in_progress задачи для injection в system prompt."""
+        results = []
+        for zone_name, zone_dict in [("tgs", self._tgs), ("hot", self._hot), ("cold", self._cold)]:
+            for key, entry in zone_dict.items():
+                if key.startswith("task_state:") and entry.get("status") == "in_progress":
+                    try:
+                        dt = datetime.fromisoformat(entry.get("updated_at", ""))
+                        updated_tick = dt.minute * 100 + dt.second
+                    except Exception:
+                        updated_tick = 0
+                    results.append(
+                        {
+                            "key": key,
+                            "zone": zone_name,
+                            "score": entry.get("score", 0),
+                            "goal": entry.get("goal", entry.get("value", "")),
+                            "steps": entry.get("steps", []),
+                            "checkpoints": entry.get("checkpoints", []),
+                            "updated_tick": updated_tick,
+                            "status": entry.get("status"),
+                        }
+                    )
+        results.sort(key=lambda x: x["updated_tick"], reverse=True)
+        return results[:limit]
 
     async def recall(self, key: str) -> Any | None:
         await self._acquire_write()

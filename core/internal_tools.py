@@ -431,3 +431,198 @@ class ListFilesTool(BaseTool):
                 "required": False,
             },
         }
+
+
+class LongTaskTool(BaseTool):
+    name = "long_task"
+    description = "Управление долгосрочными задачами. Действия: create, checkpoint, step_done, complete, cancel, list, get, help."
+    version = "1.0.0"
+
+    def __init__(self, memory_manager=None):
+        self.memory = memory_manager
+
+    async def _execute(self, action="", **kwargs):
+        if not action:
+            return make_error(
+                "invalid_url",
+                "Необходимо указать действие.",
+                "create/checkpoint/step_done/complete/cancel/list/get/help",
+            )
+        am = {
+            "create": self._a_create,
+            "checkpoint": self._a_checkpoint,
+            "step_done": self._a_stepdone,
+            "complete": self._a_complete,
+            "cancel": self._a_cancel,
+            "list": self._a_list,
+            "get": self._a_get,
+            "help": self._a_help,
+        }
+        h = am.get(action)
+        if not h:
+            return make_error(
+                "invalid_url",
+                f"Неизвестное действие: {action}.",
+                "Попробуйте: create/checkpoint/step_done/complete/cancel/list/get/help",
+            )
+        return await h(**kwargs)
+
+    @staticmethod
+    def _validate_key(key):
+        if not key or not isinstance(key, str):
+            return make_error("invalid_url", "Необходим параметр key.", "Укажите ключ задачи.")
+        if not key.startswith("task_state:"):
+            return make_error("invalid_url", f"Неверный ключ: {key}.", "Начинается с 'task_state:'")
+        return None
+
+    def _find_entry_by_key(self, key):
+        if not self.memory:
+            return None
+        for zn in ("tgs", "hot", "cold"):
+            zone = getattr(self.memory, f"_{zn}", {})
+            if key in zone:
+                return zone[key], zn, key
+        return None
+
+    async def _a_create(self, key="", goal="", steps=None, checkpoints=None, **kw):
+        if err := self._validate_key(key):
+            return err
+        if not goal:
+            return make_error("invalid_url", "Необходим параметр goal.", "Укажите цель задачи.")
+        try:
+            result = await self.memory.remember_task_state(
+                key, goal, steps=steps, checkpoints=checkpoints
+            )
+            return {
+                "status": "success",
+                "action": "create",
+                "key": key,
+                "message": "Задача создана (in_progress).",
+                "result": result,
+            }
+        except Exception as e:
+            return make_error("backend_unavailable", f"Ошибка создания: {e}", "Попробуйте позже.")
+
+    async def _a_checkpoint(self, key="", index=0, desc="", **kw):
+        if err := self._validate_key(key):
+            return err
+        entry = self._find_entry_by_key(key)
+        if entry is None:
+            return make_error("invalid_url", f"Задача не найдена: {key}.", "")
+        try:
+            result = await self.memory.update_task_metadata(
+                key, "checkpoint", {"index": index, "desc": desc}
+            )
+            return {
+                "status": "success",
+                "action": "checkpoint",
+                "key": key,
+                "message": "Чекпоинт добавлен.",
+                "result": result,
+            }
+        except Exception as e:
+            return make_error("backend_unavailable", f"Ошибка: {e}", "Попробуйте позже.")
+
+    async def _a_stepdone(self, key="", step_index=0, **kw):
+        if err := self._validate_key(key):
+            return err
+        entry = self._find_entry_by_key(key)
+        if entry is None:
+            return make_error("invalid_url", f"Задача не найдена: {key}.", "")
+        try:
+            result = await self.memory.update_task_metadata(
+                key, "step_done", {"step_index": step_index}
+            )
+            return {
+                "status": "success",
+                "action": "step_done",
+                "key": key,
+                "message": f"Шаг #{step_index} отмечен.",
+                "result": result,
+            }
+        except Exception as e:
+            return make_error("backend_unavailable", f"Ошибка: {e}", "Попробуйте позже.")
+
+    async def _a_complete(self, key="", **kw):
+        if err := self._validate_key(key):
+            return err
+        entry = self._find_entry_by_key(key)
+        if entry is None:
+            return make_error("invalid_url", f"Задача не найдена: {key}.", "")
+        try:
+            result = await self.memory.update_task_metadata(key, "complete")
+            return {
+                "status": "success",
+                "action": "complete",
+                "key": key,
+                "message": "Задача завершена (done).",
+                "result": result,
+            }
+        except Exception as e:
+            return make_error("backend_unavailable", f"Ошибка: {e}", "Попробуйте позже.")
+
+    async def _a_cancel(self, key="", **kw):
+        if err := self._validate_key(key):
+            return err
+        entry = self._find_entry_by_key(key)
+        if entry is None:
+            return make_error("invalid_url", f"Задача не найдена: {key}.", "")
+        try:
+            result = await self.memory.update_task_metadata(key, "cancel")
+            return {
+                "status": "success",
+                "action": "cancel",
+                "key": key,
+                "message": "Задача отменена (cancelled).",
+                "result": result,
+            }
+        except Exception as e:
+            return make_error("backend_unavailable", f"Ошибка: {e}", "Попробуйте позже.")
+
+    async def _a_list(self, **kw):
+        if not self.memory:
+            return make_error("backend_unavailable", "Memory manager не инициализирован.", "")
+        try:
+            active = self.memory.get_active_tasks(limit=50)
+            all_entries = []
+            for za in ("_tgs", "_hot", "_cold"):
+                zone = getattr(self.memory, za, {})
+                for k, v in zone.items():
+                    if k.startswith("task_state:"):
+                        all_entries.append({"key": k, **v})
+            return {
+                "status": "success",
+                "action": "list",
+                "in_progress": len(active),
+                "all_tasks_count": len(all_entries),
+                "tasks": all_entries[:20],
+            }
+        except Exception as e:
+            return make_error("backend_unavailable", f"Ошибка списка: {e}", "Попробуйте позже.")
+
+    async def _a_get(self, key="", **kw):
+        if err := self._validate_key(key):
+            return err
+        data = self._find_entry_by_key(key)
+        if data is None:
+            return make_error("invalid_url", f"Задача не найдена: {key}.", "")
+        entry, zn, _ = data
+        return {"status": "success", "action": "get", "key": key, "zone": zn, "entry": entry}
+
+    async def _a_help(self, **kw):
+        msg = "Доступные действия:\n- create key=... goal=... - создать задачу\n- checkpoint key=... index=N - добавить чекпоинт\n- step_done key=... step_index=N - отметить шаг выполненным\n- complete key=... - завершить (done)\n- cancel key=... - отменить (cancelled)\n- list - список задач\n- get key=... - получить задачу\n- help - справка"
+        return {"status": "success", "action": "help", "message": msg}
+
+    def _get_parameters(self):
+        return {
+            "action": {
+                "type": "string",
+                "description": "create/checkpoint/step_done/complete/cancel/list/get/help",
+                "required": True,
+            },
+            "key": {"type": "string", "description": "Ключ задачи", "required": False},
+            "goal": {"type": "string", "description": "Цель", "required": False},
+            "index": {"type": "integer", "description": "Индекс чекпоинта", "required": False},
+            "desc": {"type": "string", "description": "Описание", "required": False},
+            "step_index": {"type": "integer", "description": "Номер шага", "required": False},
+        }

@@ -70,10 +70,11 @@ MAX_ITERATIONS_FINAL_USER_MESSAGE = (
 class ReActLoop:
     """Executes Reasoning + Acting cycle with the LLM and plugins."""
 
-    def __init__(self, config, llm_client, plugin_registry):
+    def __init__(self, config, llm_client, plugin_registry, memory_manager=None):
         self.config = config
         self.llm = llm_client
         self.plugin_registry = plugin_registry
+        self.memory_manager = memory_manager
         self.max_iterations = config.max_react_iterations
         self.max_tool_calls = config.max_tool_calls_per_tool
         self.preview_length = config.log_preview_length
@@ -130,6 +131,27 @@ class ReActLoop:
         ADR-011: dialogue_history is a sliding window of last 5 pairs (user/assistant).
         """
         system_prompt = self.prompts_library.get_prompt(prompt_type) or DEFAULT_SYSTEM_PROMPT
+
+        # ADR-017: Inject active tasks into system prompt
+        if self.memory_manager is not None:
+            active_tasks = self.memory_manager.get_active_tasks(limit=3)
+            if active_tasks:
+                task_lines = []
+                for t in active_tasks:
+                    cp_count = len(t.get("checkpoints", []))
+                    step_done = len(t.get("_completed_steps", []))
+                    steps_total = len(t.get("steps", []))
+                    task_lines.append(
+                        f"- {t['key']}: {t['goal']} "
+                        f"(чекпоинты: {cp_count}, шаги: {step_done}/{steps_total})"
+                    )
+                active_section = (
+                    "\n\n## АКТИВНЫЕ ЗАДАЧИ\n"
+                    + "\n".join(task_lines)
+                    + "\n\nВыполняйте задачи по очереди. Не создавайте новые, если есть незавершённые."
+                )
+                system_prompt += active_section
+
         messages = [
             {"role": "system", "content": system_prompt},
         ]
